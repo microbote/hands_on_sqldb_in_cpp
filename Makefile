@@ -3,11 +3,16 @@
 # ============================================================
 CXX      = /usr/local/opt/llvm/bin/clang++
 CXXFLAGS = -std=c++20 -stdlib=libc++ -g -Wall -Wextra \
-           -I./src -I./src/parser -I./src/storage -I./src/core -I./src/common
+           -I$(SRC_DIR) \
+           -I../Debug/include \
+           -I/usr/local/include \
+           -I/usr/local/opt/readline/include
 
-LDFLAGS  = -L/usr/local/lib -lleveldb \
-           -L/usr/local/opt/llvm/lib/c++ -lc++abi -lc++ \
-           -lpthread
+LDFLAGS  = -L../Debug/lib -lleveldb \
+           -L/usr/local/opt/readline/lib -lreadline \
+           -L/usr/local/lib -lfmt \
+           -lpthread -l snappy \
+           -L/usr/local/opt/llvm/lib/c++ -lc++abi -lc++
 
 FLEX     = flex
 YACC     = /usr/local/opt/bison/bin/bison -t
@@ -15,13 +20,13 @@ YACC     = /usr/local/opt/bison/bin/bison -t
 # ============================================================
 # 目录路径
 # ============================================================
-SRC_DIR     = src
-PARSER_DIR  = $(SRC_DIR)/parser
-STORAGE_DIR = $(SRC_DIR)/storage
-CORE_DIR    = $(SRC_DIR)/core
-COMMON_DIR  = $(SRC_DIR)/common
-TESTS_DIR   = $(SRC_DIR)/tests
-BUILD_DIR   = build
+SRC_DIR      = .
+PARSER_DIR   = $(SRC_DIR)/parser
+QUERY_DIR    = $(SRC_DIR)/query
+RELATION_DIR = $(SRC_DIR)/relation
+STORAGE_DIR  = $(SRC_DIR)/storage
+TESTS_DIR    = $(SRC_DIR)/tests
+BUILD_DIR    = build
 
 # ============================================================
 # Parser 文件 (Flex/Bison)
@@ -32,103 +37,82 @@ LEX_OUT  = $(PARSER_DIR)/lex.yy.c
 LEX_HDR  = $(PARSER_DIR)/lex.yy.h
 YACC_OUT = $(PARSER_DIR)/parser.tab.c
 YACC_HDR = $(PARSER_DIR)/parser.tab.h
-
-# ============================================================
-# Parser 源文件
-# ============================================================
-AST_SRC  = $(PARSER_DIR)/ast.cpp
 AST_HDR  = $(PARSER_DIR)/ast.h
-AST_OBJ  = $(BUILD_DIR)/ast.o
 
 # ============================================================
-# Storage 源文件
+# 源文件（完整路径）
 # ============================================================
-STORAGE_HDR = $(STORAGE_DIR)/storage_engine.h
-MOCK_SRC    = $(STORAGE_DIR)/mock_engine.cpp
-MOCK_HDR    = $(STORAGE_DIR)/mock_engine.h
-MOCK_OBJ    = $(BUILD_DIR)/mock_engine.o
+# Parser
+PARSER_HDR = $(wildcard $(PARSER_DIR)/*.h)
+PARSER_SRCS    = $(PARSER_DIR)/ast.cpp
+GENERATED_SRCS = $(PARSER_DIR)/lex.yy.c $(PARSER_DIR)/parser.tab.c
 
-LEVELDB_SRC = $(STORAGE_DIR)/leveldb_engine.cpp
-LEVELDB_HDR = $(STORAGE_DIR)/leveldb_engine.h
-LEVELDB_OBJ = $(BUILD_DIR)/leveldb_engine.o
+# Storage
+STORAGE_HDR = $(wildcard $(STORAGE_DIR)/*/*.h)
+STORAGE_SRCS   = $(STORAGE_DIR)/kv_engine/kv_factory.cpp \
+                 $(STORAGE_DIR)/mock_engine/mock_engine.cpp \
+                 $(STORAGE_DIR)/leveldb_engine/leveldb_engine.cpp
 
-# ============================================================
-# Core 源文件
-# ============================================================
-CONDITION_SRC = $(CORE_DIR)/condition.cpp
-CONDITION_HDR = $(CORE_DIR)/condition.h
-CONDITION_OBJ = $(BUILD_DIR)/condition.o
+# Relation
+RELATION_HDR = $(wildcard $(RELATION_DIR)/*.h) $(STORAGE_HDR)
+RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
+                 $(RELATION_DIR)/schema.cpp \
+                 $(RELATION_DIR)/row.cpp \
+                 $(RELATION_DIR)/table.cpp \
+                 $(RELATION_DIR)/database.cpp \
+                 $(RELATION_DIR)/database_manager.cpp
 
-STATEMENT_SRC = $(CORE_DIR)/statement_builder.cpp
-STATEMENT_HDR = $(CORE_DIR)/statement.h $(CORE_DIR)/statement_builder.h
-STATEMENT_OBJ = $(BUILD_DIR)/statement_builder.o
+# Tests
+TESTS_SRCS     = $(TESTS_DIR)/test_parser.cpp \
+                 $(TESTS_DIR)/test_statement.cpp \
+                 $(TESTS_DIR)/test_condition.cpp \
+                 $(TESTS_DIR)/test_optimizer.cpp \
+                 $(TESTS_DIR)/test_executor.cpp \
+                 $(TESTS_DIR)/test_middle.cpp \
+                 $(TESTS_DIR)/test_mock_engine.cpp \
+                 $(TESTS_DIR)/test_leveldb_engine.cpp \
+                 $(TESTS_DIR)/test_relation.cpp
 
-OPTIMIZER_SRC = $(CORE_DIR)/optimizer.cpp
-OPTIMIZER_HDR = $(CORE_DIR)/optimizer.h $(CORE_DIR)/plan.h
-OPTIMIZER_OBJ = $(BUILD_DIR)/optimizer.o
-
-EXECUTOR_SRC  = $(CORE_DIR)/executor.cpp
-EXECUTOR_HDR  = $(CORE_DIR)/executor.h
-EXECUTOR_OBJ  = $(BUILD_DIR)/executor.o
-
-# ============================================================
-# Common 源文件
-# ============================================================
-COMMON_HDR = $(COMMON_DIR)/row_builder.h
-
-# ============================================================
-# Flex/Bison 对象
-# ============================================================
-LEX_OBJ  = $(BUILD_DIR)/lex.yy.o
-YACC_OBJ = $(BUILD_DIR)/parser.tab.o
+# Main
+MAIN_SRC       = $(SRC_DIR)/main.cpp
 
 # ============================================================
-# 主程序
+# 对象文件（从源文件路径生成）
 # ============================================================
-MAIN_SRC = $(SRC_DIR)/main.cpp
+# Parser 对象
+PARSER_OBJS = $(patsubst $(PARSER_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(PARSER_SRCS)) \
+              $(patsubst $(PARSER_DIR)/%.c,$(BUILD_DIR)/%.o,$(GENERATED_SRCS))
+
+# Storage 对象
+STORAGE_OBJS = $(patsubst $(STORAGE_DIR)/%/%.cpp,$(BUILD_DIR)/%.o,$(STORAGE_SRCS))
+
+# Relation 对象
+RELATION_OBJS = $(patsubst $(RELATION_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(RELATION_SRCS))
+
+# Tests 对象
+TESTS_OBJS = $(patsubst $(TESTS_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(TESTS_SRCS))
+
+# Main 对象
 MAIN_OBJ = $(BUILD_DIR)/main.o
-TARGET   = sql_engine
 
 # ============================================================
-# Core 对象（所有测试共享）
+# 核心对象（所有程序共享）
 # ============================================================
-CORE_OBJS = $(AST_OBJ) $(CONDITION_OBJ) $(STATEMENT_OBJ) \
-            $(OPTIMIZER_OBJ) $(EXECUTOR_OBJ) $(MOCK_OBJ) \
-            $(LEVELDB_OBJ) $(LEX_OBJ) $(YACC_OBJ)
+CORE_OBJS = $(PARSER_OBJS) $(STORAGE_OBJS) $(RELATION_OBJS)
 
 # ============================================================
-# 测试程序
+# 测试目标
 # ============================================================
-TEST_PARSER_SRC    = $(TESTS_DIR)/test_parser.cpp
-TEST_PARSER_OBJ    = $(BUILD_DIR)/test_parser.o
-TEST_PARSER_TARGET = test_parser
+TEST_TARGETS = test_parser test_statement test_condition \
+               test_optimizer test_executor test_middle \
+               test_mock_engine test_leveldb_engine test_relation
 
-TEST_STATEMENT_SRC = $(TESTS_DIR)/test_statement.cpp
-TEST_STATEMENT_OBJ = $(BUILD_DIR)/test_statement.o
-TEST_STATEMENT_TARGET = test_statement
-
-TEST_CONDITION_SRC = $(TESTS_DIR)/test_condition.cpp
-TEST_CONDITION_OBJ = $(BUILD_DIR)/test_condition.o
-TEST_CONDITION_TARGET = test_condition
-
-TEST_OPTIMIZER_SRC = $(TESTS_DIR)/test_optimizer.cpp
-TEST_OPTIMIZER_OBJ = $(BUILD_DIR)/test_optimizer.o
-TEST_OPTIMIZER_TARGET = test_optimizer
-
-TEST_EXECUTOR_SRC  = $(TESTS_DIR)/test_executor.cpp
-TEST_EXECUTOR_OBJ  = $(BUILD_DIR)/test_executor.o
-TEST_EXECUTOR_TARGET = test_executor
-
-TEST_MIDDLE_SRC    = $(TESTS_DIR)/test_middle.cpp
-TEST_MIDDLE_OBJ    = $(BUILD_DIR)/test_middle.o
-TEST_MIDDLE_TARGET = test_middle
+TARGET = sql_engine
 
 # ============================================================
 # 默认目标
 # ============================================================
-all: $(TARGET) $(TEST_PARSER_TARGET) $(TEST_STATEMENT_TARGET) \
-     $(TEST_CONDITION_TARGET) $(TEST_OPTIMIZER_TARGET) \
-     $(TEST_EXECUTOR_TARGET) $(TEST_MIDDLE_TARGET)
+all: $(TARGET) $(TEST_TARGETS)
 	@echo "✅ 所有程序构建完成"
 
 # ============================================================
@@ -147,45 +131,79 @@ $(LEX_OUT) $(LEX_HDR): $(LEX_SRC) $(YACC_HDR)
 	$(FLEX) --header-file=$(LEX_HDR) --outfile=$(LEX_OUT) $(LEX_SRC)
 
 # ============================================================
-# 编译 Parser
+# 编译规则（完整路径）
 # ============================================================
-$(AST_OBJ): $(AST_SRC) $(AST_HDR) | $(BUILD_DIR)
+
+# ---- Parser 的 .cpp ----
+$(BUILD_DIR)/ast.o: $(PARSER_DIR)/ast.cpp $(AST_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(LEX_OBJ): $(LEX_OUT) $(LEX_HDR) $(YACC_HDR) $(AST_HDR) | $(BUILD_DIR)
+# ---- Parser 的 .c（Flex/Bison 生成） ----
+$(BUILD_DIR)/lex.yy.o: $(PARSER_DIR)/lex.yy.c $(LEX_HDR) $(YACC_HDR) $(AST_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -Wno-unused-function -c $< -o $@
 
-$(YACC_OBJ): $(YACC_OUT) $(YACC_HDR) $(AST_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/parser.tab.o: $(PARSER_DIR)/parser.tab.c $(YACC_HDR) $(AST_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -Wno-unused-function -c $< -o $@
 
-# ============================================================
-# 编译 Storage
-# ============================================================
-$(MOCK_OBJ): $(MOCK_SRC) $(MOCK_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+# ---- Storage ----
+$(BUILD_DIR)/kv_factory.o: $(STORAGE_DIR)/kv_engine/kv_factory.cpp $(STORAGE_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(LEVELDB_OBJ): $(LEVELDB_SRC) $(LEVELDB_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/mock_engine.o: $(STORAGE_DIR)/mock_engine/mock_engine.cpp $(STORAGE_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# ============================================================
-# 编译 Core
-# ============================================================
-$(CONDITION_OBJ): $(CONDITION_SRC) $(CONDITION_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/leveldb_engine.o: $(STORAGE_DIR)/leveldb_engine/leveldb_engine.cpp $(STORAGE_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(STATEMENT_OBJ): $(STATEMENT_SRC) $(STATEMENT_HDR) $(AST_HDR) $(CONDITION_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+# ---- Relation ----
+$(BUILD_DIR)/value.o: $(RELATION_DIR)/value.cpp $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OPTIMIZER_OBJ): $(OPTIMIZER_SRC) $(OPTIMIZER_HDR) $(STATEMENT_HDR) $(CONDITION_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/schema.o: $(RELATION_DIR)/schema.cpp $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(EXECUTOR_OBJ): $(EXECUTOR_SRC) $(EXECUTOR_HDR) $(PLAN_HDR) $(CONDITION_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/row.o: $(RELATION_DIR)/row.cpp $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# ============================================================
-# 编译主程序
-# ============================================================
-$(MAIN_OBJ): $(MAIN_SRC) $(AST_HDR) $(STATEMENT_HDR) $(OPTIMIZER_HDR) $(EXECUTOR_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/table.o: $(RELATION_DIR)/table.cpp $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/database.o: $(RELATION_DIR)/database.cpp $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/database_manager.o: $(RELATION_DIR)/database_manager.cpp $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# ---- Tests ----
+$(BUILD_DIR)/test_parser.o: $(TESTS_DIR)/test_parser.cpp $(AST_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_statement.o: $(TESTS_DIR)/test_statement.cpp $(AST_HDR) $(QUERY_DIR)/statement.h $(STORAGE_DIR)/kv_engine/kv_engine.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_condition.o: $(TESTS_DIR)/test_condition.cpp $(QUERY_DIR)/condition.h $(RELATION_DIR)/schema.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_optimizer.o: $(TESTS_DIR)/test_optimizer.cpp $(QUERY_DIR)/optimizer.h $(RELATION_DIR)/database_manager.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_executor.o: $(TESTS_DIR)/test_executor.cpp $(QUERY_DIR)/executor.h $(RELATION_DIR)/database_manager.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_middle.o: $(TESTS_DIR)/test_middle.cpp $(AST_HDR) $(QUERY_DIR)/statement_builder.h $(QUERY_DIR)/optimizer.h $(QUERY_DIR)/executor.h $(RELATION_DIR)/database_manager.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_mock_engine.o: $(TESTS_DIR)/test_mock_engine.cpp $(STORAGE_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_leveldb_engine.o: $(TESTS_DIR)/test_leveldb_engine.cpp $(STORAGE_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_relation.o: $(TESTS_DIR)/test_relation.cpp $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# ---- Main ----
+$(BUILD_DIR)/main.o: $(MAIN_SRC) $(AST_HDR) $(RELATION_DIR)/sql_relation.h $(STORAGE_DIR)/kv_engine/kv_engine.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ============================================================
@@ -195,133 +213,60 @@ $(TARGET): $(MAIN_OBJ) $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 # ============================================================
-# 编译测试程序
-# ============================================================
-$(TEST_PARSER_OBJ): $(TEST_PARSER_SRC) $(AST_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_STATEMENT_OBJ): $(TEST_STATEMENT_SRC) $(AST_HDR) $(STATEMENT_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_CONDITION_OBJ): $(TEST_CONDITION_SRC) $(CONDITION_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_OPTIMIZER_OBJ): $(TEST_OPTIMIZER_SRC) $(STATEMENT_HDR) $(OPTIMIZER_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_EXECUTOR_OBJ): $(TEST_EXECUTOR_SRC) $(EXECUTOR_HDR) $(PLAN_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(TEST_MIDDLE_OBJ): $(TEST_MIDDLE_SRC) $(AST_HDR) $(STATEMENT_HDR) $(OPTIMIZER_HDR) $(EXECUTOR_HDR) $(STORAGE_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# ============================================================
 # 链接测试程序
 # ============================================================
-$(TEST_PARSER_TARGET): $(TEST_PARSER_OBJ) $(AST_OBJ) $(LEX_OBJ) $(YACC_OBJ)
+test_parser: $(BUILD_DIR)/test_parser.o $(PARSER_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(TEST_STATEMENT_TARGET): $(TEST_STATEMENT_OBJ) $(CORE_OBJS)
+test_statement: $(BUILD_DIR)/test_statement.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(TEST_CONDITION_TARGET): $(TEST_CONDITION_OBJ) $(CONDITION_OBJ) $(STORAGE_HDR)
+test_condition: $(BUILD_DIR)/test_condition.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(TEST_OPTIMIZER_TARGET): $(TEST_OPTIMIZER_OBJ) $(CORE_OBJS)
+test_optimizer: $(BUILD_DIR)/test_optimizer.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(TEST_EXECUTOR_TARGET): $(TEST_EXECUTOR_OBJ) $(CORE_OBJS)
+test_executor: $(BUILD_DIR)/test_executor.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(TEST_MIDDLE_TARGET): $(TEST_MIDDLE_OBJ) $(CORE_OBJS)
+test_middle: $(BUILD_DIR)/test_middle.o $(CORE_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_mock_engine: $(BUILD_DIR)/test_mock_engine.o $(STORAGE_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_leveldb_engine: $(BUILD_DIR)/test_leveldb_engine.o $(STORAGE_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_relation: $(BUILD_DIR)/test_relation.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 # ============================================================
 # 运行测试目标
 # ============================================================
-.PHONY: test test-parser test-statement test-condition \
-        test-optimizer test-executor test-middle \
-        test-all test-quick
+.PHONY: test test-quick $(addprefix test-,$(TEST_TARGETS))
 
-# 运行所有测试
-test: test-parser test-statement test-condition \
-      test-optimizer test-executor test-middle
+test: $(TEST_TARGETS)
 	@echo ""
 	@echo "╔══════════════════════════════════════════╗"
 	@echo "║     ✅ 所有测试通过                    ║"
 	@echo "╚══════════════════════════════════════════╝"
 
-# 快速测试（只运行核心测试）
-test-quick: test-parser test-statement test-executor
+test-quick: test_parser test_statement test_relation
 	@echo ""
 	@echo "✅ 快速测试完成"
 
-# 分阶段测试
-test-parser: $(TEST_PARSER_TARGET)
+define TEST_RULE
+test-$(1):
 	@echo ""
 	@echo "╔══════════════════════════════════════════╗"
-	@echo "║     🧪 测试: Parser (词法/语法分析)    ║"
+	@echo "║     🧪 测试: $(1)                      ║"
 	@echo "╚══════════════════════════════════════════╝"
-	./$(TEST_PARSER_TARGET)
+	./$(1)
+endef
 
-test-statement: $(TEST_STATEMENT_TARGET)
-	@echo ""
-	@echo "╔══════════════════════════════════════════╗"
-	@echo "║     🧪 测试: Statement Builder          ║"
-	@echo "╚══════════════════════════════════════════╝"
-	./$(TEST_STATEMENT_TARGET)
-
-test-condition: $(TEST_CONDITION_TARGET)
-	@echo ""
-	@echo "╔══════════════════════════════════════════╗"
-	@echo "║     🧪 测试: Condition (条件表达式)     ║"
-	@echo "╚══════════════════════════════════════════╝"
-	./$(TEST_CONDITION_TARGET)
-
-test-optimizer: $(TEST_OPTIMIZER_TARGET)
-	@echo ""
-	@echo "╔══════════════════════════════════════════╗"
-	@echo "║     🧪 测试: Optimizer (优化器)         ║"
-	@echo "╚══════════════════════════════════════════╝"
-	./$(TEST_OPTIMIZER_TARGET)
-
-test-executor: $(TEST_EXECUTOR_TARGET)
-	@echo ""
-	@echo "╔══════════════════════════════════════════╗"
-	@echo "║     🧪 测试: Executor (执行器)          ║"
-	@echo "╚══════════════════════════════════════════╝"
-	./$(TEST_EXECUTOR_TARGET)
-
-test-middle: $(TEST_MIDDLE_TARGET)
-	@echo ""
-	@echo "╔══════════════════════════════════════════╗"
-	@echo "║     🧪 测试: 完整中端流程               ║"
-	@echo "╚══════════════════════════════════════════╝"
-	./$(TEST_MIDDLE_TARGET)
-
-# ============================================================
-# 构建单个测试程序（不运行）
-# ============================================================
-.PHONY: build-parser build-statement build-condition \
-        build-optimizer build-executor build-middle
-
-build-parser: $(TEST_PARSER_TARGET)
-	@echo "✅ Parser 测试构建完成"
-
-build-statement: $(TEST_STATEMENT_TARGET)
-	@echo "✅ Statement Builder 测试构建完成"
-
-build-condition: $(TEST_CONDITION_TARGET)
-	@echo "✅ Condition 测试构建完成"
-
-build-optimizer: $(TEST_OPTIMIZER_TARGET)
-	@echo "✅ Optimizer 测试构建完成"
-
-build-executor: $(TEST_EXECUTOR_TARGET)
-	@echo "✅ Executor 测试构建完成"
-
-build-middle: $(TEST_MIDDLE_TARGET)
-	@echo "✅ 完整中端测试构建完成"
+$(foreach t,$(TEST_TARGETS),$(eval $(call TEST_RULE,$(t))))
 
 # ============================================================
 # 运行主程序
@@ -334,16 +279,9 @@ run: $(TARGET)
 # ============================================================
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -f $(TARGET) \
-	      $(TEST_PARSER_TARGET) $(TEST_STATEMENT_TARGET) \
-	      $(TEST_CONDITION_TARGET) $(TEST_OPTIMIZER_TARGET) \
-	      $(TEST_EXECUTOR_TARGET) $(TEST_MIDDLE_TARGET) \
-	      $(LEX_OUT) $(YACC_OUT) $(YACC_HDR) $(LEX_HDR)
+	rm -f $(TARGET) $(TEST_TARGETS) $(LEX_OUT) $(YACC_OUT) $(YACC_HDR) $(LEX_HDR)
 	@echo "✅ 清理完成"
 
-# ============================================================
-# 完全清理
-# ============================================================
 distclean: clean
 	rm -rf sql_db *.dSYM
 	@echo "✅ 完全清理完成"
@@ -359,22 +297,19 @@ help:
 	@echo "构建目标："
 	@echo "  make all              - 构建所有程序和测试"
 	@echo "  make $(TARGET)        - 只构建主程序"
-	@echo "  make build-parser     - 构建 Parser 测试"
-	@echo "  make build-statement  - 构建 Statement 测试"
-	@echo "  make build-condition  - 构建 Condition 测试"
-	@echo "  make build-optimizer  - 构建 Optimizer 测试"
-	@echo "  make build-executor   - 构建 Executor 测试"
-	@echo "  make build-middle     - 构建完整中端测试"
 	@echo ""
 	@echo "运行测试："
 	@echo "  make test             - 运行所有测试"
-	@echo "  make test-quick       - 运行快速测试"
+	@echo "  make test-quick       - 运行快速测试 (parser, statement, relation)"
 	@echo "  make test-parser      - 运行 Parser 测试"
-	@echo "  make test-statement   - 运行 Statement Builder 测试"
+	@echo "  make test-statement   - 运行 Statement 测试"
 	@echo "  make test-condition   - 运行 Condition 测试"
 	@echo "  make test-optimizer   - 运行 Optimizer 测试"
 	@echo "  make test-executor    - 运行 Executor 测试"
 	@echo "  make test-middle      - 运行完整中端测试"
+	@echo "  make test-relation    - 运行 Relation 测试"
+	@echo "  make test-mock-engine - 运行 Mock Engine 测试"
+	@echo "  make test-leveldb-engine - 运行 LevelDB Engine 测试"
 	@echo ""
 	@echo "其他："
 	@echo "  make run              - 运行主程序"
@@ -382,8 +317,4 @@ help:
 	@echo "  make distclean        - 完全清理（含数据库）"
 	@echo "  make help             - 显示此帮助信息"
 
-.PHONY: all clean distclean help run \
-        test test-quick test-parser test-statement test-condition \
-        test-optimizer test-executor test-middle \
-        build-parser build-statement build-condition \
-        build-optimizer build-executor build-middle
+.PHONY: all clean distclean help run test test-quick

@@ -1,20 +1,24 @@
 // statement.h
-#ifndef STATEMENT_H
-#define STATEMENT_H
+#ifndef QUERY_STATEMENT_H
+#define QUERY_STATEMENT_H
 
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "relation/sql_relation.h"
 #include "condition.h"
-#include "storage_engine.h"
 
-namespace sql {
+namespace query {
 
-// ============ 语句类型 ============
+// ============================================================
+// 语句类型
+// ============================================================
 enum class StatementType { USE, SELECT, INSERT, UPDATE, DELETE, UNKNOWN };
 
-// ============ 语句基类 ============
+// ============================================================
+// 语句基类
+// ============================================================
 class Statement {
  public:
   virtual ~Statement() = default;
@@ -26,21 +30,26 @@ class Statement {
   bool valid_ = true;
 };
 
-// ============ USE 语句 ============
+// ============================================================
+// USE 语句
+// ============================================================
 class UseStatement : public Statement {
  public:
   std::string database_name;
+
   UseStatement(const std::string& db) : database_name(db) {}
   StatementType type() const override { return StatementType::USE; }
   std::string to_string() const override { return "USE " + database_name; }
 };
 
-// ============ SELECT 语句 ============
+// ============================================================
+// SELECT 语句
+// ============================================================
 class SelectStatement : public Statement {
  public:
   std::string table_name;
-  std::vector<std::string> columns;
-  std::unique_ptr<ConditionExpr> condition;
+  std::vector<std::string> columns;          // 空表示 SELECT *
+  std::unique_ptr<ConditionExpr> condition;  // WHERE 条件
 
   SelectStatement(const std::string& table) : table_name(table) {}
   StatementType type() const override { return StatementType::SELECT; }
@@ -63,12 +72,14 @@ class SelectStatement : public Statement {
   }
 };
 
-// ============ INSERT 语句 ============
+// ============================================================
+// INSERT 语句
+// ============================================================
 class InsertStatement : public Statement {
  public:
   std::string table_name;
   std::vector<std::string> columns;
-  std::vector<storage::Value> values;
+  std::vector<sql::Value> values;
 
   InsertStatement(const std::string& table) : table_name(table) {}
   StatementType type() const override { return StatementType::INSERT; }
@@ -93,11 +104,13 @@ class InsertStatement : public Statement {
   }
 };
 
-// ============ UPDATE 语句 ============
+// ============================================================
+// UPDATE 语句
+// ============================================================
 class UpdateStatement : public Statement {
  public:
   std::string table_name;
-  std::vector<std::pair<std::string, storage::Value>> assignments;
+  std::vector<std::pair<std::string, sql::Value>> assignments;
   std::unique_ptr<ConditionExpr> condition;
 
   UpdateStatement(const std::string& table) : table_name(table) {}
@@ -117,7 +130,9 @@ class UpdateStatement : public Statement {
   }
 };
 
-// ============ DELETE 语句 ============
+// ============================================================
+// DELETE 语句
+// ============================================================
 class DeleteStatement : public Statement {
  public:
   std::string table_name;
@@ -135,6 +150,6 @@ class DeleteStatement : public Statement {
   }
 };
 
-}  // namespace sql
+}  // namespace query
 
-#endif  // STATEMENT_H
+#endif  // QUERY_STATEMENT_H

@@ -1,0 +1,28 @@
+SQL: SELECT id, name FROM users WHERE age > 25 AND id < 7;
+
+1. Parser → AST
+   NODE_SELECT
+     left: NODE_LIST [id, name]
+     right: NODE_BINARY_OP (AND)
+       left: NODE_COMPARE (age > 25)
+       right: NODE_COMPARE (id < 7)
+     str_val: "users"
+
+2. StatementBuilder → SelectStatement
+   table: "users"
+   columns: ["id", "name"]
+   condition: (age > 25 AND id < 7)
+
+3. Optimizer → ExecutionPlan
+   检查条件：
+   - age > 25 → 非主键条件，保留
+   - id < 7 → 主键条件，可下推
+   生成计划：
+   IndexScan(users, range: [-inf, 7))
+     filter: age > 25
+
+4. Executor → Result
+   a. Table::scan_range(-inf, 7) → rows where id < 7
+   b. 应用 filter: age > 25
+   c. 投影: id, name
+   d. 返回结果

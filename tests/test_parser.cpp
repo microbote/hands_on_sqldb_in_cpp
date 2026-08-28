@@ -2,9 +2,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "ast.h"
-#include "parser.tab.h"
-#include "lex.yy.h"
+#include "parser/ast.h"
+#include "parser/parser.tab.h"
+#include "parser/lex.yy.h"
 #include <vector>
 #include <string>
 using namespace std;

@@ -21,6 +21,10 @@ test_condition
 test_optimizer
 test_executor
 test_middle
+test_relation
+test_mock_engine
+test_leveldb_engine
+    
 
 # ============================================================
 # Flex/Bison 生成的文件
