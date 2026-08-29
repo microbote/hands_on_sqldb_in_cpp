@@ -6,10 +6,12 @@
 #include <vector>
 
 #include "value.h"
+#include <expected>  // C++23
 
 namespace sql {
 
 class TableSchema;
+enum class SchemaError;
 
 class Row {
  public:
@@ -33,6 +35,7 @@ class Row {
   bool operator!=(const Row& other) const { return !(*this == other); }
 
   void push_back(const Value& value) { values_.push_back(value); }
+  void reserve(size_t size) { values_.reserve(size); }
  private:
   std::vector<Value> values_;
 };
@@ -80,8 +83,9 @@ class RowBuilder {
     return *this;
   }
 
-  Row build(const TableSchema& schema) const;
-  Row build_ordered(const std::vector<std::string>& order) const;
+  std::expected<Row, SchemaError> build(const TableSchema& schema) const;
+  std::expected<Row, SchemaError> build_ordered(
+      const TableSchema& schema, const std::vector<std::string>& order) const;
 
   Value get(const std::string& column) const;
   bool has(const std::string& column) const;

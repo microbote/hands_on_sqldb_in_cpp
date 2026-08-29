@@ -49,6 +49,16 @@ inline std::string data_key(const std::string& db_name,
   return data_key(db_name, table_name, primary_key.to_string());
 }
 
+inline std::string data_prefix_key(const std::string& prefix,
+                                   const std::string& primary_key) {
+  return prefix + primary_key;
+}
+
+inline std::string data_prefix_key(const std::string& prefix,
+                                   const Value& primary_key) {
+  return data_prefix_key(prefix, primary_key.to_string());
+}
+
 // ============================================================
 // Key 类型检查
 // ============================================================

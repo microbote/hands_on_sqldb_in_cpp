@@ -62,29 +62,60 @@ bool Row::operator==(const Row& other) const {
 // RowBuilder 实现
 // ============================================================
 
-Row RowBuilder::build(const TableSchema& schema) const {
+std::expected<Row, SchemaError> RowBuilder::build(
+    const TableSchema& schema) const {
   Row row;
+  row.reserve(schema.columns().size());
+
   for (const auto& col : schema.columns()) {
     auto it = values_.find(col.name);
     if (it != values_.end()) {
       row.push_back(it->second);
     } else {
+      // ✅ 检查 NOT NULL 约束：缺失的列如果 NOT NULL，返回错误
+      if (!col.nullable) {
+        fprintf(stderr, "column:[%s] is not nullable\n", col.name.c_str());
+        return std::unexpected(SchemaError::COLUMN_ATTR_NULL_MISMATCH);
+      }
       row.push_back(Value());  // NULL
     }
   }
+
+  // ✅ 验证行（类型检查、NULL 约束等）
+  auto err = schema.validate_row(row);
+  if (err != SchemaError::OK) {
+    return std::unexpected(err);
+  }
+
   return row;
 }
 
-Row RowBuilder::build_ordered(const std::vector<std::string>& order) const {
+std::expected<Row, SchemaError> RowBuilder::build_ordered(
+    const TableSchema& schema, const std::vector<std::string>& order) const {
   Row row;
-  for (const auto& col : order) {
-    auto it = values_.find(col);
+  row.reserve(order.size());
+
+  for (const auto& col_name : order) {
+    auto it = values_.find(col_name);
     if (it != values_.end()) {
       row.push_back(it->second);
     } else {
+      const auto* col = schema.column(col_name);
+      if (!col) {
+        return std::unexpected(SchemaError::COLUMN_NOT_FOUND);
+      }
+      if (!col->nullable) {
+        return std::unexpected(SchemaError::COLUMN_ATTR_NULL_MISMATCH);
+      }
       row.push_back(Value());
     }
   }
+
+  auto err = schema.validate_row(row);
+  if (err != SchemaError::OK) {
+    return std::unexpected(err);
+  }
+
   return row;
 }
 

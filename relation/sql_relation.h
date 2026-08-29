@@ -6,3 +6,5 @@
 #include "database.h"
 #include "database_manager.h"
 #include "schema.h"
+#include "cursor.h"
+

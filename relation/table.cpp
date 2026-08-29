@@ -3,6 +3,8 @@
 
 #include <iostream>
 #include <sstream>
+#include "key_prefix.h"
+#include "cursor.h"
 
 namespace sql {
 
@@ -17,8 +19,10 @@ Table::Table(std::shared_ptr<kv::KVEngine> engine, const std::string& db_name,
 // ============================================================
 
 bool Table::insert(const Row& row) {
-  if (!schema_.validate_row(row)) {
+  auto err = schema_.validate_row(row);
+  if (SchemaError::OK != err) {
     std::cerr << "❌ Insert failed: invalid row for table " << schema_.name()
+              << ": " << TableSchema::error_message(err)
               << std::endl;
     return false;
   }
@@ -29,7 +33,7 @@ bool Table::insert(const Row& row) {
     return false;
   }
 
-  std::string key = keys::data_key(db_name_, schema_.name(), pk);
+  std::string key = this->to_kv_key(pk);
   std::string value = encode_row(row);
 
   return engine_->put(key, value) == kv::Status::OK;
@@ -43,18 +47,21 @@ bool Table::insert_batch(const std::vector<Row>& rows) {
   kv::WriteBatch batch;
 
   for (const auto& row : rows) {
-    if (!schema_.validate_row(row)) {
-      std::cerr << "❌ Batch insert failed: invalid row" << std::endl;
+    auto err = schema_.validate_row(row);
+    if (SchemaError::OK != err) {
+      std::cerr << "❌ Batch insert failed: invalid row. Error: "
+                << TableSchema::error_message(err) << std::endl;
       return false;
     }
 
     Value pk = get_primary_key(row);
     if (pk.is_null()) {
-      std::cerr << "❌ Batch insert failed: null primary key" << std::endl;
+      std::cerr << "❌ Batch insert failed: null primary key:"
+                << row.to_string() << std::endl;
       return false;
     }
 
-    std::string key = keys::data_key(db_name_, schema_.name(), pk);
+    std::string key = to_kv_key(pk);
     std::string value = encode_row(row);
     batch.put(key, value);
   }
@@ -66,12 +73,12 @@ bool Table::insert_batch(const std::vector<Row>& rows) {
 // 查询操作
 // ============================================================
 
-std::optional<Row> Table::get(const Value& primary_key) {
+std::optional<Row> Table::get(const Value& primary_key) const{
   if (primary_key.is_null()) {
     return std::nullopt;
   }
 
-  std::string key = keys::data_key(db_name_, schema_.name(), primary_key);
+  std::string key = to_kv_key(primary_key);
   std::string value;
   kv::Status status = engine_->get(key, &value);
 
@@ -82,12 +89,48 @@ std::optional<Row> Table::get(const Value& primary_key) {
   return decode_row(value);
 }
 
-std::optional<Row> Table::get(const std::string& primary_key) {
+std::optional<Row> Table::get(const std::string& primary_key) const {
   return get(Value(primary_key));
 }
 
-std::optional<Row> Table::get(int64_t primary_key) {
+std::optional<Row> Table::get(int64_t primary_key) const {
   return get(Value(primary_key));
+}
+
+// 批量点查询
+bool Table::get_batch(const std::vector<Value>& primary_keys,
+               TableMissingKeyPolicy policy,
+               std::vector<std::optional<Row>>* values) const {
+    kv::MissingKeyPolicy kv_policy;
+
+    switch (policy) {
+      case TableMissingKeyPolicy::kReturnError:
+        kv_policy = kv::MissingKeyPolicy::kReturnError;
+        break;
+      case TableMissingKeyPolicy::kReturnEmpty:
+        kv_policy = kv::MissingKeyPolicy::kReturnEmpty;
+        break;
+    }
+    std::vector<std::optional<kv::ByteValue>> kv_values;
+    std::vector<std::string> kv_keys(primary_keys.size());
+    for(int i=0;i<primary_keys.size();i++){
+      kv_keys[i] = to_kv_key(primary_keys[i]);
+    }
+    auto status = engine_->get_batch(kv_keys, kv_policy, &kv_values);
+
+    for (size_t i = 0; i < kv_values.size(); ++i) {
+      if (kv_values[i].has_value()) {
+        values->push_back(decode_row(*kv_values[i]));
+      } else {
+        values->push_back(std::nullopt);
+      }
+    }
+    if(status != kv::Status::OK){
+      fprintf(stderr, "get_batch error, batchsize:%d, from:%s\n",
+              kv_keys.size(), get_key_prefix().c_str());
+      return false;
+    }
+    return true;
 }
 
 // ============================================================
@@ -99,7 +142,7 @@ bool Table::update(const Value& primary_key, const Row& row) {
     return false;
   }
 
-  if (!schema_.validate_row(row)) {
+  if (SchemaError::OK != schema_.validate_row(row)) {
     std::cerr << "❌ Update failed: invalid row" << std::endl;
     return false;
   }
@@ -111,7 +154,7 @@ bool Table::update(const Value& primary_key, const Row& row) {
     return false;
   }
 
-  std::string key = keys::data_key(db_name_, schema_.name(), primary_key);
+  std::string key = to_kv_key(primary_key);
   std::string value = encode_row(row);
 
   return engine_->put(key, value) == kv::Status::OK;
@@ -148,7 +191,7 @@ bool Table::remove(const Value& primary_key) {
     return false;
   }
 
-  std::string key = keys::data_key(db_name_, schema_.name(), primary_key);
+  std::string key = to_kv_key(primary_key);
   return engine_->remove(key) == kv::Status::OK;
 }
 
@@ -161,59 +204,47 @@ bool Table::remove(int64_t primary_key) { return remove(Value(primary_key)); }
 // ============================================================
 // 扫描操作
 // ============================================================
+kv::KeyRange Table::to_kv_range(const PrimaryKeyRange& range) const {
+  kv::KeyRange kv_range;
+  kv_range.direction = (range.direction == ScanDirection::kForward)
+                           ? kv::ScanDirection::kForward
+                           : kv::ScanDirection::kReverse;
+  kv_range.limit = range.limit;
 
-std::vector<Row> Table::scan_all() {
-  std::vector<Row> result;
-  kv::KeyRange range = kv::KeyRange::prefix(key_prefix_);
-  auto it = engine_->new_iterator(range);
-
-  if (!it) {
-    return result;
+  if (range.start) {
+    kv_range.start = to_kv_key(*range.start);
+  }else{
+    kv_range.start = key_prefix_;
+  }
+  if (range.end) {
+    kv_range.end = to_kv_key(*range.end);
+  }else{
+    kv_range.end = key_prefix_ + '\xFF';
   }
 
-  while (it->valid()) {
-    result.push_back(decode_row(it->value()));
-    it->next();
-  }
-
-  return result;
+  return kv_range;
 }
 
-std::vector<Row> Table::scan_range(const Value& start, const Value& end) {
-  std::vector<Row> result;
-  std::string start_key = keys::data_key(db_name_, schema_.name(), start);
-  std::string end_key = keys::data_key(db_name_, schema_.name(), end);
-  kv::KeyRange range = kv::KeyRange::range(start_key, end_key);
-  auto it = engine_->new_iterator(range);
 
-  if (!it) {
-    return result;
+std::unique_ptr<Cursor> Table::scan(const PrimaryKeyRange& range) {
+  // 由 Table 创建 Cursor，传入 this 指针
+  if(!engine_){
+    fprintf(stderr, "engine is null from %s\n", key_prefix_.c_str());
+    return nullptr;
+  }
+  auto kv_iter = engine_->new_iterator(to_kv_range(range));
+  if (!kv_iter)
+  {
+    fprintf(stderr, "scan iterator is null from %s\n", key_prefix_.c_str());
+    return nullptr;
   }
 
-  while (it->valid()) {
-    result.push_back(decode_row(it->value()));
-    it->next();
-  }
-
-  return result;
+  return std::make_unique<TableCursor>(this, range, std::move(kv_iter));
 }
 
-std::vector<Row> Table::scan_prefix(const std::string& prefix) {
-  std::vector<Row> result;
-  std::string full_prefix = key_prefix_ + prefix;
-  kv::KeyRange range = kv::KeyRange::prefix(full_prefix);
-  auto it = engine_->new_iterator(range);
-
-  if (!it) {
-    return result;
-  }
-
-  while (it->valid()) {
-    result.push_back(decode_row(it->value()));
-    it->next();
-  }
-
-  return result;
+std::unique_ptr<Cursor> Table::scan_all()
+{
+  return scan(PrimaryKeyRange::all());
 }
 
 // ============================================================

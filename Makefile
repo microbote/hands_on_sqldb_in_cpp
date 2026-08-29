@@ -2,11 +2,12 @@
 # 编译器和编译选项
 # ============================================================
 CXX      = /usr/local/opt/llvm/bin/clang++
-CXXFLAGS = -std=c++20 -stdlib=libc++ -g -Wall -Wextra \
+CXXFLAGS = -std=c++23 -stdlib=libc++ -g -Wall -Wextra \
            -I$(SRC_DIR) \
            -I../Debug/include \
            -I/usr/local/include \
-           -I/usr/local/opt/readline/include
+           -I/usr/local/opt/readline/include \
+					 -I/usr/local/Cellar/llvm/20.1.5/bin/../include/c++/v1
 
 LDFLAGS  = -L../Debug/lib -lleveldb \
            -L/usr/local/opt/readline/lib -lreadline \
@@ -57,6 +58,7 @@ STORAGE_SRCS   = $(STORAGE_DIR)/kv_engine/kv_factory.cpp \
 RELATION_HDR = $(wildcard $(RELATION_DIR)/*.h) $(STORAGE_HDR)
 RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
                  $(RELATION_DIR)/schema.cpp \
+								 $(RELATION_DIR)/cursor.cpp \
                  $(RELATION_DIR)/row.cpp \
                  $(RELATION_DIR)/table.cpp \
                  $(RELATION_DIR)/database.cpp \
@@ -163,6 +165,9 @@ $(BUILD_DIR)/schema.o: $(RELATION_DIR)/schema.cpp $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/row.o: $(RELATION_DIR)/row.cpp $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cursor.o: $(RELATION_DIR)/cursor.cpp $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/table.o: $(RELATION_DIR)/table.cpp $(RELATION_HDR) | $(BUILD_DIR)
