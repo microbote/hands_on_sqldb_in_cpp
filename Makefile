@@ -49,13 +49,13 @@ PARSER_SRCS    = $(PARSER_DIR)/ast.cpp
 GENERATED_SRCS = $(PARSER_DIR)/lex.yy.c $(PARSER_DIR)/parser.tab.c
 
 # Storage
-STORAGE_HDR = $(wildcard $(STORAGE_DIR)/*/*.h)
+STORAGE_HDR    = $(wildcard $(STORAGE_DIR)/*/*.h)
 STORAGE_SRCS   = $(STORAGE_DIR)/kv_engine/kv_factory.cpp \
                  $(STORAGE_DIR)/mock_engine/mock_engine.cpp \
                  $(STORAGE_DIR)/leveldb_engine/leveldb_engine.cpp
 
 # Relation
-RELATION_HDR = $(wildcard $(RELATION_DIR)/*.h) $(STORAGE_HDR)
+RELATION_HDR   = $(wildcard $(RELATION_DIR)/*.h) $(STORAGE_HDR)
 RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
                  $(RELATION_DIR)/schema.cpp \
 								 $(RELATION_DIR)/cursor.cpp \
@@ -75,6 +75,9 @@ TESTS_SRCS     = $(TESTS_DIR)/test_parser.cpp \
                  $(TESTS_DIR)/test_leveldb_engine.cpp \
                  $(TESTS_DIR)/test_relation.cpp
 
+QUERY_HDR      = $(wildcard $(QUERY_DIR)/*.h)
+QUERY_SRCS     = $(QUERY_DIR)/statement/condition.cpp
+
 # Main
 MAIN_SRC       = $(SRC_DIR)/main.cpp
 
@@ -91,6 +94,9 @@ STORAGE_OBJS = $(patsubst $(STORAGE_DIR)/%/%.cpp,$(BUILD_DIR)/%.o,$(STORAGE_SRCS
 # Relation 对象
 RELATION_OBJS = $(patsubst $(RELATION_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(RELATION_SRCS))
 
+# Query 对象
+QUERY_OBJS = $(patsubst $(QUERY_DIR)/%/%.cpp,$(BUILD_DIR)/%.o,$(QUERY_SRCS))
+
 # Tests 对象
 TESTS_OBJS = $(patsubst $(TESTS_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(TESTS_SRCS))
 
@@ -100,7 +106,8 @@ MAIN_OBJ = $(BUILD_DIR)/main.o
 # ============================================================
 # 核心对象（所有程序共享）
 # ============================================================
-CORE_OBJS = $(PARSER_OBJS) $(STORAGE_OBJS) $(RELATION_OBJS)
+CORE_OBJS = $(PARSER_OBJS) $(STORAGE_OBJS) $(RELATION_OBJS) \
+            $(QUERY_OBJS)
 
 # ============================================================
 # 测试目标
@@ -179,14 +186,14 @@ $(BUILD_DIR)/database.o: $(RELATION_DIR)/database.cpp $(RELATION_HDR) | $(BUILD_
 $(BUILD_DIR)/database_manager.o: $(RELATION_DIR)/database_manager.cpp $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/condition.o : $(QUERY_DIR)/statement/condition.cpp $(QUERY_HDR) $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 # ---- Tests ----
 $(BUILD_DIR)/test_parser.o: $(TESTS_DIR)/test_parser.cpp $(AST_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_statement.o: $(TESTS_DIR)/test_statement.cpp $(AST_HDR) $(QUERY_DIR)/statement.h $(STORAGE_DIR)/kv_engine/kv_engine.h | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/test_condition.o: $(TESTS_DIR)/test_condition.cpp $(QUERY_DIR)/condition.h $(RELATION_DIR)/schema.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_optimizer.o: $(TESTS_DIR)/test_optimizer.cpp $(QUERY_DIR)/optimizer.h $(RELATION_DIR)/database_manager.h | $(BUILD_DIR)
@@ -205,6 +212,9 @@ $(BUILD_DIR)/test_leveldb_engine.o: $(TESTS_DIR)/test_leveldb_engine.cpp $(STORA
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_relation.o: $(TESTS_DIR)/test_relation.cpp $(RELATION_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_condition.o: $(TESTS_DIR)/test_condition.cpp $(QUERY_HDR) $(RELATION_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ---- Main ----
