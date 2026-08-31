@@ -3,6 +3,7 @@
 #define QUERY_CONDITION_H
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -11,9 +12,9 @@
 namespace query {
 
 // ============================================================
-// 比较操作符
+// 比较操作符（仅用于 COMPARE 节点）
 // ============================================================
-enum class CompareOp { EQ, NE, GT, GE, LT, LE, LIKE, IN };
+enum class CompareOp { EQ, NE, GT, GE, LT, LE, LIKE, IS_NULL, IS_NOT_NULL };
 
 // ============================================================
 // 条件类型
@@ -27,50 +28,132 @@ enum class ConditionType {
 };
 
 // ============================================================
+// 主键条件片段（一个 OR 分支）
+// ============================================================
+struct PrimaryKeyFragment {
+  bool is_point_set = false;
+  std::vector<sql::Value> points;   // 点集（OR 关系）
+  std::optional<sql::Value> start;  // 范围起始（包含）
+  std::optional<sql::Value> end;    // 范围结束（不包含）
+
+  bool is_valid() const;
+  bool is_point_set_only() const { return is_point_set && !points.empty(); }
+  bool is_range() const { return !is_point_set && (start || end); }
+  bool is_all() const { return !is_point_set && !start && !end; }
+
+  bool operator==(const PrimaryKeyFragment& other) const;
+
+  std::string to_string() const;
+
+  // and 总是可以合并，大不了交集为空
+  static std::optional<PrimaryKeyFragment> merge_fragments_and(
+      const PrimaryKeyFragment& a, const PrimaryKeyFragment& b);
+
+  // or 可能无法合并，比如一个range,一个点集
+  // 若无法合并，则返回 nullopt, 需要push_back二者
+  static std::optional<PrimaryKeyFragment> can_merge_fragments_or(
+      const PrimaryKeyFragment& a, const PrimaryKeyFragment& b);
+
+  static std::optional<PrimaryKeyFragment> can_merge_ranges_or(
+      const PrimaryKeyFragment& a, const PrimaryKeyFragment& b);
+
+  static std::optional<PrimaryKeyFragment> merge_fragments_or_point_set(
+    const PrimaryKeyFragment& a, const PrimaryKeyFragment& b);
+
+  static std::vector<PrimaryKeyFragment> merge_vector_ranges_or(
+      std::vector<PrimaryKeyFragment>& fragments
+  );
+
+  static std::optional<PrimaryKeyFragment> merge_vector_point_set_or(
+      const std::vector<PrimaryKeyFragment>& fragments);
+
+};
+
+// ============================================================
+// 主键条件（多个 OR 片段）
+// ============================================================
+struct PrimaryKeyCondition {
+  std::vector<PrimaryKeyFragment> fragments;  // OR 关系
+
+  bool empty() const { return fragments.empty(); }
+  bool is_single() const { return fragments.size() == 1; }
+  bool has_pk_condition() const { return !empty(); }
+  size_t size() const { return fragments.size(); }
+
+  // 合并两个条件（AND 语义），返回 nullopt 表示无法合并
+  static std::optional<PrimaryKeyCondition> merge_and(
+      const PrimaryKeyCondition& a, const PrimaryKeyCondition& b);
+
+  // 合并两个条件（OR 语义）
+  static PrimaryKeyCondition merge_or(const PrimaryKeyCondition& a,
+                                      const PrimaryKeyCondition& b);
+
+  // 简化（合并重叠的点集/范围）
+  static PrimaryKeyCondition simplify(const PrimaryKeyCondition& cond);
+
+
+
+  std::string to_string() const;
+};
+
+// ============================================================
+// 扫描规范（主键条件 + ORDER BY + LIMIT）
+// ============================================================
+struct ScanSpec {
+  PrimaryKeyCondition pk_cond;
+  bool order_by_pk = false;
+  bool ascending = true;
+  size_t limit = 0;
+
+  bool has_pk_condition() const { return pk_cond.has_pk_condition(); }
+  bool is_single_range() const { return pk_cond.is_single(); }
+
+  std::string to_string() const;
+};
+
+// ============================================================
+// 条件抽取结果
+// ============================================================
+class ConditionExpr;
+struct ConditionExtractResult {
+  PrimaryKeyCondition pk_cond;
+  std::unique_ptr<ConditionExpr> remaining;  // 非主键条件
+
+  ConditionExtractResult() = default;
+  bool has_pk_condition() const { return pk_cond.has_pk_condition(); }
+};
+
+// ============================================================
 // 条件表达式树
 // ============================================================
 class ConditionExpr {
  public:
   // ----- 构造 -----
-  // 比较条件: column op value
-  explicit ConditionExpr(ConditionType type, const std::string& column, CompareOp op,
+  // COMPARE: column op value
+  ConditionExpr(const std::string& column, CompareOp op,
                 const sql::Value& value);
 
-  // 逻辑条件: AND/OR
-  explicit ConditionExpr(ConditionType type, std::unique_ptr<ConditionExpr> left,
+  // AND/OR: left op right
+  ConditionExpr(ConditionType type, std::unique_ptr<ConditionExpr> left,
                 std::unique_ptr<ConditionExpr> right);
 
-  // NOT 条件
-  explicit ConditionExpr(
-      ConditionType type, std::unique_ptr<ConditionExpr> child);
+  // NOT: child
+  ConditionExpr(ConditionType type, std::unique_ptr<ConditionExpr> child);
 
-  // IN 构造
-  explicit ConditionExpr(ConditionType type, const std::string& column,
+  // IN: column IN (values)
+  ConditionExpr(ConditionType type, const std::string& column,
                 std::vector<sql::Value> values);
 
-  static ConditionExpr make_compare_expr(const std::string& column, CompareOp op,
-                      const sql::Value& value) {
-    return ConditionExpr(ConditionType::COMPARE, column, op, value);
-  }
-
-  static ConditionExpr make_and_expr(std::unique_ptr<ConditionExpr> left,
-                                    std::unique_ptr<ConditionExpr> right) {
-    return ConditionExpr(ConditionType::AND, std::move(left), std::move(right));
-  }
-
-  static ConditionExpr make_or_expr(std::unique_ptr<ConditionExpr> left,
-                                   std::unique_ptr<ConditionExpr> right) {
-    return ConditionExpr(ConditionType::OR, std::move(left), std::move(right));
-  }
-
-  static ConditionExpr make_not_expr(std::unique_ptr<ConditionExpr> child) {
-    return ConditionExpr(ConditionType::NOT, std::move(child));
-  }
-
-  static ConditionExpr make_in_expr(const std::string& column,
-                                   std::vector<sql::Value> values) {
-    return ConditionExpr(ConditionType::IN, column, std::move(values));
-  }
+  // ----- 静态工厂 -----
+  static ConditionExpr make_compare(const std::string& column, CompareOp op,
+                                    const sql::Value& value);
+  static ConditionExpr make_and(std::unique_ptr<ConditionExpr> left,
+                                std::unique_ptr<ConditionExpr> right);
+  static ConditionExpr make_or(std::unique_ptr<ConditionExpr> left,
+                               std::unique_ptr<ConditionExpr> right);
+  static ConditionExpr make_not(std::unique_ptr<ConditionExpr> child);
+  static ConditionExpr make_in(const std::string& column,
+                               std::vector<sql::Value> values);
 
   // 拷贝/移动
   ConditionExpr(const ConditionExpr& other);
@@ -94,40 +177,29 @@ class ConditionExpr {
   const std::vector<sql::Value>& in_values() const { return in_values_; }
 
   // ----- 核心方法 -----
-  // 判断行是否匹配条件
-  bool matches(const sql::Row& row, const sql::TableSchema& schema) const;
+  bool match(const sql::Row& row, const sql::TableSchema& schema) const;
 
-  // 提取主键条件（用于优化）
-  bool extract_primary_key_conditions(
-      const sql::TableSchema& schema,
-      std::vector<std::pair<CompareOp, sql::Value>>& pk_conds,
-      std::unique_ptr<ConditionExpr>& remaining) const;
+  // 抽取主键条件（返回结构化结果）
+  ConditionExtractResult extract_primary_key_conditions(
+      const sql::TableSchema& schema);
 
   // 检查是否只涉及主键
   bool only_primary_key(const sql::TableSchema& schema) const;
 
-  // ----- 调试 -----
   std::string to_string() const;
 
  private:
   bool matches_compare(const sql::Row& row,
                        const sql::TableSchema& schema) const;
   bool compare_values(const sql::Value& row_val) const;
-  bool compare_in_values(const sql::Value& row_val) const;
   bool like_match(const std::string& str, const std::string& pattern) const;
-  void collect_pk_conditions(
-      const sql::TableSchema& schema,
-      std::vector<std::pair<CompareOp, sql::Value>>& result) const;
+  bool compare_in_values(const sql::Value& row_val) const;
 
   ConditionType type_;
-
-  // COMPARE 类型使用
   std::string column_;
   CompareOp op_;
   sql::Value value_;
-  std::vector<sql::Value> in_values_;  // IN 列表
-
-  // 逻辑类型使用
+  std::vector<sql::Value> in_values_;
   std::unique_ptr<ConditionExpr> left_;
   std::unique_ptr<ConditionExpr> right_;
 };
