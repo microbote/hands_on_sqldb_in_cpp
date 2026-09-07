@@ -8,9 +8,9 @@
 #include <vector>
 
 #include "key_range.h"
-#include "relation/value.h"
+#include "value.h"
 
-namespace query {
+namespace sql {
 
 // ============================================================
 // KeySet：基于 std::vector 的点集，支持集合运算
@@ -185,13 +185,15 @@ class KeySet {
   // ============================================================
 
   bool contains(const sql::Value& val) const {
-    if (points_.empty()) return false;
+    if (points_.empty()) { return false;
+}
     ensure_sorted();
     return std::binary_search(points_.begin(), points_.end(), val);
   }
 
   bool contains_all(const KeySet& other) const {
-    if (other.empty()) return true;
+    if (other.empty()) { return true;
+}
     ensure_sorted();
     other.ensure_sorted();
     return std::includes(points_.begin(), points_.end(), other.points_.begin(),
@@ -199,7 +201,8 @@ class KeySet {
   }
 
   bool contains_any(const KeySet& other) const {
-    if (empty() || other.empty()) return false;
+    if (empty() || other.empty()) { return false;
+}
     ensure_sorted();
     other.ensure_sorted();
     std::vector<sql::Value> result;
@@ -209,7 +212,8 @@ class KeySet {
   }
 
   bool equals(const KeySet& other) const {
-    if (size() != other.size()) return false;
+    if (size() != other.size()) { return false;
+}
     ensure_sorted();
     other.ensure_sorted();
     return points_ == other.points_;
@@ -235,8 +239,10 @@ class KeySet {
   // 转换为 KeyRange（连续点集）
   // ============================================================
   std::optional<KeyRange> to_range() const {
-    if (points_.empty()) return KeyRange::empty();
-    if (!all_int()) return std::nullopt;
+    if (points_.empty()) { return KeyRange::empty();
+}
+    if (!all_int()) { return std::nullopt;
+}
 
     ensure_sorted();
 
@@ -254,8 +260,10 @@ class KeySet {
   // 将点集拆分为多个连续范围
   std::vector<KeyRange> to_ranges() const {
     std::vector<KeyRange> result;
-    if (points_.empty()) return result;
-    if (!all_int()) return result;
+    if (points_.empty()) { return result;
+}
+    if (!all_int()) { return result;
+}
 
     ensure_sorted();
 
@@ -290,7 +298,8 @@ class KeySet {
   // 序列化
   // ============================================================
   std::string to_string() const {
-    if (points_.empty()) return "{}";
+    if (points_.empty()) { return "{}";
+}
     ensure_sorted();
     std::string s = "{";
     for (size_t i = 0; i < points_.size(); ++i) {
@@ -306,7 +315,7 @@ class KeySet {
   KeySet(std::vector<sql::Value>&& points, bool sorted)
       : points_(std::move(points)), sorted_(sorted) {}
 
-  std::vector<sql::Value> points_;
+  mutable std::vector<sql::Value> points_;
   mutable bool sorted_ = false;
 };
 

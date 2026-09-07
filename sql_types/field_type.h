@@ -3,8 +3,6 @@
 
 #include "common/c_types.h"
 #include <cstdint>
-#include <string>
-#include <vector>
 
 namespace sql {
 

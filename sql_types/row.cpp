@@ -10,7 +10,8 @@ std::string Row::to_string() const {
   std::ostringstream oss;
   oss << "[";
   for (size_t i = 0; i < values_.size(); ++i) {
-    if (i > 0) oss << ", ";
+    if (i > 0) { oss << ", ";
+}
     oss << values_[i].to_string();
   }
   oss << "]";
@@ -20,8 +21,9 @@ std::string Row::to_string() const {
 std::string Row::serialize() const {
   std::ostringstream oss;
   for (size_t i = 0; i < values_.size(); ++i) {
-    if (i > 0) oss << "|";
-    oss << values_[i].to_string();
+    if (i > 0) { oss << "|";
+}
+    oss << values_[i].to_key();
   }
   return oss.str();
 }
@@ -35,7 +37,7 @@ Row Row::deserialize(const std::string& data, const TableSchema& schema) {
   while (std::getline(ss, val_str, '|')) {
     if (col_idx < schema.columns().size()) {
       const auto& col = schema.columns()[col_idx];
-      row.push_back(Value::from_string(val_str, col.type));
+      row.push_back(Value::from_key(val_str, col.type));
     } else {
       row.push_back(Value());
     }
@@ -51,9 +53,11 @@ Row Row::deserialize(const std::string& data, const TableSchema& schema) {
 }
 
 bool Row::operator==(const Row& other) const {
-  if (values_.size() != other.values_.size()) return false;
+  if (values_.size() != other.values_.size()) { return false;
+}
   for (size_t i = 0; i < values_.size(); ++i) {
-    if (values_[i] != other.values_[i]) return false;
+    if (values_[i] != other.values_[i]) { return false;
+}
   }
   return true;
 }

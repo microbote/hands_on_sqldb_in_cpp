@@ -1,11 +1,12 @@
 // schema.h
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
-#include "types.h"
 #include "value.h"
+#include "identifier.h"
 
 namespace sql {
 
@@ -15,20 +16,20 @@ class Row;
 // 列定义
 // ============================================================
 struct ColumnDef {
-  std::string name;
+  Identifier name;
   DataType type;
   bool nullable = true;
   bool primary_key = false;
 
   ColumnDef() = default;
-  ColumnDef(const std::string& n, DataType t, bool pk = false, bool nul = true)
+  ColumnDef(const Identifier& n, DataType t, bool pk = false, bool nul = true)
       : name(n), type(t), nullable(nul), primary_key(pk) {}
 };
 
 // ============================================================
 // 错误码
 // ============================================================
-enum class SchemaError {
+enum class SchemaError :uint8_t {
   OK = 0,
   DUPLICATE_PRIMARY_KEY,
   NO_PRIMARY_KEY,
@@ -46,11 +47,11 @@ enum class SchemaError {
 class TableSchema {
  public:
   TableSchema() = default;
-  explicit TableSchema(const std::string& name);
+  explicit TableSchema(const Identifier& name);
 
   // ----- 属性 -----
   const std::string& name() const { return name_; }
-  TableSchema& set_name(const std::string& name) {
+  TableSchema& set_name(const Identifier& name) {
     name_ = name;
     return *this;
   }
@@ -59,17 +60,17 @@ class TableSchema {
   std::vector<ColumnDef>& columns() { return columns_; }
 
   // ----- 链式 API（返回 *this，内部记录错误）-----
-  TableSchema& primary_key(const std::string& name, DataType type);
-  TableSchema& not_null(const std::string& name, DataType type);
-  TableSchema& nullable(const std::string& name, DataType type);
+  TableSchema& primary_key(const Identifier& name, DataType type);
+  TableSchema& not_null(const Identifier& name, DataType type);
+  TableSchema& nullable(const Identifier& name, DataType type);
   TableSchema& add_column(const ColumnDef& col);
-  TableSchema& add_column(const std::string& name, DataType type,
+  TableSchema& add_column(const Identifier& name, DataType type,
                           bool pk = false, bool nullable = true);
 
   // ----- 查询 -----
-  int column_index(const std::string& name) const;
-  const ColumnDef* column(const std::string& name) const;
-  std::string primary_key_name() const;
+  int column_index(const Identifier& name) const;
+  const ColumnDef* column(const Identifier& name) const;
+  Identifier primary_key_name() const;
   int primary_key_index() const { return primary_key_index_; }
 
   // ----- 验证 -----
@@ -88,7 +89,7 @@ class TableSchema {
   static const char* error_message(SchemaError err);
 
  private:
-  std::string name_;
+  Identifier name_;
   std::vector<ColumnDef> columns_;
   int primary_key_index_ = -1;
   SchemaError error_ = SchemaError::OK;

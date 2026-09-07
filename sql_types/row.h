@@ -6,12 +6,12 @@
 #include <vector>
 
 #include "value.h"
-#include <expected>  // C++23
+#include <expected> 
 
 namespace sql {
 
 class TableSchema;
-enum class SchemaError;
+enum class SchemaError : uint8_t;
 
 class Row {
  public:

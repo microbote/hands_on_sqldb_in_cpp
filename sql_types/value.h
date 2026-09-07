@@ -1,13 +1,12 @@
 // value.h
 #pragma once
 
-#include <optional>
 #include <string>
-#include <variant>
-
-#include "types.h"
+#include "field_type.h"
 
 namespace sql {
+
+using Key=std::string;
 
 // ============================================================
 // SQL 值类型
@@ -24,10 +23,64 @@ class Value {
   explicit Value(bool v) : type_(DataType::BOOLEAN), bool_val_(v) {}
 
   // ----- 拷贝/移动 -----
-  Value(const Value& other) = default;
-  Value(Value&& other) = default;
-  Value& operator=(const Value& other) = default;
-  Value& operator=(Value&& other) = default;
+  Value(const Value& other) noexcept {
+    if (this != &other) {
+      type_ = other.type_;
+      if(is_int()){
+        int_val_ = other.int_val_;
+      }else if(is_string()){
+        str_val_ = other.str_val_;
+      }else if(is_bool()){
+        bool_val_ = other.bool_val_;
+      }else{
+        int_val_ = other.int_val_; 
+      }
+    }
+    
+  }
+  Value(Value&& other) noexcept
+    :  {
+    if(this != &other){
+      type_ = other.type_;
+      if(is_int()){
+        int_val_ = other.int_val_;
+      }else if(is_string()){
+        str_val_ = std::move(other.str_val_);
+      }else if(is_bool()){
+        bool_val_ = other.bool_val_;
+      }else{
+        int_val_ = other.int_val_; 
+      }
+    }
+  }
+  Value& operator=(const Value& other) noexcept {
+    if (this != &other) {
+      type_ = other.type_;
+      if(is_int()){
+        int_val_ = other.int_val_;
+      }else if(is_string()){
+        str_val_ = other.str_val_;
+      }else if(is_bool()){
+        bool_val_ = other.bool_val_;
+      }else{
+        int_val_ = other.int_val_; 
+      }
+    }
+    return *this;
+  }
+  Value& operator=(Value&& other) noexcept {
+    if(this != &other){
+      if(is_int()){
+        int_val_ = other.int_val_;
+      }else if(is_string()){
+        str_val_ = std::move(other.str_val_);
+      }else if(is_bool()){
+        bool_val_ = other.bool_val_;
+      }else{
+        int_val_ = other.int_val_; 
+      }
+    }
+  }
 
   // ----- 类型检查 -----
   DataType type() const { return type_; }
@@ -54,8 +107,13 @@ class Value {
   bool operator>=(const Value& other) const;
 
   // ----- 转换 -----
+  // to 文本字符串
   std::string to_string() const;
   static Value from_string(const std::string& str, DataType type);
+
+  // to 二进制key
+  Key to_key() const;
+  static Value from_key(const Key& key, DataType type);
 
  private:
   DataType type_;

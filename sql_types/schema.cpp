@@ -10,7 +10,7 @@ namespace sql {
 // ============================================================
 // 构造
 // ============================================================
-TableSchema::TableSchema(const std::string& name) : name_(name) {}
+TableSchema::TableSchema(const Identifier& name) : name_(name) {}
 
 // ============================================================
 // 链式 API
@@ -45,12 +45,12 @@ TableSchema& TableSchema::add_column(const ColumnDef& col) {
   return *this;
 }
 
-TableSchema& TableSchema::add_column(const std::string& name, DataType type,
+TableSchema& TableSchema::add_column(const Identifier& name, DataType type,
                                      bool pk, bool nullable) {
   return add_column(ColumnDef(name, type, pk, nullable));
 }
 
-TableSchema& TableSchema::primary_key(const std::string& name, DataType type) {
+TableSchema& TableSchema::primary_key(const Identifier& name, DataType type) {
   if (has_error()) {
     return *this;
   }
@@ -66,11 +66,11 @@ TableSchema& TableSchema::primary_key(const std::string& name, DataType type) {
   return *this;
 }
 
-TableSchema& TableSchema::not_null(const std::string& name, DataType type) {
+TableSchema& TableSchema::not_null(const Identifier& name, DataType type) {
   return add_column(ColumnDef(name, type, false, false));
 }
 
-TableSchema& TableSchema::nullable(const std::string& name, DataType type) {
+TableSchema& TableSchema::nullable(const Identifier& name, DataType type) {
   return add_column(ColumnDef(name, type, false, true));
 }
 
@@ -94,7 +94,7 @@ SchemaError TableSchema::validate() const {
     return SchemaError::INVALID_ROW;
   }
 
-  std::vector<std::string> primary_keys;
+  std::vector<Identifier> primary_keys;
   // 3. 检查列名重复（这个已经在 add_column 中检查了，但再确认一次）
   for (size_t i = 0; i < columns_.size(); ++i) {
     if (columns_[i].primary_key){
@@ -138,7 +138,7 @@ bool TableSchema::has_primary_key() const {
 // 查询
 // ============================================================
 
-int TableSchema::column_index(const std::string& name) const {
+int TableSchema::column_index(const Identifier& name) const {
   for (size_t i = 0; i < columns_.size(); ++i) {
     if (columns_[i].name == name) {
       return static_cast<int>(i);
@@ -147,16 +147,16 @@ int TableSchema::column_index(const std::string& name) const {
   return -1;
 }
 
-const ColumnDef* TableSchema::column(const std::string& name) const {
+const ColumnDef* TableSchema::column(const Identifier& name) const {
   int idx = column_index(name);
   return idx >= 0 ? &columns_[idx] : nullptr;
 }
 
-std::string TableSchema::primary_key_name() const {
+Identifier TableSchema::primary_key_name() const {
   if (has_primary_key()) {
     return columns_[primary_key_index_].name;
   }
-  return "";
+  return {};
 }
 
 // ============================================================
@@ -182,7 +182,7 @@ TableSchema TableSchema::deserialize(const std::string& data) {
   std::string token;
 
   std::getline(ss, token, '|');
-  schema.set_name(token);
+  schema.set_name(Identifier(token));
 
   std::getline(ss, token, '|');
   if (!token.empty()) {
