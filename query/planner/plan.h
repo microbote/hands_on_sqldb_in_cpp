@@ -8,6 +8,7 @@
 
 #include "relation/sql_relation.h"
 #include "query/statement/condition.h"
+#include "query/statement/scan_desc.h"
 
 namespace query {
 
@@ -35,121 +36,102 @@ class PlanNode {
 };
 
 // ============================================================
-// 顺序扫描计划
-// ============================================================
-class SequentialScanPlan : public PlanNode {
- public:
-  std::string table_name;
-  std::unique_ptr<ConditionExpr> filter_condition;  // 应用层过滤
-  std::vector<std::string> columns;                 // 需要返回的列
-
-  SequentialScanPlan(const std::string& table) : table_name(table) {}
-  PlanType type() const override { return PlanType::SEQUENTIAL_SCAN; }
-  std::string to_string() const override {
-    std::string result = "SeqScan(" + table_name + ")";
-    if (filter_condition) {
-      result += " [filter: " + filter_condition->to_string() + "]";
-    }
-    return result;
-  }
-};
-
-// ============================================================
-// 索引扫描计划（主键优化）
+// IndexScanPlan：索引扫描计划
 // ============================================================
 class IndexScanPlan : public PlanNode {
- public:
-  std::string table_name;
-  std::vector<std::string> columns;
-  bool is_point_query = false;  // true: 点查询, false: 范围查询
-  sql::Value start_key;         // 范围起点（包含）
-  sql::Value end_key;           // 范围终点（不包含）
-  std::unique_ptr<ConditionExpr> filter_condition;  // 额外的非主键过滤
-
-  IndexScanPlan(const std::string& table) : table_name(table) {}
-  PlanType type() const override { return PlanType::INDEX_SCAN; }
-  std::string to_string() const override {
-    std::string result = "IndexScan(" + table_name + ", ";
-    if (is_point_query) {
-      result += "point: " + start_key.to_string();
-    } else {
-      result +=
-          "range: [" + start_key.to_string() + ", " + end_key.to_string() + ")";
-    }
-    if (filter_condition) {
-      result += ", filter: " + filter_condition->to_string();
-    }
-    result += ")";
-    return result;
-  }
-};
-
-// ============================================================
-// 插入计划
-// ============================================================
-class InsertPlan : public PlanNode {
- public:
-  std::string table_name;
-  std::vector<std::string> columns;
-  std::vector<sql::Value> values;
-
-  InsertPlan(const std::string& table) : table_name(table) {}
-  PlanType type() const override { return PlanType::INSERT; }
-  std::string to_string() const override {
-    return "Insert(" + table_name + ")";
-  }
-};
-
-// ============================================================
-// 更新计划
-// ============================================================
-class UpdatePlan : public PlanNode {
- public:
-  std::string table_name;
-  std::vector<std::pair<std::string, sql::Value>> assignments;
-  std::unique_ptr<ConditionExpr> condition;
-
-  UpdatePlan(const std::string& table) : table_name(table) {}
-  PlanType type() const override { return PlanType::UPDATE; }
-  std::string to_string() const override {
-    return "Update(" + table_name + ")";
-  }
-};
-
-// ============================================================
-// 删除计划
-// ============================================================
-class DeletePlan : public PlanNode {
- public:
-  std::string table_name;
-  std::unique_ptr<ConditionExpr> condition;
-
-  DeletePlan(const std::string& table) : table_name(table) {}
-  PlanType type() const override { return PlanType::DELETE; }
-  std::string to_string() const override {
-    return "Delete(" + table_name + ")";
-  }
-};
-
-// ============================================================
-// 执行计划
-// ============================================================
-class ExecutionPlan {
- public:
-  StatementType stmt_type;
-  std::unique_ptr<PlanNode> root;
-  std::string database_name;  // 执行时使用的数据库
-
-  ExecutionPlan() : stmt_type(StatementType::UNKNOWN) {}
-  explicit ExecutionPlan(StatementType type) : stmt_type(type) {}
-
-  std::string to_string() const {
-    if (root) {
-      return root->to_string();
-    }
-    return "EmptyPlan";
-  }
-};
+  public:
+      std::string table_name;
+      std::vector<std::string> columns;        // 需要返回的列
+      
+      // ===== 扫描方式 =====
+      bool is_point_query = false;             // true: 点查询, false: 范围查询
+      
+      // 点查询
+      std::vector<std::string> key_set;        // 点查询的 key 列表
+      
+      // 范围查询
+      KeyRange key_range;                      // 范围 [start, end)
+      
+      // 排除集（用于过滤）
+      std::vector<std::string> excluded_keys;  // 需要排除的 key
+      
+      // ===== 排序和限制（已下推） =====
+      bool order_by_pk = false;
+      bool ascending = true;
+      size_t limit = 0; 
+      
+      // ===== 执行状态（运行时） =====
+      // 由执行器维护，不在 Plan 中存储
+      
+      PlanType type() const override { return PlanType::INDEX_SCAN; }
+      
+      std::string to_string() const override {
+          std::string s = "IndexScan(" + table_name;
+          if (is_point_query) {
+              s += ", points: " + std::to_string(key_set.size()) + " keys";
+          } else {
+              s += ", range: " + key_range.to_string();
+          }
+          if (!excluded_keys.empty()) {
+              s += ", excluded: " + std::to_string(excluded_keys.size()) + " keys";
+          }
+          if (order_by_pk) {
+              s += ", order_by: " + std::string(ascending ? "ASC" : "DESC");
+          }
+          if (limit > 0) {
+              s += ", limit: " + std::to_string(limit);
+          }
+          s += ")";
+          return s;
+      }
+  };
+  
+  // ============================================================
+  // FilterPlan：过滤计划
+  // ============================================================
+  class FilterPlan : public PlanNode {
+  public:
+      std::unique_ptr<PlanNode> child;         // 子节点
+      std::unique_ptr<ConditionExpr> condition; // 过滤条件
+      
+      PlanType type() const override { return PlanType::FILTER; }
+      
+      std::string to_string() const override {
+          std::string s = "Filter(";
+          if (condition) {
+              s += condition->to_string();
+          }
+          s += ")";
+          if (child) {
+              s += " -> " + child->to_string();
+          }
+          return s;
+      }
+  };
+  
+  // ============================================================
+  // ProjectPlan：投影计划
+  // ============================================================
+  class ProjectPlan : public PlanNode {
+  public:
+      std::unique_ptr<PlanNode> child;
+      std::vector<std::string> columns;        // 需要投影的列
+      
+      PlanType type() const override { return PlanType::PROJECT; }
+      
+      std::string to_string() const override {
+          std::string s = "Project(";
+          for (size_t i = 0; i < columns.size(); ++i) {
+              if (i > 0) s += ", ";
+              s += columns[i];
+          }
+          s += ")";
+          if (child) {
+              s += " -> " + child->to_string();
+          }
+          return s;
+      }
+  };
 
 }  // namespace query
 

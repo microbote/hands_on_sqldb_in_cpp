@@ -1,13 +1,15 @@
+%code requires {
+#include "ast.h"
+}
+
 %{
 #include "ast.h"
+#include "parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// 声明 flex 的词法分析函数
 extern int yylex();
-
-// 声明错误处理函数
 void yyerror(const char *s);
 
 %}
@@ -15,34 +17,64 @@ void yyerror(const char *s);
 %debug
 %verbose
 
-/* 定义优先级（从低到高） */
-%left TOK_OR
-%left TOK_AND
-%nonassoc '=' '<' '>' TOK_GE TOK_LE
 
+/* yyltype, yylval */
 %union {
     int num;
     char* str;
+    COpType op;
+    CDataType dt;
     struct ASTNode* node;
-    struct ASTNodeList* list; /* 可选：如果你用链表存列名/值列表 */
+    struct ASTNode* list;
 }
 
-%token TOK_INTO TOK_VALUES TOK_SET
+%token TOK_USE TOK_INSERT TOK_DELETE TOK_UPDATE TOK_SET TOK_INTO TOK_VALUES 
+%token TOK_SELECT TOK_WHERE TOK_FROM 
+%token TOK_AND TOK_OR TOK_NOT 
+%token TOK_GE TOK_LE TOK_GT TOK_LT
+%token TOK_EQ TOK_NE TOK_IN TOK_IS TOK_LIKE
+%token TOK_ORDER TOK_BY TOK_ASC TOK_DESC TOK_LIMIT TOK_OFFSET
 
-%token TOK_USE TOK_SELECT TOK_INSERT TOK_UPDATE TOK_DELETE
-
-%token TOK_WHERE TOK_FROM TOK_AND TOK_OR TOK_GE TOK_LE
+/* DDL */
+%token TOK_CREATE TOK_DROP TOK_DATABASE TOK_TABLE
+%token TOK_PRIMARY TOK_KEY
+%token TOK_NULL
+%token TOK_INT TOK_BIGINT TOK_VARCHAR TOK_TEXT TOK_BOOLEAN
 
 %token <num> TOK_NUMBER
-
 %token <str> TOK_IDENT TOK_STRING
 
-/* 非终结符类型声明 */
-%type <node> input statement use_stmt select_stmt insert_stmt update_stmt delete_stmt
+/* DML */
+%type <node> input statement select_stmt insert_stmt update_stmt delete_stmt
+%type <list> select_list column_name_list
+%type <list> insert_columns insert_values in_values
+%type <list> value_item_list
+%type <node> value_item 
+%type <list> assignment_list
+%type <node> assignment
+
 %type <node> opt_where condition_expr condition_term condition_factor
-%type <node> assignment value_item
-%type <list> select_list column_list value_list column_name_list value_item_list assignment_list
+%type <op> compare_op
+
+%type <node> opt_limit opt_order_by order_item  
+%type <op> order_direction
+
+/* DDL */
+%type <node> use_stmt create_db_stmt drop_db_stmt create_table_stmt drop_table_stmt
+%type <list> column_def_list
+%type <node> column_def
+%type <dt> data_type 
+%type <num> opt_nullable opt_primary_key
+
+
+%left TOK_OR
+%left TOK_AND
+%right TOK_NOT
+%nonassoc TOK_IS
+%nonassoc TOK_EQ TOK_LT TOK_GT TOK_GE TOK_LE TOK_NE TOK_IN TOK_LIKE
+
 %%
+
 
 input:
     statement ';'     { set_parsed_ast($1); }
@@ -54,134 +86,230 @@ statement:
     | insert_stmt     { $$ = $1; }
     | update_stmt     { $$ = $1; }
     | delete_stmt     { $$ = $1; }
+    | create_db_stmt  { $$ = $1; }
+    | drop_db_stmt    { $$ = $1; }
+    | create_table_stmt { $$ = $1; }
+    | drop_table_stmt { $$ = $1; }
     ;
 
+
+/* ============================================================
+   DDL: DATABASE
+   ============================================================ */
 use_stmt:
     TOK_USE TOK_IDENT { $$ = make_use_node($2); }
     ;
 
+create_db_stmt:
+    TOK_CREATE TOK_DATABASE TOK_IDENT {
+        $$ = make_create_database_node($3);
+    }
+    ;
+
+drop_db_stmt:
+    TOK_DROP TOK_DATABASE TOK_IDENT {
+        $$ = make_drop_database_node($3);
+    }
+    ;
+
+/* ============================================================
+   DDL: TABLE
+   ============================================================ */
+create_table_stmt:
+    TOK_CREATE TOK_TABLE TOK_IDENT '(' column_def_list ')' {
+        $$ = make_create_table_node($3, $5);
+    }
+    ;
+
+drop_table_stmt:
+    TOK_DROP TOK_TABLE TOK_IDENT {
+        $$ = make_drop_table_node($3);
+    }
+    ;
+
+/* ============================================================
+   列定义
+   ============================================================ */
+column_def_list:
+    column_def                         { $$ = create_list($1, LIST_COLUMN_DEF); }
+    | column_def_list ',' column_def   { $$ = append_to_list($1, $3); }
+    ;
+
+column_def:
+    TOK_IDENT data_type opt_primary_key opt_nullable {
+        $$ = make_column_def_node($1, $2, $3, $4);
+    }
+    ;
+
+data_type:
+    TOK_INT          { $$ = DT_INT; }
+    | TOK_BIGINT     { $$ = DT_BIGINT; }
+    | TOK_VARCHAR    { $$ = DT_VARCHAR; }
+    | TOK_TEXT       { $$ = DT_TEXT; }
+    | TOK_BOOLEAN    { $$ = DT_BOOLEAN; }
+    ;
+
+opt_primary_key:
+    %empty                { $$ = 0; }
+    | TOK_PRIMARY TOK_KEY { $$ = 1; }
+    ;
+
+opt_nullable:
+    %empty                { $$ = 1; }   /* 默认可为空 */
+    | TOK_NOT TOK_NULL    { $$ = 0; }   /* NOT NULL */
+    | TOK_NULL            { $$ = 1; }   /* 显式 NULL */
+    ;
+
+/* ============================================================
+   SELECT 语句
+   ============================================================ */
 select_stmt:
-    TOK_SELECT select_list TOK_FROM TOK_IDENT opt_where
+    TOK_SELECT select_list TOK_FROM TOK_IDENT opt_where opt_order_by opt_limit
     {
-        $$ = make_select_node($4, $2, $5); // table, column_list, condition
+        $$ = make_select_node($4, $2, $5, $6, $7);
     }
     ;
 
 select_list:
-    '*'                          { $$ = create_list(make_ident_node("*")); }
-    | column_name_list          { $$ = $1; }
+    '*'                          { $$ = create_list(make_ident_node("*"), LIST_COLUMN); }
+    | column_name_list           { $$ = $1; }
     ;
 
+/* ============================================================
+   列名列表
+   ============================================================ */
+column_name_list:
+    TOK_IDENT                    { $$ = create_list(make_ident_node($1), LIST_COLUMN); }
+    | column_name_list ',' TOK_IDENT { $$ = append_to_list($1, make_ident_node($3)); }
+    ;
+
+
+/* ============================================================
+   INSERT / UPDATE / DELETE
+   ============================================================ */
 insert_stmt:
-    TOK_INSERT TOK_INTO TOK_IDENT column_list TOK_VALUES value_list
+    TOK_INSERT TOK_INTO TOK_IDENT insert_columns TOK_VALUES insert_values
     {
-        // 假设 make_insert_node 签名为: (table, columns_node, values_node)
         $$ = make_insert_node($3, $4, $6);
     }
     ;
 
+insert_columns:
+    %empty                         { $$ = NULL; }
+    | '(' column_name_list ')'     { $$ = $2; }
+    ;
+
+insert_values:
+    '(' value_item_list ')'      { $$ = $2; }
+
+in_values:
+    '(' value_item_list ')'      { $$ = $2; }
+    ;
+
+value_item_list:
+    value_item                   { $$ = create_list($1, LIST_VALUE); }
+    | value_item_list ',' value_item { $$ = append_to_list($1, $3); }
+    ;
+
+value_item:
+    TOK_NUMBER                   { $$ = make_number_node($1); }
+    | TOK_STRING                 { $$ = make_string_node($1); }
+    ;
 
 
 update_stmt:
     TOK_UPDATE TOK_IDENT TOK_SET assignment_list opt_where
     {
-        // 假设 make_update_node 签名为: (table, assignments, condition)
-        // 如果 opt_where 为空，传 NULL
         $$ = make_update_node($2, $4, $5);
     }
     ;
 
+assignment_list:
+    assignment                   { $$ = create_list($1,LIST_ASSIGNMENT); }
+    | assignment_list ',' assignment { $$ = append_to_list($1, $3); }
+    ;
+
+assignment:
+    TOK_IDENT TOK_EQ value_item    {printf("DEBUG: assignment: %s = ...\n", $1);  $$ = make_assignment_node($1, $3); }
+    ;
 
 
 delete_stmt:
     TOK_DELETE TOK_FROM TOK_IDENT opt_where
     {
-        $$ = make_delete_node($3, $4); // table, condition
+        $$ = make_delete_node($3, $4);
     }
     ;
 
-/* --- 辅助规则 --- */
+/* ============================================================
+   WHERE 条件
+   ============================================================ */
 opt_where:
     %empty                           { $$ = NULL; }
-
     | TOK_WHERE condition_expr       { $$ = $2; }
     ;
 
 condition_expr:
     condition_term               { $$ = $1; }
-    | condition_expr TOK_OR condition_term { $$ = make_binary_node($1, "OR", $3); }
+    | condition_expr TOK_OR condition_term { $$ = make_binary_node($1, OP_OR, $3); }
     ;
 
 condition_term:
     condition_factor             { $$ = $1; }
-    | condition_term TOK_AND condition_factor { $$ = make_binary_node( $1, "AND", $3); }
+    | condition_term TOK_AND condition_factor { $$ = make_binary_node($1, OP_AND, $3); }
     ;
 
 condition_factor:
-    TOK_IDENT '=' TOK_NUMBER     { $$ = make_compare_node(make_ident_node($1), "=", make_number_node($3)); }
-    | TOK_IDENT '>' TOK_NUMBER   { $$ = make_compare_node(make_ident_node($1), ">", make_number_node($3)); }
-    | TOK_IDENT '<' TOK_NUMBER   { $$ = make_compare_node(make_ident_node($1), "<", make_number_node($3)); }
-    | TOK_IDENT TOK_GE TOK_NUMBER { $$ = make_compare_node(make_ident_node($1), ">=", make_number_node($3)); }
-    | TOK_IDENT TOK_LE TOK_NUMBER { $$ = make_compare_node(make_ident_node($1), "<=", make_number_node($3)); }
-    | TOK_IDENT '=' TOK_STRING   { $$ = make_compare_node(make_ident_node($1), "=", make_string_node($3)); }
-    | '(' condition_expr ')'     { $$ = $2; }  /* ← 支持括号分组 */
+    TOK_IDENT compare_op value_item           { $$ = make_compare_node($1, $2, $3); }
+    | TOK_IDENT TOK_IN in_values         { $$ = make_in_node($1, $3); }
+    | TOK_IDENT TOK_NOT TOK_IN in_values { $$ = make_not_node(make_in_node($1, $4)); }
+    | TOK_IDENT TOK_LIKE TOK_STRING { $$ = make_compare_node($1, OP_LIKE, make_string_node($3));}
+    | TOK_IDENT TOK_NOT TOK_LIKE TOK_STRING { $$ = make_not_node(make_compare_node($1, OP_LIKE, make_string_node($4)));}
+    | TOK_IDENT TOK_IS TOK_NULL { $$ = make_compare_node($1, OP_IS_NULL, NULL); }
+    | TOK_IDENT TOK_IS TOK_NOT TOK_NULL { $$ = make_compare_node($1, OP_IS_NOT_NULL, NULL);}
+    | '(' condition_expr ')' { $$ = $2; }
+    | TOK_NOT condition_factor { $$ = make_not_node($2); }
     ;
 
-column_name_list:
-    TOK_IDENT                    { $$ = create_list(make_ident_node($1)); }
-    | column_name_list ',' TOK_IDENT { $$ = append_to_list($1, make_ident_node($3)); }
+/* ============================================================
+   比较操作符
+   ============================================================ */
+compare_op:
+    TOK_EQ     { $$ = OP_EQ; }
+    | TOK_NE   { $$ = OP_NE; }
+    | TOK_GT   { $$ = OP_GT; }
+    | TOK_GE   { $$ = OP_GE; }
+    | TOK_LT   { $$ = OP_LT; }
+    | TOK_LE   { $$ = OP_LE; }
     ;
 
-/* 列名列表 (id, name) -> 构建一个 AST 节点或列表 */
-column_list:
-    '(' column_name_list ')'        { $$ = $2; }
+/* ============================================================
+   ORDER BY
+   ============================================================ */
+opt_order_by:
+    %empty                       { $$ = NULL; }
+    | TOK_ORDER TOK_BY order_item { $$ = $3; }
     ;
 
-/* 值列表 (1, 'abc') -> 构建一个 AST 节点或列表 */
-value_list:
-    '(' value_item_list ')'               { $$ = $2; }
-
-value_item_list:
-    value_item                       { $$ = create_list($1); }
-    | value_item_list ',' value_item { $$ = append_to_list($1, $3); }
+order_item:
+    TOK_IDENT                   { $$ = make_order_node($1, OP_ASC); }
+    | TOK_IDENT order_direction { $$ = make_order_node($1, $2); }
     ;
 
-value_item:
-    TOK_NUMBER                       { $$ = make_number_node($1); }
-
-    | TOK_STRING                     { $$ = make_string_node($1); }
+order_direction:
+    TOK_ASC    { $$ = OP_ASC; }
+    | TOK_DESC { $$ = OP_DESC; }
     ;
-
-assignment_list:
-    assignment                     { $$ = create_list($1); }
-
-    | assignment_list ',' assignment { $$ = append_to_list($1, $3); }
+    
+/* ============================================================
+   LIMIT / OFFSET
+   ============================================================ */
+opt_limit:
+    %empty                       { $$ = NULL; }
+    | TOK_LIMIT TOK_NUMBER       { $$ = make_limit_node($2, 0); }
+    | TOK_LIMIT TOK_NUMBER TOK_OFFSET TOK_NUMBER { $$ = make_limit_node($2, $4); }
+    | TOK_LIMIT TOK_NUMBER ',' TOK_NUMBER { $$ = make_limit_node($4, $2); }  /* MySQL 风格 */
     ;
-
-assignment:
-    TOK_IDENT '=' TOK_NUMBER       { $$ = make_assignment_node(make_ident_node($1), make_number_node($3)); }
-
-    | TOK_IDENT '=' TOK_STRING     { $$ = make_assignment_node(make_ident_node($1), make_string_node($3)); }
-    ;
-
-
 
 %%
 
-void yyerror(const char *s) {
-    extern int yylineno;  // 如果启用了行号
-    fprintf(stderr, "Parse error at line %d: %s\n", yylineno, s);
-
-
-    extern int yychar;
-    extern char* yytext;
-
-    fprintf(stderr, "Current token: %d\n", yychar);
-
-    // 尝试显示 token 名称
-    if (yychar < 256) {
-        fprintf(stderr, "Token character: '%c' (ASCII %d)\n", yychar, yychar);
-    } else {
-        fprintf(stderr, "Token number: %d\n", yychar);
-    }
-}

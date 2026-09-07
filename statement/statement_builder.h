@@ -11,6 +11,9 @@
 #include "statement.h"
 
 namespace query {
+// build the condition expr tree from ast's where condition tree
+static std::unique_ptr<ConditionExpr> build_condition_expr_from_ast(
+    const ASTNode* ast_where);
 
 // ============================================================
 // Statement 构建器（AST → Statement + 语义验证）

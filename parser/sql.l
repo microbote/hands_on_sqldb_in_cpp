@@ -1,6 +1,7 @@
+
 %{
 #include "parser.tab.h"
-#include <cstring>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -12,56 +13,87 @@ void debug_token(const char* name, int token) {
 %option noyywrap
 %option case-insensitive
 
+
 %%
 
-"select"    { printf("DEBUG: matched 'select' -> TOK_SELECT (%d)\n", TOK_SELECT); return TOK_SELECT; }
-"from"      { printf("DEBUG: matched 'from' -> TOK_FROM (%d)\n", TOK_FROM); return TOK_FROM; }
-"where"     { printf("DEBUG: matched 'where' -> TOK_WHERE (%d)\n", TOK_WHERE); return TOK_WHERE; }
-"and"       { printf("DEBUG: matched 'and' -> TOK_AND (%d)\n", TOK_AND); return TOK_AND; }
-"or"        { printf("DEBUG: matched 'or' -> TOK_OR (%d)\n", TOK_OR); return TOK_OR; }
-"insert"    { printf("DEBUG: matched 'insert' -> TOK_INSERT (%d)\n", TOK_INSERT); return TOK_INSERT; }
-"into"      { printf("DEBUG: matched 'into' -> TOK_INTO (%d)\n", TOK_INTO); return TOK_INTO; }
-"values"    { printf("DEBUG: matched 'values' -> TOK_VALUES (%d)\n", TOK_VALUES); return TOK_VALUES; }
-"update"    { printf("DEBUG: matched 'update' -> TOK_UPDATE (%d)\n", TOK_UPDATE); return TOK_UPDATE; }
-"set"       { printf("DEBUG: matched 'set' -> TOK_SET (%d)\n", TOK_SET); return TOK_SET; }
-"delete"    { printf("DEBUG: matched 'delete' -> TOK_DELETE (%d)\n", TOK_DELETE); return TOK_DELETE; }
-"use"       { printf("DEBUG: matched 'use' -> TOK_USE (%d)\n", TOK_USE); return TOK_USE; }
+"select"    { return TOK_SELECT; }
+"from"      { return TOK_FROM; }
+"where"     { return TOK_WHERE; }
 
-">="        { printf("DEBUG: matched '>=' -> TOK_GE (%d)\n", TOK_GE); return TOK_GE; }
-"<="        { printf("DEBUG: matched '<=' -> TOK_LE (%d)\n", TOK_LE); return TOK_LE; }
-">"         { printf("DEBUG: matched '>' -> '%c' (%d)\n", *yytext, *yytext); return '>'; }
-"<"         { printf("DEBUG: matched '<' -> '%c' (%d)\n", *yytext, *yytext); return '<'; }
-"="         { printf("DEBUG: matched '=' -> '%c' (%d)\n", *yytext, *yytext); return '='; }
+"and"       { return TOK_AND; }
+"or"        { return TOK_OR; }
+"not"       { return TOK_NOT; }
 
-","         { printf("DEBUG: matched ',' -> '%c' (%d)\n", *yytext, *yytext); return ','; }
-"("         { printf("DEBUG: matched '(' -> '%c' (%d)\n", *yytext, *yytext); return '('; }
-")"         { printf("DEBUG: matched ')' -> '%c' (%d)\n", *yytext, *yytext); return ')'; }
-";"         { printf("DEBUG: matched ';' -> '%c' (%d)\n", *yytext, *yytext); return ';'; }
-"*"         { printf("DEBUG: matched '*' -> '%c' (%d)\n", *yytext, *yytext); return '*'; }
+"insert"    { return TOK_INSERT; }
+"into"      { return TOK_INTO; }
+"values"    { return TOK_VALUES; }
+"update"    { return TOK_UPDATE; }
+"set"       { return TOK_SET; }
+"delete"    { return TOK_DELETE; }
+
+"order"     { return TOK_ORDER; }
+"by"        { return TOK_BY; }
+"asc"       { return TOK_ASC; }
+"ascending" { return TOK_ASC; }
+"desc"      { return TOK_DESC; }
+"descending" { return TOK_DESC; }
+"limit"     { return TOK_LIMIT; }
+"offset"    { return TOK_OFFSET; }
+
+"use"       { return TOK_USE; }
+"create"    { return TOK_CREATE; }
+"drop"      { return TOK_DROP; }
+"database"  { return TOK_DATABASE; }
+"table"     { return TOK_TABLE; }
+"primary"   { return TOK_PRIMARY; }
+"key"       { return TOK_KEY; }
+
+"int"       { return TOK_INT; }
+"integer"   { return TOK_INT; }
+"bigint"    { return TOK_BIGINT; }
+"varchar"   { return TOK_VARCHAR; }
+"text"      { return TOK_TEXT; }
+"boolean"   { return TOK_BOOLEAN; }
+"bool"      { return TOK_BOOLEAN; }
+"null"      { return TOK_NULL; }
+
+">="        { return TOK_GE; }
+"<="        { return TOK_LE; }
+">"         { return TOK_GT; }
+"<"         { return TOK_LT; }
+"="         { return TOK_EQ; }
+"!="        { return TOK_NE; }
+"in"        { return TOK_IN; }
+"is"        { return TOK_IS; }
+"like"      { return TOK_LIKE; }
+
+","         { return ','; }
+"("         { return '('; }
+")"         { return ')'; }
+";"         { return ';'; }
+"*"         { return '*'; }
+"%"         { return '%'; } 
+
 
 [a-zA-Z_][a-zA-Z0-9_]* {
-    printf("DEBUG: matched IDENT: '%s' -> TOK_IDENT (%d)\n", yytext, TOK_IDENT);
     yylval.str = strdup(yytext);
     return TOK_IDENT;
 }
 
 [0-9]+ {
-    printf("DEBUG: matched NUMBER: '%s' -> TOK_NUMBER (%d)\n", yytext, TOK_NUMBER);
     yylval.num = atoi(yytext);
     return TOK_NUMBER;
 }
 
 '[^']*' {
-    printf("DEBUG: matched STRING: '%s' -> TOK_STRING (%d)\n", yytext, TOK_STRING);
     yylval.str = strdup(yytext + 1);
     yylval.str[strlen(yylval.str) - 1] = '\0';
     return TOK_STRING;
 }
 
-[ \t\n\r]+ { printf("DEBUG: whitespace\n"); }
+[ \t\n\r]+ { /* 忽略空格 */ }
 
 . {
-    printf("DEBUG: Unknown character: '%c' (ASCII %d)\n", *yytext, *yytext);
     fprintf(stderr, "Unknown character: %c\n", *yytext);
 }
 

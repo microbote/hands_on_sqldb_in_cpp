@@ -62,6 +62,8 @@ LOG*
 *.tmp
 .DS_Store
 Thumbs.db
+.clangd
+compile_flags.txt
 
 # ============================================================
 # 临时文件

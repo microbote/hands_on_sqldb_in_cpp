@@ -1,6 +1,7 @@
 // types.h
 #pragma once
 
+#include "common/c_types.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -16,7 +17,8 @@ enum class DataType : uint8_t {
   VARCHAR,   // 变长字符串
   TEXT,      // 长文本
   BOOLEAN,   // 布尔值
-  NULL_TYPE  // NULL 类型
+  NULL_TYPE,  // NULL 类型
+  UNKNOWN_TYPE
 };
 
 // 数据类型名称
@@ -39,14 +41,31 @@ inline const char* data_type_name(DataType type) {
   }
 }
 
-// 从字符串解析数据类型
-inline DataType parse_data_type(const std::string& name) {
-  if (name == "INT" || name == "int") return DataType::INT;
-  if (name == "BIGINT" || name == "bigint") return DataType::BIGINT;
-  if (name == "VARCHAR" || name == "varchar") return DataType::VARCHAR;
-  if (name == "TEXT" || name == "text") return DataType::TEXT;
-  if (name == "BOOLEAN" || name == "boolean") return DataType::BOOLEAN;
-  return DataType::NULL_TYPE;
+inline DataType from_c(::CDataType type){
+  //{ DT_INT, DT_BIGINT, DT_VARCHAR, DT_TEXT, DT_BOOLEAN } 
+  switch(type){
+    case DT_INT: return DataType::INT;
+    case DT_BIGINT: return DataType::BIGINT;
+    case DT_VARCHAR: return DataType::VARCHAR;
+    case DT_TEXT: return DataType::TEXT;
+    case DT_BOOLEAN: return DataType::BOOLEAN;
+    case DT_NULL: return DataType::NULL_TYPE;
+    default: return DataType::UNKNOWN_TYPE;
+  }
 }
+
+inline CDataType to_c(DataType type){
+  switch(type){
+    case DataType::INT: return DT_INT;
+    case DataType::BIGINT: return DT_BIGINT;
+    case DataType::VARCHAR: return DT_VARCHAR;
+    case DataType::TEXT: return DT_TEXT;
+    case DataType::BOOLEAN: return DT_BOOLEAN;
+    case DataType::NULL_TYPE: return DT_NULL;
+    default: return DT_UNKNOWN;
+  }
+}
+
+
 
 }  // namespace sql

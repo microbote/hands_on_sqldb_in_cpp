@@ -13,7 +13,7 @@ LDFLAGS  = -L../Debug/lib -lleveldb \
            -L/usr/local/opt/readline/lib -lreadline \
            -L/usr/local/lib -lfmt \
            -lpthread -l snappy \
-           -L/usr/local/opt/llvm/lib/c++ -lc++abi -lc++
+           -L/usr/local/opt/llvm/lib/c++ -lc++abi -lc++	
 
 FLEX     = flex
 YACC     = /usr/local/opt/bison/bin/bison -t
@@ -45,7 +45,7 @@ AST_HDR  = $(PARSER_DIR)/ast.h
 # ============================================================
 # Parser
 PARSER_HDR = $(wildcard $(PARSER_DIR)/*.h)
-PARSER_SRCS    = $(PARSER_DIR)/ast.cpp
+PARSER_SRCS    = $(PARSER_DIR)/ast.cpp $(PARSER_DIR)/parser.cpp
 GENERATED_SRCS = $(PARSER_DIR)/lex.yy.c $(PARSER_DIR)/parser.tab.c
 
 # Storage
@@ -65,7 +65,8 @@ RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
                  $(RELATION_DIR)/database_manager.cpp
 
 # Tests
-TESTS_SRCS     = $(TESTS_DIR)/test_parser.cpp \
+TESTS_SRCS     = $(TESTS_DIR)/test_ast.cpp \
+                 $(TESTS_DIR)/test_parser.cpp \
                  $(TESTS_DIR)/test_statement.cpp \
                  $(TESTS_DIR)/test_condition.cpp \
                  $(TESTS_DIR)/test_optimizer.cpp \
@@ -85,8 +86,8 @@ MAIN_SRC       = $(SRC_DIR)/main.cpp
 # 对象文件（从源文件路径生成）
 # ============================================================
 # Parser 对象
-PARSER_OBJS = $(patsubst $(PARSER_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(PARSER_SRCS)) \
-              $(patsubst $(PARSER_DIR)/%.c,$(BUILD_DIR)/%.o,$(GENERATED_SRCS))
+PARSER_OBJS = $(patsubst $(PARSER_DIR)/%.c,$(BUILD_DIR)/%.o,$(GENERATED_SRCS)) \
+							$(patsubst $(PARSER_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(PARSER_SRCS)) 
 
 # Storage 对象
 STORAGE_OBJS = $(patsubst $(STORAGE_DIR)/%/%.cpp,$(BUILD_DIR)/%.o,$(STORAGE_SRCS))
@@ -112,7 +113,7 @@ CORE_OBJS = $(PARSER_OBJS) $(STORAGE_OBJS) $(RELATION_OBJS) \
 # ============================================================
 # 测试目标
 # ============================================================
-TEST_TARGETS = test_parser test_statement test_condition \
+TEST_TARGETS = test_ast test_parser test_statement test_condition \
                test_optimizer test_executor test_middle \
                test_mock_engine test_leveldb_engine test_relation
 
@@ -145,6 +146,9 @@ $(LEX_OUT) $(LEX_HDR): $(LEX_SRC) $(YACC_HDR)
 
 # ---- Parser 的 .cpp ----
 $(BUILD_DIR)/ast.o: $(PARSER_DIR)/ast.cpp $(AST_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/parser.o: $(PARSER_DIR)/parser.cpp $(PARSER_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ---- Parser 的 .c（Flex/Bison 生成） ----
@@ -190,7 +194,10 @@ $(BUILD_DIR)/condition.o : $(QUERY_DIR)/statement/condition.cpp $(QUERY_HDR) $(R
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ---- Tests ----
-$(BUILD_DIR)/test_parser.o: $(TESTS_DIR)/test_parser.cpp $(AST_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
+$(BUILD_DIR)/test_ast.o: $(TESTS_DIR)/test_ast.cpp $(AST_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_parser.o: $(TESTS_DIR)/test_parser.cpp $(PARSER_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_statement.o: $(TESTS_DIR)/test_statement.cpp $(AST_HDR) $(QUERY_DIR)/statement.h $(STORAGE_DIR)/kv_engine/kv_engine.h | $(BUILD_DIR)
@@ -230,6 +237,9 @@ $(TARGET): $(MAIN_OBJ) $(CORE_OBJS)
 # ============================================================
 # 链接测试程序
 # ============================================================
+test_ast: $(BUILD_DIR)/test_ast.o $(PARSER_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
 test_parser: $(BUILD_DIR)/test_parser.o $(PARSER_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
