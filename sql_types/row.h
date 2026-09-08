@@ -1,6 +1,7 @@
 // row.h
 #pragma once
 
+#include "identifier.h"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -48,50 +49,50 @@ class RowBuilder {
   RowBuilder() = default;
 
   // ✅ 整数 - 使用 int，避免和 bool 冲突
-  RowBuilder& set(const std::string& column, int value) {
+  RowBuilder& set(const Identifier& column, int value) {
     values_[column] = Value(static_cast<int64_t>(value));
     return *this;
   }
 
   // ✅ 字符串
-  RowBuilder& set(const std::string& column, const std::string& value) {
+  RowBuilder& set(const Identifier& column, const std::string& value) {
     values_[column] = Value(value);
     return *this;
   }
 
   // ✅ 字符串字面量
-  RowBuilder& set(const std::string& column, const char* value) {
+  RowBuilder& set(const Identifier& column, const char* value) {
     values_[column] = Value(std::string(value));
     return *this;
   }
 
   // ✅ 布尔值 - 单独方法避免歧义
-  RowBuilder& set_bool(const std::string& column, bool value) {
+  RowBuilder& set_bool(const Identifier& column, bool value) {
     values_[column] = Value(value);
     return *this;
   }
 
   // ✅ 显式 NULL
-  RowBuilder& set_null(const std::string& column) {
+  RowBuilder& set_null(const Identifier& column) {
     values_[column] = Value();
     return *this;
   }
 
   // ✅ 通用 Value（高级用法）
-  RowBuilder& set(const std::string& column, const Value& value) {
+  RowBuilder& set(const Identifier& column, const Value& value) {
     values_[column] = value;
     return *this;
   }
 
   std::expected<Row, SchemaError> build(const TableSchema& schema) const;
   std::expected<Row, SchemaError> build_ordered(
-      const TableSchema& schema, const std::vector<std::string>& order) const;
+      const TableSchema& schema, const std::vector<Identifier>& order) const;
 
-  Value get(const std::string& column) const;
-  bool has(const std::string& column) const;
+  Value get(const Identifier& column) const;
+  bool has(const Identifier& column) const;
 
  private:
-  std::unordered_map<std::string, Value> values_;
+  std::unordered_map<Identifier, Value, sql::IdentifierHash> values_;
 };
 
 inline RowBuilder row() { return RowBuilder(); }

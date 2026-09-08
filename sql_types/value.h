@@ -38,8 +38,7 @@ class Value {
     }
     
   }
-  Value(Value&& other) noexcept
-    :  {
+  Value(Value&& other) noexcept {
     if(this != &other){
       type_ = other.type_;
       if(is_int()){
@@ -80,6 +79,7 @@ class Value {
         int_val_ = other.int_val_; 
       }
     }
+    return *this;
   }
 
   // ----- 类型检查 -----

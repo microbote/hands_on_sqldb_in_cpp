@@ -5,8 +5,9 @@
 #include <string>
 #include <vector>
 
-#include "value.h"
+
 #include "identifier.h"
+#include "field_type.h"
 
 namespace sql {
 
@@ -24,7 +25,15 @@ struct ColumnDef {
   ColumnDef() = default;
   ColumnDef(const Identifier& n, DataType t, bool pk = false, bool nul = true)
       : name(n), type(t), nullable(nul), primary_key(pk) {}
+
+  std::string to_string() const {
+    std::string s = name.str() + " " + data_type_name(type);
+    if (primary_key) s += " PRIMARY KEY";
+    if (!nullable) s += " NOT NULL";
+    return s;
+  }
 };
+
 
 // ============================================================
 // 错误码
@@ -50,7 +59,7 @@ class TableSchema {
   explicit TableSchema(const Identifier& name);
 
   // ----- 属性 -----
-  const std::string& name() const { return name_; }
+  const std::string& name() const { return name_.str(); }
   TableSchema& set_name(const Identifier& name) {
     name_ = name;
     return *this;

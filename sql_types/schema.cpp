@@ -1,6 +1,7 @@
 // schema.cpp
 #include "schema.h"
 
+#include <sql_types/identifier.h>
 #include <sstream>
 
 #include "row.h"
@@ -196,7 +197,7 @@ TableSchema TableSchema::deserialize(const std::string& data) {
     ColumnDef col;
 
     std::getline(col_ss, part, ':');
-    col.name = part;
+    col.name = Identifier::make(part);
 
     std::getline(col_ss, part, ':');
     col.type = static_cast<DataType>(std::stoi(part));

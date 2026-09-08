@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <optional>
+#include "identifier.h"
 #include <string>
 #include <vector>
 
@@ -11,7 +12,7 @@ namespace sql {
 // ============================================================
 // OrderBy 排序方向
 // ============================================================
-enum class OrderDirection {
+enum class OrderDirection : uint8_t {
   ASC,
   DESC,
 };
@@ -20,20 +21,20 @@ enum class OrderDirection {
 // OrderBy 项
 // ============================================================
 struct OrderByItem {
-  std::string column;
+  Identifier column;
   OrderDirection direction = OrderDirection::ASC;
 
   // 构造函数
   OrderByItem() = default;
-  OrderByItem(std::string col, OrderDirection dir = OrderDirection::ASC)
+  OrderByItem(Identifier col, OrderDirection dir = OrderDirection::ASC)
       : column(std::move(col)), direction(dir) {}
 
   // 便捷创建
-  static OrderByItem asc(std::string col) {
+  static OrderByItem asc(Identifier col) {
     return OrderByItem(std::move(col), OrderDirection::ASC);
   }
 
-  static OrderByItem desc(std::string col) {
+  static OrderByItem desc(Identifier col) {
     return OrderByItem(std::move(col), OrderDirection::DESC);
   }
 };

@@ -56,7 +56,8 @@ void yyerror(const char *s);
 %type <node> opt_where condition_expr condition_term condition_factor
 %type <op> compare_op
 
-%type <node> opt_limit opt_order_by order_item  
+%type <node> opt_limit opt_order_by order_item 
+%type <list> order_list 
 %type <op> order_direction
 
 /* DDL */
@@ -288,9 +289,12 @@ compare_op:
    ============================================================ */
 opt_order_by:
     %empty                       { $$ = NULL; }
-    | TOK_ORDER TOK_BY order_item { $$ = $3; }
+    | TOK_ORDER TOK_BY order_list { $$ = $3; }
     ;
 
+order_list:
+    order_item                  { $$ = create_list($1, LIST_ORDER);}
+    | order_list ',' order_item    { $$ = append_to_list($1, $2); }
 order_item:
     TOK_IDENT                   { $$ = make_order_node($1, OP_ASC); }
     | TOK_IDENT order_direction { $$ = make_order_node($1, $2); }

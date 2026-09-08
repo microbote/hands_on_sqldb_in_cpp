@@ -1,0 +1,65 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "llvm-debug",
+      "displayName": "LLVM Clang 23 (Debug)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-mp-23",
+        "CMAKE_CXX_COMPILER": "clang++-mp-23",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-stdlib=libc++",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -Wall -Wextra -g -I/opt/local/libexec/llvm-23/include/c++/v1",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++ -L/opt/local/libexec/llvm-23/lib -lc++abi -lc++ -Wl,-rpath,/opt/local/libexec/llvm-23/lib",
+    
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld -stdlib=libc++ -L/opt/local/libexec/llvm-23/lib -lc++abi -lc++ -Wl,-rpath,/opt/local/libexec/llvm-23/lib"
+      }
+    },
+    {
+      "name": "llvm-release",
+      "displayName": "LLVM Clang 23 (Release)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-release",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-mp-23",
+        "CMAKE_CXX_COMPILER": "clang++-mp-23",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "CMAKE_CXX_EXTENSIONS": "OFF",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-stdlib=libc++",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++ -O3 -I/opt/local/libexec/llvm-23/include/c++/v1",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld -L/opt/local/libexec/llvm-23/lib -lc++abi -lc++ -Wl,-rpath,/opt/local/libexec/llvm-23/lib"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "llvm-debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "llvm-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "llvm-debug",
+      "output": {"outputOnFailure": true},
+      "execution": {"noProgressBar": true}
+    },
+    {
+      "name": "release",
+      "configurePreset": "llvm-release",
+      "output": {"outputOnFailure": true},
+      "execution": {"noProgressBar": true}
+    }
+  ]
+}

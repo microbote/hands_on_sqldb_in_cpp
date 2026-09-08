@@ -2,6 +2,7 @@
 #include "row.h"
 #include "schema.h"
 
+#include <sql_types/identifier.h>
 #include <sstream>
 
 namespace sql {
@@ -95,7 +96,7 @@ std::expected<Row, SchemaError> RowBuilder::build(
 }
 
 std::expected<Row, SchemaError> RowBuilder::build_ordered(
-    const TableSchema& schema, const std::vector<std::string>& order) const {
+    const TableSchema& schema, const std::vector<Identifier>& order) const {
   Row row;
   row.reserve(order.size());
 
@@ -123,12 +124,12 @@ std::expected<Row, SchemaError> RowBuilder::build_ordered(
   return row;
 }
 
-Value RowBuilder::get(const std::string& column) const {
+Value RowBuilder::get(const Identifier& column) const {
   auto it = values_.find(column);
   return it != values_.end() ? it->second : Value();
 }
 
-bool RowBuilder::has(const std::string& column) const {
+bool RowBuilder::has(const Identifier& column) const {
   return values_.find(column) != values_.end();
 }
 

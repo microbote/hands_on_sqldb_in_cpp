@@ -222,6 +222,7 @@ typedef enum {
     LIST_VALUE,   // 值列表
     LIST_ASSIGNMENT, // 赋值列表
     LIST_COLUMN_DEF, // 列定义列表
+    LIST_ORDER, // orderby
     LIST_UNKNOWN
 } ListType;
 
@@ -231,6 +232,7 @@ static inline const char* list_type_to_string(ListType type) {
         case LIST_VALUE: return "VALUES";
         case LIST_ASSIGNMENT: return "ASSIGNMENTS";
         case LIST_COLUMN_DEF: return "COLUMN_DEFINES";
+        case LIST_ORDER: return "ORDER_BY";
         default: return "UNKNOWN_LIST_TYPE";
     }
 }
