@@ -19,20 +19,31 @@ class Row {
   Row() = default;
   explicit Row(const std::vector<Value>& values) : values_(values) {}
 
+  // 显式声明拷贝/移动语义（确保正确）
+  Row(const Row&) = default;
+  Row(Row&&) = default;
+  Row& operator=(const Row&) = default;
+  Row& operator=(Row&&) = default;
+
   size_t size() const { return values_.size(); }
   const Value& operator[](size_t index) const { return values_[index]; }
   Value& operator[](size_t index) { return values_[index]; }
 
+  bool is_empty() const { return values_.empty(); }
   auto begin() { return values_.begin(); }
   auto end() { return values_.end(); }
   auto begin() const { return values_.begin(); }
   auto end() const { return values_.end(); }
+  auto rbegin() { return values_.rbegin(); }
+  auto rend() { return values_.rend(); }
+  auto rbegin() const { return values_.rbegin(); }
+  auto rend() const { return values_.rend(); }
 
   std::string to_string() const;
   std::string serialize() const;
   static Row deserialize(const std::string& data, const TableSchema& schema);
 
-  bool operator==(const Row& other) const;
+  bool operator==(const Row& other) const { return values_ == other.values_; }
   bool operator!=(const Row& other) const { return !(*this == other); }
 
   void push_back(const Value& value) { values_.push_back(value); }
@@ -92,7 +103,7 @@ class RowBuilder {
   bool has(const Identifier& column) const;
 
  private:
-  std::unordered_map<Identifier, Value, sql::IdentifierHash> values_;
+  std::unordered_map<Identifier, Value> values_;
 };
 
 inline RowBuilder row() { return RowBuilder(); }

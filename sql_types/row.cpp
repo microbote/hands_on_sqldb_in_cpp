@@ -53,15 +53,6 @@ Row Row::deserialize(const std::string& data, const TableSchema& schema) {
   return row;
 }
 
-bool Row::operator==(const Row& other) const {
-  if (values_.size() != other.values_.size()) { return false;
-}
-  for (size_t i = 0; i < values_.size(); ++i) {
-    if (values_[i] != other.values_[i]) { return false;
-}
-  }
-  return true;
-}
 
 // ============================================================
 // RowBuilder 实现

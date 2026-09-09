@@ -36,13 +36,13 @@ class ConditionVisitor {
 // 对整个条件树执行 visitor（深度优先，先父后子）
 inline void walk_condition_pre_order(const Condition& cond, ConditionVisitor& visitor) {
   cond.accept(visitor);
-  for(int i=0; i < cond.child_count(); i++){
+  for(size_t i=0; i < cond.child_count(); i++){
     walk_condition_pre_order(*cond.child_at(i), visitor);
   }
 }
 
 inline void walk_condition_post_order(const Condition& cond, ConditionVisitor& visitor) {
-  for(int i=0; i < cond.child_count(); i++){
+  for(size_t i=0; i < cond.child_count(); i++){
     walk_condition_post_order(*cond.child_at(i), visitor);
   }
   cond.accept(visitor);

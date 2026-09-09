@@ -2,6 +2,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(sqldb_dev LANGUAGES C CXX)
 
+# for clangd
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ============================================================
 # 查找 fmt
 # ============================================================

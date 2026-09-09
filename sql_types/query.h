@@ -76,9 +76,9 @@ struct ColumnRef {
   // 显示名称：优先别名，其次列名
   std::string display_name() const {
     if (alias) {
-      return alias->str();
+      return alias->display_name();
     }
-    return column.str();
+    return column.display_name();
   }
 };
 
@@ -121,15 +121,15 @@ struct SelectQuery {
         if (columns[i].is_qualified()) {
           s += columns[i].table.str() + ".";
         }
-        s += columns[i].column.str();
+        s += columns[i].column.display_name();
         if (columns[i].alias) {
-          s += " AS " + columns[i].alias->str();
+          s += " AS " + columns[i].alias->display_name();
         }
       }
     }
-    s += " FROM " + table.str();
+    s += " FROM " + table.display_name();
     if (alias)
-      s += " AS " + alias->str();
+      s += " AS " + alias->display_name();
     if (where)
       s += " WHERE " + where->to_string();
     if (!group_by.empty()) {
@@ -137,7 +137,7 @@ struct SelectQuery {
       for (size_t i = 0; i < group_by.size(); ++i) {
         if (i > 0)
           s += ", ";
-        s += group_by[i].str();
+        s += group_by[i].display_name();
       }
     }
     if (!order_by.empty()) {
@@ -145,7 +145,7 @@ struct SelectQuery {
       for (size_t i = 0; i < order_by.size(); ++i) {
         if (i > 0)
           s += ", ";
-        s += order_by[i].column.str();
+        s += order_by[i].column.display_name();
         s += (order_by[i].direction == OrderDirection::ASC) ? " ASC" : " DESC";
       }
     }
@@ -183,13 +183,13 @@ struct InsertQuery {
 
   // 调试
   std::string to_string() const {
-    std::string s = "INSERT INTO " + table.str();
+    std::string s = "INSERT INTO " + table.display_name();
     if (!columns.empty()) {
       s += " (";
       for (size_t i = 0; i < columns.size(); ++i) {
         if (i > 0)
           s += ", ";
-        s += columns[i].str();
+        s += columns[i].display_name();
       }
       s += ")";
     }
@@ -228,11 +228,11 @@ struct UpdateQuery {
 
   // 调试
   std::string to_string() const {
-    std::string s = "UPDATE " + table.str() + " SET ";
+    std::string s = "UPDATE " + table.display_name() + " SET ";
     for (size_t i = 0; i < assignments.size(); ++i) {
       if (i > 0)
         s += ", ";
-      s += assignments[i].column.str() + " = " +
+      s += assignments[i].column.display_name() + " = " +
            assignments[i].value.to_string();
     }
     if (where) {
@@ -253,7 +253,7 @@ struct DeleteQuery {
 
   // 调试
   std::string to_string() const {
-    std::string s = "DELETE FROM " + table.str();
+    std::string s = "DELETE FROM " + table.display_name();
     if (where) {
       s += " WHERE " + where->to_string();
     }
@@ -275,8 +275,8 @@ struct CreateTableQuery {
   std::string to_string() const {
     std::string s = "CREATE TABLE ";
     if (!database.empty())
-      s += database.str() + ".";
-    s += table.str() + " (";
+      s += database.display_name() + ".";
+    s += table.display_name() + " (";
     for (size_t i = 0; i < columns.size(); ++i) {
       if (i > 0)
         s += ", ";
@@ -295,8 +295,8 @@ struct DropTableQuery {
   std::string to_string() const {
     std::string s = "DROP TABLE ";
     if (!database.empty())
-      s += database.str() + ".";
-    s += table.str();
+      s += database.display_name() + ".";
+    s += table.display_name();
     return s;
   }
 };
@@ -305,21 +305,21 @@ struct DropTableQuery {
 struct CreateDatabaseQuery {
   Identifier database;
 
-  std::string to_string() const { return "CREATE DATABASE " + database.str(); }
+  std::string to_string() const { return "CREATE DATABASE " + database.display_name(); }
 };
 
 // DROP DATABASE
 struct DropDatabaseQuery {
   Identifier database;
 
-  std::string to_string() const { return "DROP DATABASE " + database.str(); }
+  std::string to_string() const { return "DROP DATABASE " + database.display_name(); }
 };
 
 // USE DATABASE
 struct UseDatabaseQuery {
   Identifier database;
 
-  std::string to_string() const { return "USE " + database.str(); }
+  std::string to_string() const { return "USE " + database.display_name(); }
 };
 
 // ============================================================

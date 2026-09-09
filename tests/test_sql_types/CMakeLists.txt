@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # 查找 fmt 库（已经由 fwk 传递链接，但确保）
-find_package(fmt REQUIRED)
+#find_package(fmt REQUIRED)
 
 # sql_types 头文件路径
 set(SQL_TYPES_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../sql_types)
@@ -10,7 +10,16 @@ set(SQL_TYPES_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../sql_types)
 # 测试可执行文件
 add_executable(test_sql_types
     main.cpp
+    test_compare_op.cpp
+    test_value.cpp
     test_identifier.cpp
+    test_field_type.cpp
+    test_row.cpp
+    test_condition.cpp
+    test_key_set.cpp
+    test_key_range.cpp
+    test_schema.cpp
+    test_query.cpp
 )
 
 

@@ -32,6 +32,15 @@ struct ColumnDef {
     if (!nullable) s += " NOT NULL";
     return s;
   }
+
+  bool operator==(const ColumnDef& other) const {
+    return name == other.name && type == other.type && 
+           nullable == other.nullable && primary_key == other.primary_key;
+  }
+
+  bool operator!=(const ColumnDef& other) const {
+    return !(*this == other);
+  }
 };
 
 
@@ -59,15 +68,23 @@ class TableSchema {
   explicit TableSchema(const Identifier& name);
 
   // ----- 属性 -----
-  const std::string& name() const { return name_.str(); }
+  const std::string& table_name_str() const { return name_.str(); }
+  const Identifier& table_name() const { return name_; }
   TableSchema& set_name(const Identifier& name) {
     name_ = name;
     return *this;
   }
+  std::vector<std::string> column_names() const {
+    std::vector<std::string> names;
+    for(auto col : columns_){
+      names.push_back(col.name.display_name());
+    }
+    return names;
+  }
 
   const std::vector<ColumnDef>& columns() const { return columns_; }
   std::vector<ColumnDef>& columns() { return columns_; }
-
+  size_t column_count() const { return columns_.size(); }
   // ----- 链式 API（返回 *this，内部记录错误）-----
   TableSchema& primary_key(const Identifier& name, DataType type);
   TableSchema& not_null(const Identifier& name, DataType type);
@@ -79,9 +96,25 @@ class TableSchema {
   // ----- 查询 -----
   int column_index(const Identifier& name) const;
   const ColumnDef* column(const Identifier& name) const;
+  const ColumnDef* column_at(int idx) const {
+    return &columns_[idx];
+  }
+  DataType column_type(const Identifier& name) const {
+    auto col = column(name);
+    if(col) {
+      return col->type;
+    }
+    return DataType::UNKNOWN_TYPE;
+  }
   Identifier primary_key_name() const;
   int primary_key_index() const { return primary_key_index_; }
-
+  const ColumnDef* primary_key_column() const {
+    if(has_primary_key()){
+      return column_at(primary_key_index());
+    }
+    return nullptr;
+  }
+  bool is_empty() const { return columns_.empty(); }
   // ----- 验证 -----
   SchemaError validate() const;
   SchemaError validate_row(const Row& row) const;
@@ -93,6 +126,23 @@ class TableSchema {
   // ----- 序列化 -----
   std::string serialize() const;
   static TableSchema deserialize(const std::string& data);
+
+  // 单行紧凑格式: users(id INT PRIMARY KEY, name VARCHAR NOT NULL, age INT NULL)
+  std::string to_string() const;
+  
+  // 多行友好格式（对齐列）
+  std::string to_string_pretty() const;
+  
+  // 表格形式 (类似 psql 输出)
+  std::string to_string_table() const;
+  
+  // 简短摘要: users(3 columns, PK: id)
+  std::string to_string_summary() const;
+
+  // ----- 相等比较 -----
+  bool operator==(const TableSchema& other) const;
+  bool operator!=(const TableSchema& other) const { return !(*this == other); }
+
 
   // ----- 错误信息 -----
   static const char* error_message(SchemaError err);
@@ -111,6 +161,10 @@ class TableSchema {
       error_ = err;  // 只记录第一个错误
     }
   }
+
+  // 计算对齐的辅助函数
+  int max_column_name_width() const;
+  int max_type_width() const;
 };
 
 }  // namespace sql

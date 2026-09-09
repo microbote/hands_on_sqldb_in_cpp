@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <iterator>
 
 #include "key_range.h"
 #include "value.h"
@@ -44,8 +45,8 @@ class KeySet {
   }
 
   std::vector<sql::Value>& points() { return points_; }
-
   bool empty() const { return points_.empty(); }
+  bool is_empty() const { return points_.empty(); }
   size_t size() const { return points_.size(); }
 
   // ============================================================
@@ -80,7 +81,21 @@ class KeySet {
     }
     return *this;
   }
-
+// 删除单值
+   bool remove(const sql::Value& val) {
+     auto it = std::find(points_.begin(), points_.end(), val);
+     if (it != points_.end()) {
+       points_.erase(it);
+       return true;
+     }
+     return false;
+   }
+   
+   // 清空
+   void clear() {
+     points_.clear();
+     sorted_ = true;  // 空集是已排序的
+   }
   // ============================================================
   // 排序和去重（原地操作）
   // ============================================================
@@ -116,6 +131,23 @@ class KeySet {
 
   bool is_sorted() const { return sorted_; }
 
+  // 最小值（请在 points_ 非空时调用）
+  sql::Value min() const {
+     if (points_.empty()) {
+       throw std::runtime_error("KeySet::min() on empty set");
+     }
+     ensure_sorted();
+     return points_.front();
+   }
+   
+   // 最大值
+   sql::Value max() const {
+     if (points_.empty()) {
+       throw std::runtime_error("KeySet::max() on empty set");
+     }
+     ensure_sorted();
+     return points_.back();
+   }
   // ============================================================
   // 集合运算（返回新的 KeySet）
   // ============================================================
@@ -248,13 +280,13 @@ class KeySet {
 
     // 检查是否连续
     for (size_t i = 1; i < points_.size(); ++i) {
-      if (points_[i].int_val() - points_[i - 1].int_val() != 1) {
+      if (points_[i].as_int() - points_[i - 1].as_int() != 1) {
         return std::nullopt;
       }
     }
 
     return KeyRange::range(points_.front(),
-                           sql::Value(points_.back().int_val() + 1));
+                           sql::Value(points_.back().as_int() + 1));
   }
 
   // 将点集拆分为多个连续范围
@@ -271,18 +303,36 @@ class KeySet {
     sql::Value current = start;
 
     for (size_t i = 1; i < points_.size(); ++i) {
-      if (points_[i].int_val() - current.int_val() != 1) {
+      if (points_[i].as_int() - current.as_int() != 1) {
         result.push_back(
-            KeyRange::range(start, sql::Value(current.int_val() + 1)));
+            KeyRange::range(start, sql::Value(current.as_int() + 1)));
         start = points_[i];
       }
       current = points_[i];
     }
-    result.push_back(KeyRange::range(start, sql::Value(current.int_val() + 1)));
+    result.push_back(KeyRange::range(start, sql::Value(current.as_int() + 1)));
 
     return result;
   }
 
+  // 是否有与 KeyRange 重叠
+   bool is_intersect(const KeyRange& range) const {
+     if (points_.empty() || range.is_empty()) return false;
+     ensure_sorted();
+     
+     // 直接用 range 内部逻辑，让 range 处理无穷
+     return range.intersects_set(*this);
+   }
+
+   // 过滤出范围内的点
+   KeySet filter(const KeyRange& range) const {
+     if (points_.empty() || range.is_empty()) {
+       return {};
+     }
+     
+     ensure_sorted();
+     return range.filter_set(*this);
+   }
   // ============================================================
   // 迭代器支持
   // ============================================================
@@ -294,6 +344,21 @@ class KeySet {
   auto begin() { return points_.begin(); }
   auto end() { return points_.end(); }
 
+  // 反转（用于降序遍历）
+   auto rbegin() const { return points_.rbegin(); }
+   auto rend() const { return points_.rend(); }
+   
+   // 迭代器访问（直接通过容器）
+   const sql::Value& at(size_t i) const {
+     ensure_sorted();
+     return points_.at(i);
+   }
+   
+   // 随机访问操作符
+   const sql::Value& operator[](size_t i) const {
+     ensure_sorted();
+     return points_[i];
+   }
   // ============================================================
   // 序列化
   // ============================================================
@@ -309,6 +374,23 @@ class KeySet {
     s += "}";
     return s;
   }
+
+  // 完整字符串（不排序）
+   std::string to_string_raw() const {
+     std::string s = "[";
+     for (size_t i = 0; i < points_.size(); ++i) {
+       if (i > 0) s += ", ";
+       s += points_[i].to_string();
+     }
+     s += "]";
+     return s;
+   }
+   
+   // 类型检查辅助（用于测试）
+   DataType data_type() const {
+     if (points_.empty()) return DataType::UNKNOWN_TYPE;
+     return points_.front().type();
+   }
 
  private:
   // 私有构造函数（用于已知已排序的情况）

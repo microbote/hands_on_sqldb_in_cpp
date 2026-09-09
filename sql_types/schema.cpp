@@ -1,9 +1,8 @@
 // schema.cpp
 #include "schema.h"
-
-#include <sql_types/identifier.h>
 #include <sstream>
-
+#include <iomanip>
+#include <algorithm>
 #include "row.h"
 
 namespace sql {
@@ -197,7 +196,7 @@ TableSchema TableSchema::deserialize(const std::string& data) {
     ColumnDef col;
 
     std::getline(col_ss, part, ':');
-    col.name = Identifier::make(part);
+    col.name = identifier(part);
 
     std::getline(col_ss, part, ':');
     col.type = static_cast<DataType>(std::stoi(part));
@@ -264,6 +263,165 @@ SchemaError TableSchema::check_duplicate_column_name(
     }
   }
   return SchemaError::OK;
+}
+
+// ============================================================
+// to_string - 单行紧凑格式
+// ============================================================
+std::string TableSchema::to_string() const {
+  std::ostringstream oss;
+  oss << name_.str() << "(";
+  
+  for (size_t i = 0; i < columns_.size(); ++i) {
+    if (i > 0) { oss << ", ";
+}
+    const auto& col = columns_[i];
+    oss << col.name.str() << " " << data_type_name(col.type);
+    if (col.primary_key) { oss << " PRIMARY KEY";
+    } else if (!col.nullable) { oss << " NOT NULL";
+}
+  }
+  
+  oss << ")";
+  return oss.str();
+}
+
+// ============================================================
+// to_string_pretty - 多行对齐格式
+// ============================================================
+std::string TableSchema::to_string_pretty() const {
+  if (columns_.empty()) {
+    return name_.str() + " (empty table)";
+  }
+  
+  std::ostringstream oss;
+  oss << "Table: " << name_.str() << "\n";
+  oss << "Columns:\n";
+  
+  // 表头
+  oss << "  " << std::left << std::setw(25) << "Name" 
+      << std::setw(15) << "Type" 
+      << std::setw(10) << "Nullable" 
+      << "Constraint\n";
+  oss << "  " << std::string(50, '-') << "\n";
+  
+  for (const auto& col : columns_) {
+    std::string nullable = col.nullable ? "YES" : "NO";
+    std::string constraint;
+    if (col.primary_key) {
+      constraint = "PRIMARY KEY";
+    } else if (!col.nullable) {
+      constraint = "NOT NULL";
+    }
+    
+    oss << "  " << std::left << std::setw(25) << col.name.str()
+        << std::setw(15) << data_type_name(col.type)
+        << std::setw(10) << nullable
+        << constraint << "\n";
+  }
+  
+  return oss.str();
+}
+
+// ============================================================
+// to_string_table - 类似 psql 的表格形式
+// ============================================================
+std::string TableSchema::to_string_table() const {
+  if (columns_.empty()) {
+    return "Table \"" + name_.str() + "\" has no columns.\n";
+  }
+  
+  // 计算列宽
+  int name_width = max_column_name_width() + 2;
+  int type_width = max_type_width() + 2;
+  int null_width = 8;
+  
+  std::ostringstream oss;
+  oss << "Table \"" << name_.str() << "\"\n";
+  
+  // 上边框
+  oss << "+" << std::string(name_width + 2, '-')
+      << "+" << std::string(type_width + 2, '-')
+      << "+" << std::string(null_width + 2, '-')
+      << "+" << std::string(12 + 2, '-') << "+\n";
+  
+  // 表头
+  oss << "| " << std::left << std::setw(name_width) << "Column"
+      << "| " << std::setw(type_width) << "Type"
+      << "| " << std::setw(null_width) << "Nullable"
+      << "| " << std::setw(12) << "Constraint" << "|\n";
+  
+  // 表头分隔线
+  oss << "|" << std::string(name_width + 2, '-')
+      << "|" << std::string(type_width + 2, '-')
+      << "|" << std::string(null_width + 2, '-')
+      << "|" << std::string(12 + 2, '-') << "|\n";
+  
+  // 数据行
+  for (const auto& col : columns_) {
+    std::string nullable = col.nullable ? "YES" : "NO";
+    std::string constraint;
+    if (col.primary_key) {
+      constraint = "PRIMARY KEY";
+    } else if (!col.nullable) {
+      constraint = "NOT NULL";
+    }
+    
+    oss << "| " << std::left << std::setw(name_width) << col.name.str()
+        << "| " << std::setw(type_width) << data_type_name(col.type)
+        << "| " << std::setw(null_width) << nullable
+        << "| " << std::setw(12) << constraint << "|\n";
+  }
+  
+  // 下边框
+  oss << "+" << std::string(name_width + 2, '-')
+      << "+" << std::string(type_width + 2, '-')
+      << "+" << std::string(null_width + 2, '-')
+      << "+" << std::string(12 + 2, '-') << "+\n";
+  
+  return oss.str();
+}
+
+// ============================================================
+// to_string_summary - 简短摘要
+// ============================================================
+std::string TableSchema::to_string_summary() const {
+  std::ostringstream oss;
+  oss << name_.str() << "(" << columns_.size() << " columns";
+  if (has_primary_key()) {
+    oss << ", PK: " << primary_key_column()->name.str();
+  }
+  oss << ")";
+  return oss.str();
+}
+
+// ============================================================
+// 相等比较
+// ============================================================
+bool TableSchema::operator==(const TableSchema& other) const {
+  return name_ == other.name_ && 
+         columns_ == other.columns_ &&
+         primary_key_index_ == other.primary_key_index_;
+}
+
+// ============================================================
+// 辅助函数
+// ============================================================
+int TableSchema::max_column_name_width() const {
+  int max_width = 0;
+  for (const auto& col : columns_) {
+    max_width = std::max(max_width, (int)col.name.str().length());
+  }
+  return max_width;
+}
+
+int TableSchema::max_type_width() const {
+  int max_width = 0;
+  for (const auto& col : columns_) {
+    max_width = std::max(max_width, 
+                         (int)std::string(data_type_name(col.type)).length());
+  }
+  return max_width;
 }
 
 }  // namespace sql

@@ -9,6 +9,7 @@
 #include "condition_visitor.h"
 #include "compare_op.h"
 #include "value.h"
+#include "identifier.h"
 
 namespace sql {
 
@@ -27,7 +28,7 @@ class CompareCondition : public Condition {
   const Condition* child_at(size_t) const override { return nullptr; }
 
   // ---- 访问器 ----
-  const std::string& column() const { return column_; }
+  const Identifier& column() const { return column_; }
   CompareOp op() const { return op_; }
   const Value& value() const { return value_; }
 
@@ -43,7 +44,7 @@ class CompareCondition : public Condition {
 
   // ---- 调试 ----
   std::string to_string() const override {
-    std::string s = column_;
+    std::string s = column_.display_name();
     s += " " + compare_op_to_string(op_);
     if (!is_null_op(op_)) {
       s += " " + value_.to_string();
@@ -52,7 +53,7 @@ class CompareCondition : public Condition {
   }
 
  private:
-  std::string column_;
+  Identifier column_;
   CompareOp op_;
   Value value_;
 };
@@ -73,7 +74,7 @@ class InCondition : public Condition {
   const Condition* child_at(size_t) const override { return nullptr; }
 
   // ---- 访问器 ----
-  const std::string& column() const { return column_; }
+  const Identifier& column() const { return column_; }
   bool is_not_in() const { return is_not_in_; }
   const std::vector<Value>& values() const { return values_; }
   size_t value_count() const { return values_.size(); }
@@ -94,7 +95,7 @@ class InCondition : public Condition {
 
   // ---- 调试 ----
   std::string to_string() const override {
-    std::string s = column_;
+    std::string s = column_.display_name();
     s += is_not_in_ ? " NOT IN (" : " IN (";
     for (size_t i = 0; i < values_.size(); ++i) {
       if (i > 0) s += ", ";
@@ -105,7 +106,7 @@ class InCondition : public Condition {
   }
 
  private:
-  std::string column_;
+  Identifier column_;
   bool is_not_in_;
   std::vector<Value> values_;
 };
