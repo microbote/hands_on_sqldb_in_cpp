@@ -17,9 +17,10 @@ find_package(fmt REQUIRED)
 # ============================================================
 add_library(sql_types STATIC
     sql_types/compare_op.cpp
+    sql_types/key_range.cpp
+    sql_types/row.cpp
     sql_types/schema.cpp
     sql_types/value.cpp
-    sql_types/row.cpp
 )
 
 # 关键：添加根目录路径，这样 "common/c_types.h" 能被找到

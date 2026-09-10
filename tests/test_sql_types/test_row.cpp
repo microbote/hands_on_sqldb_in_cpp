@@ -241,14 +241,17 @@ TEST(RowBuilder, SchemaSerializationWithRow) {
         // 序列化行（不带 schema 信息）
         std::string data = r.serialize();
         CHECK(!data.empty());
-        
+
         // 反序列化需要 schema
-        Row restored = Row::deserialize(data, schema);
-        CHECK_EQ(restored.size(), r.size());
-        CHECK_EQ(restored[0].as_int(), 42);
-        CHECK_EQ(restored[1].as_str(), "Test");
-        CHECK_EQ(restored[2].as_int(), 99);
-        CHECK_EQ(restored[3].as_bool(), false);
-        CHECK(restored == r);
+        auto restored = Row::deserialize(data, schema);
+        CHECK(restored.has_value());
+        if (restored.has_value()) {
+            CHECK_EQ(restored->size(), r.size());
+            CHECK_EQ((*restored)[0].as_int(), 42);
+            CHECK_EQ((*restored)[1].as_str(), "Test");
+            CHECK_EQ((*restored)[2].as_int(), 99);
+            CHECK_EQ((*restored)[3].as_bool(), false);
+            CHECK(*restored == r);
+        }
     }
 }

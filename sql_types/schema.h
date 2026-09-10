@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -12,6 +14,7 @@
 namespace sql {
 
 class Row;
+class Value;
 
 // ============================================================
 // 列定义
@@ -53,6 +56,7 @@ enum class SchemaError :uint8_t {
   NO_PRIMARY_KEY,
   DUPLICATE_COLUMN_NAME,
   INVALID_ROW,
+  INVALID_FORMAT,          // 序列化数据损坏 / 版本不匹配
   COLUMN_NOT_FOUND,
   COLUMN_ATTR_NULL_MISMATCH,
   COLUMN_SIZE_MISMATCH,
@@ -64,6 +68,9 @@ enum class SchemaError :uint8_t {
 // ============================================================
 class TableSchema {
  public:
+  // 序列化格式版本；格式变化时必须递增，反序列化会校验
+  static constexpr uint8_t kFormatVersion = 1;
+
   TableSchema() = default;
   explicit TableSchema(const Identifier& name);
 
@@ -97,7 +104,12 @@ class TableSchema {
   int column_index(const Identifier& name) const;
   const ColumnDef* column(const Identifier& name) const;
   const ColumnDef* column_at(int idx) const {
-    return &columns_[idx];
+    if (idx < 0 || static_cast<size_t>(idx) >= columns_.size()) {
+      throw std::out_of_range("TableSchema::column_at: index " +
+                              std::to_string(idx) + " out of range (size " +
+                              std::to_string(columns_.size()) + ")");
+    }
+    return &columns_[static_cast<size_t>(idx)];
   }
   DataType column_type(const Identifier& name) const {
     auto col = column(name);
@@ -118,6 +130,10 @@ class TableSchema {
   // ----- 验证 -----
   SchemaError validate() const;
   SchemaError validate_row(const Row& row) const;
+  // 按列定义校验单个值（类型族 + NOT NULL）
+  SchemaError validate_value(const ColumnDef& col, const Value& value) const;
+  SchemaError validate_value(const Identifier& column_name,
+                             const Value& value) const;
   bool has_primary_key() const;
   bool has_error() const { return error_ != SchemaError::OK; }
   SchemaError error() const { return error_; }
@@ -125,7 +141,8 @@ class TableSchema {
 
   // ----- 序列化 -----
   std::string serialize() const;
-  static TableSchema deserialize(const std::string& data);
+  static std::expected<TableSchema, SchemaError> deserialize(
+      const std::string& data);
 
   // 单行紧凑格式: users(id INT PRIMARY KEY, name VARCHAR NOT NULL, age INT NULL)
   std::string to_string() const;

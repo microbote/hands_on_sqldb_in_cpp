@@ -258,17 +258,20 @@ TEST(Schema, SerDes) {
     
     // 反序列化
     auto restored = TableSchema::deserialize(data);
-    CHECK(restored.table_name() == schema.table_name());
-    CHECK_EQ(restored.column_count(), schema.column_count());
-    
-    // 逐列对比
-    for (size_t i = 0; i < schema.column_count(); ++i) {
-        const auto* orig = schema.column_at(i);
-        const auto* copy = restored.column_at(i);
-        CHECK(orig->name == copy->name);
-        CHECK(orig->type == copy->type);
-        CHECK_EQ(orig->primary_key, copy->primary_key);
-        CHECK_EQ(orig->nullable, copy->nullable);
+    CHECK(restored.has_value());
+    if (restored.has_value()) {
+        CHECK(restored->table_name() == schema.table_name());
+        CHECK_EQ(restored->column_count(), schema.column_count());
+
+        // 逐列对比
+        for (size_t i = 0; i < schema.column_count(); ++i) {
+            const auto* orig = schema.column_at(i);
+            const auto* copy = restored->column_at(i);
+            CHECK(orig->name == copy->name);
+            CHECK(orig->type == copy->type);
+            CHECK_EQ(orig->primary_key, copy->primary_key);
+            CHECK_EQ(orig->nullable, copy->nullable);
+        }
     }
 }
 

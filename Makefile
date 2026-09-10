@@ -294,6 +294,18 @@ endef
 $(foreach t,$(TEST_TARGETS),$(eval $(call TEST_RULE,$(t))))
 
 # ============================================================
+# sql_types 模块（新构建系统走 CMake，与上面的 legacy 目标解耦）
+# ============================================================
+.PHONY: sql-types sql-types-test
+
+sql-types:
+	cmake --build $(BUILD_DIR) --target sql_types
+
+sql-types-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_sql_types
+
+# ============================================================
 # 运行主程序
 # ============================================================
 run: $(TARGET)

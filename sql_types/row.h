@@ -2,6 +2,7 @@
 #pragma once
 
 #include "identifier.h"
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,7 +42,11 @@ class Row {
 
   std::string to_string() const;
   std::string serialize() const;
-  static Row deserialize(const std::string& data, const TableSchema& schema);
+  static std::expected<Row, SchemaError> deserialize(
+      const std::string& data, const TableSchema& schema);
+
+  // 序列化格式版本；格式变化必须递增
+  static constexpr uint8_t kFormatVersion = 1;
 
   bool operator==(const Row& other) const { return values_ == other.values_; }
   bool operator!=(const Row& other) const { return !(*this == other); }
@@ -61,7 +66,12 @@ class RowBuilder {
 
   // ✅ 整数 - 使用 int，避免和 bool 冲突
   RowBuilder& set(const Identifier& column, int value) {
-    values_[column] = Value(static_cast<int64_t>(value));
+    values_[column] = Value(value);
+    return *this;
+  }
+
+  RowBuilder& set(const Identifier& column, int64_t value) {
+    values_[column] = Value(value);
     return *this;
   }
 

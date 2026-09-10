@@ -2,8 +2,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <initializer_list>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <iterator>
@@ -44,7 +46,13 @@ class KeySet {
     return points_;
   }
 
-  std::vector<sql::Value>& points() { return points_; }
+  // 非 const 版本会暴露可变引用：无法知道调用方是否修改内容，
+  // 因此必须让惰性排序标志失效。否则 contains()/equals() 里的
+  // binary_search 会在未排序的数据上给出假阴性。
+  std::vector<sql::Value>& points() {
+    sorted_ = false;
+    return points_;
+  }
   bool empty() const { return points_.empty(); }
   bool is_empty() const { return points_.empty(); }
   size_t size() const { return points_.size(); }
@@ -336,17 +344,20 @@ class KeySet {
   // ============================================================
   // 迭代器支持
   // ============================================================
+  // 只提供只读迭代（按序）。需要修改内容请用 add/remove/points()，
+  // 它们会正确维护排序标志。
   auto begin() const {
     ensure_sorted();
-    return points_.begin();
+    return points_.cbegin();
   }
-  auto end() const { return points_.end(); }
-  auto begin() { return points_.begin(); }
-  auto end() { return points_.end(); }
+  auto end() const { return points_.cend(); }
 
-  // 反转（用于降序遍历）
-   auto rbegin() const { return points_.rbegin(); }
-   auto rend() const { return points_.rend(); }
+   // 反转（用于降序遍历）
+   auto rbegin() const {
+     ensure_sorted();
+     return points_.crbegin();
+   }
+   auto rend() const { return points_.crend(); }
    
    // 迭代器访问（直接通过容器）
    const sql::Value& at(size_t i) const {

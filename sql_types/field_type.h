@@ -2,6 +2,8 @@
 
 #include "common/c_types.h"
 
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -19,6 +21,13 @@ enum class DataType : uint8_t {
   BOOLEAN,   // 布尔值
   NULL_TYPE, // NULL 类型
   UNKNOWN_TYPE
+};
+
+enum class DataTypeClass : uint8_t {
+  INTEGER,
+  STRING,
+  BOOLEAN,
+  UNKNOWN_CLASS
 };
 
 inline bool is_integer(DataType type) {
@@ -45,7 +54,47 @@ inline bool is_boolean(DataType type) { return type == DataType::BOOLEAN; }
 
 inline bool is_numeric(DataType type) { return is_integer(type); }
 
-inline bool is_null(DataType type) { return type == DataType::NULL_TYPE; }
+inline bool is_null(DataType type) {
+  return type == DataType::NULL_TYPE || type == DataType::UNKNOWN_TYPE;
+}
+
+// ============================================================
+// 类型族（type family）
+//
+// INT/BIGINT 在底层都按 int64_t 存储与编码，VARCHAR/TEXT 在底层都是
+// 字符串。因此"列类型 vs 值类型"的一致性判定必须按 *族* 而不是按
+// 枚举值精确相等，否则 Value(int64_t(5)) 永远写不进 BIGINT 列、
+// TEXT 往返一次就会被判定为 VARCHAR。
+//
+// 注意：这里只表达"可以直接赋值/比较"，不做精度收窄（BIGINT -> INT
+// 依然算兼容，由上层决定是否检查取值范围）。
+// ============================================================
+inline bool is_same_family(DataType a, DataType b) {
+  if (a == b) {
+    return true;
+  }
+  if (is_integer(a) && is_integer(b)) {
+    return true;
+  }
+  if (is_string(a) && is_string(b)) {
+    return true;
+  }
+  return false;
+}
+
+// 大小写不敏感的 ASCII 比较（不分配内存）
+inline bool iequals_ascii(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) !=
+        std::tolower(static_cast<unsigned char>(b[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
 
 inline bool is_orderable(DataType type) {
   return is_integer(type) || is_string(type) || is_boolean(type);
@@ -56,6 +105,19 @@ inline bool is_hashable(DataType type) {
 }
 
 inline bool is_indexable(DataType type) { return is_orderable(type); }
+
+inline DataTypeClass get_type_class(DataType type){
+  if(is_integer(type)){
+    return DataTypeClass::INTEGER;
+  }
+  if(is_string(type)){
+    return DataTypeClass::STRING;
+  }
+  if(is_boolean(type)){
+    return DataTypeClass::BOOLEAN;
+  }
+  return DataTypeClass::UNKNOWN_CLASS;
+}
 
 // ============================================================
 // 数据类型名称
@@ -96,19 +158,9 @@ inline const char *data_type_name(DataType type) {
 // string_to_data_type(std::string(...)) -> DataType::INT
 // ============================================================
 inline DataType string_to_data_type(std::string_view str) {
-  // 先做大小写无关比较（避免拷贝）
-  auto iequals = [](std::string_view s, const char *literal) {
-    size_t len = std::char_traits<char>::length(literal);
-    if (s.size() != len) {
-      return false;
-    }
-    for (size_t i = 0; i < len; ++i) {
-      if (std::tolower(static_cast<unsigned char>(s[i])) !=
-          std::tolower(static_cast<unsigned char>(literal[i]))) {
-        return false;
-      }
-    }
-    return true;
+  // 大小写无关比较（避免拷贝）
+  auto iequals = [](std::string_view s, std::string_view literal) {
+    return iequals_ascii(s, literal);
   };
 
   if (iequals(str, "int") || iequals(str, "integer")|| iequals(str, "int8")) {

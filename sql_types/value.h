@@ -3,8 +3,10 @@
 
 #include <cassert>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "field_type.h"
@@ -37,13 +39,35 @@ public:
   explicit Value(const char *v)
       : type_(DataType::VARCHAR), str_ptr_(new std::string(v)) {}
 
+  // 显式指定字符串的逻辑类型（VARCHAR 或 TEXT）。
+  // 取代早期的 Value(str, bool) 技巧：语义清晰，且不会和 bool 构造混淆。
+  Value(std::string v, DataType type)
+      : type_(type), str_ptr_(new std::string(std::move(v))) {
+    assert(sql::is_string(type_));
+  }
+
   explicit Value(bool v) noexcept : type_(DataType::BOOLEAN), bool_val_(v) {}
 
   // ----- 拷贝构造 -----
-  Value(const Value &other) { *this = other; }
+  Value(const Value &other) : type_(other.type_) {
+    if (other.is_string()) {
+      str_ptr_ = new std::string(*other.str_ptr_);
+    } else {
+      int_val_ = other.int_val_;  // 覆盖 union 的标量成员（含 bool）
+    }
+  }
 
-  // ----- 移动构造 -----
-  Value(Value &&other) noexcept { *this = std::move(other); }
+  // ----- 移动构造：直接转移资源，源置为 NULL -----
+  Value(Value &&other) noexcept : type_(other.type_) {
+    if (other.is_string()) {
+      str_ptr_ = other.str_ptr_;
+      other.str_ptr_ = nullptr;
+      other.type_ = DataType::NULL_TYPE;
+    } else {
+      int_val_ = other.int_val_;
+      other.type_ = DataType::NULL_TYPE;
+    }
+  }
 
   // ----- 析构 -----
   ~Value() { cleanup(); }
@@ -170,22 +194,22 @@ public:
   // ----- 比较运算符 -----
   bool operator==(const Value &other) const {
     // 类型不同直接返回 false（除非都是 NULL）
-    if (type_ != other.type_) {
-      // NULL == NULL 是 true
-      return is_null() && other.is_null();
+    auto type_class = get_type_class(type_);
+    auto other_class = get_type_class(other.type_);
+    if (type_class != other_class) {
+      // including NULL == NULL is true
+      return false;
     }
 
-    switch (type_) {
-    case DataType::INT:
-    case DataType::BIGINT:
+    switch (type_class) {
+    case DataTypeClass::INTEGER:
       return int_val_ == other.int_val_;
-    case DataType::VARCHAR:
-    case DataType::TEXT:
+    case DataTypeClass::STRING:
       return *str_ptr_ == *other.str_ptr_;
-    case DataType::BOOLEAN:
+    case DataTypeClass::BOOLEAN:
       return bool_val_ == other.bool_val_;
-    case DataType::NULL_TYPE:
-      return true;
+    case DataTypeClass::UNKNOWN_CLASS:
+      return is_null() && other.is_null();
     default:
       return false;
     }
@@ -201,9 +225,10 @@ public:
     if (other.is_null()) {
       return false;
     }
-
+    auto type_class = get_type_class(type_);
+    auto other_class = get_type_class(other.type_);
     // 类型不同时，按类型序号比较
-    if (type_ != other.type_) {
+    if (type_class != other_class) {
       return static_cast<int>(type_) < static_cast<int>(other.type_);
     }
 
@@ -263,24 +288,26 @@ public:
 
   // ----- 解析字符串为值 -----
   static Value from_string(const std::string &str, DataType type) {
-    // 处理 NULL
-    if (str == "NULL" || str == "null" || str == "\\N") {
+    // 处理 NULL（大小写不敏感："NULL" / "null" / "Null" / "\N"）
+    if (str == "\\N" || iequals_ascii(str, "null")) {
       return Value();
     }
 
     switch (type) {
     case DataType::INT:
-      return Value(std::stoi(str));
     case DataType::BIGINT:
+      // 两个整数类型底层都是 int64_t，统一用 stoll，
+      // 避免 stoi 在 32 位边界上溢出抛异常。
       return Value(std::stoll(str));
     case DataType::VARCHAR:
-    case DataType::TEXT:
       return Value(str);
+    case DataType::TEXT:
+      return Value(str, DataType::TEXT);
     case DataType::BOOLEAN:
-      if (str == "true" || str == "1") {
+      if (iequals_ascii(str, "true") || str == "1") {
         return Value(true);
       }
-      if (str == "false" || str == "0") {
+      if (iequals_ascii(str, "false") || str == "0") {
         return Value(false);
       }
       throw std::invalid_argument("Invalid boolean: " + str);
@@ -294,7 +321,7 @@ public:
   static Value null() { return Value(); }
   static Value boolean(bool v) { return Value(v); }
   static Value integer(int64_t v) { return Value(v); }
-  static Value text(const std::string &v) { return Value(v); }
+  static Value text(const std::string &v) { return Value(v, DataType::TEXT); }
 
   // ----- 获取字符串的哈希值 -----
   size_t hash() const noexcept {

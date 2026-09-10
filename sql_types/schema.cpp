@@ -3,7 +3,9 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include "byte_buffer.h"
 #include "row.h"
+#include "value.h"
 
 namespace sql {
 
@@ -107,7 +109,6 @@ SchemaError TableSchema::validate() const {
     }
   }
   if(primary_keys.size()  > 1) {
-    fprintf(stderr, "table:[%s] has more than one primary key:[%s,%s,...]\n", name_.c_str(), primary_keys[0].c_str(), primary_keys[1].c_str());
     return SchemaError::DUPLICATE_PRIMARY_KEY;
   }
 
@@ -119,14 +120,33 @@ SchemaError TableSchema::validate_row(const Row& row) const {
     return SchemaError::COLUMN_SIZE_MISMATCH;
   }
   for (size_t i = 0; i < columns_.size(); ++i) {
-    if (row[i].is_null() && !columns_[i].nullable) {
-      return SchemaError::COLUMN_ATTR_NULL_MISMATCH;
-    }
-    if (!row[i].is_null() && columns_[i].type != row[i].type()) {
-      return SchemaError::COLUMN_TYPE_MISMATCH;
+    const auto err = validate_value(columns_[i], row[i]);
+    if (err != SchemaError::OK) {
+      return err;
     }
   }
   return SchemaError::OK;
+}
+
+SchemaError TableSchema::validate_value(const ColumnDef& col,
+                                        const Value& value) const {
+  if (value.is_null()) {
+    return col.nullable ? SchemaError::OK
+                        : SchemaError::COLUMN_ATTR_NULL_MISMATCH;
+  }
+  if (!is_same_family(col.type, value.type())) {
+    return SchemaError::COLUMN_TYPE_MISMATCH;
+  }
+  return SchemaError::OK;
+}
+
+SchemaError TableSchema::validate_value(const Identifier& column_name,
+                                        const Value& value) const {
+  const ColumnDef* col = column(column_name);
+  if (col == nullptr) {
+    return SchemaError::COLUMN_NOT_FOUND;
+  }
+  return validate_value(*col, value);
 }
 
 bool TableSchema::has_primary_key() const {
@@ -160,57 +180,80 @@ Identifier TableSchema::primary_key_name() const {
 }
 
 // ============================================================
-// 序列化
+// 序列化（格式 v1：长度前缀，不依赖任何分隔符）
+//
+//   [u8  version][str table_name][u32 pk_slot][u32 column_count]
+//   column_count 个: [str name][u8 type][u8 flags]
+//     flags: bit0 = nullable, bit1 = primary_key
+//   pk_slot: 0 表示没有主键，否则是 primary_key_index_ + 1
+//
+// 用长度前缀而不是 '|' / ',' / ':'：标识符里可以包含这些字符
+// （带引号的列名、含 ':' 的库名），旧格式会被内容击穿。
 // ============================================================
 
 std::string TableSchema::serialize() const {
-  std::ostringstream oss;
-  oss << name_ << "|";
-  oss << primary_key_index_ << "|";
-  for (size_t i = 0; i < columns_.size(); ++i) {
-    if (i > 0) oss << ",";
-    const auto& col = columns_[i];
-    oss << col.name << ":" << static_cast<int>(col.type) << ":"
-        << (col.nullable ? "1" : "0") << ":" << (col.primary_key ? "1" : "0");
+  ByteWriter w;
+  w.put_u8(kFormatVersion);
+  w.put_str(name_.str());
+  w.put_u32(primary_key_index_ >= 0
+                ? static_cast<uint32_t>(primary_key_index_) + 1
+                : 0);
+  w.put_u32(static_cast<uint32_t>(columns_.size()));
+  for (const auto& col : columns_) {
+    w.put_str(col.name.str());
+    w.put_u8(static_cast<uint8_t>(col.type));
+    uint8_t flags = 0;
+    if (col.nullable) flags |= 0x01;
+    if (col.primary_key) flags |= 0x02;
+    w.put_u8(flags);
   }
-  return oss.str();
+  return w.take();
 }
 
-TableSchema TableSchema::deserialize(const std::string& data) {
-  TableSchema schema;
-  std::stringstream ss(data);
-  std::string token;
+std::expected<TableSchema, SchemaError> TableSchema::deserialize(
+    const std::string& data) {
+  ByteReader r(data);
 
-  std::getline(ss, token, '|');
-  schema.set_name(Identifier(token));
-
-  std::getline(ss, token, '|');
-  if (!token.empty()) {
-    schema.primary_key_index_ = std::stoi(token);
+  const uint8_t version = r.get_u8();
+  if (!r.status() || version != kFormatVersion) {
+    return std::unexpected(SchemaError::INVALID_FORMAT);
   }
 
-  while (std::getline(ss, token, ',')) {
-    if (token.empty()) continue;
-    std::stringstream col_ss(token);
-    std::string part;
+  TableSchema schema;
+  schema.set_name(Identifier(r.get_str()));
+
+  const uint32_t pk_slot = r.get_u32();
+  const uint32_t column_count = r.get_u32();
+  if (!r.status() || column_count > 65535) {
+    return std::unexpected(SchemaError::INVALID_FORMAT);
+  }
+
+  for (uint32_t i = 0; i < column_count; ++i) {
     ColumnDef col;
-
-    std::getline(col_ss, part, ':');
-    col.name = identifier(part);
-
-    std::getline(col_ss, part, ':');
-    col.type = static_cast<DataType>(std::stoi(part));
-
-    std::getline(col_ss, part, ':');
-    col.nullable = (part == "1");
-
-    std::getline(col_ss, part, ':');
-    col.primary_key = (part == "1");
-
+    col.name = Identifier(r.get_str());
+    const uint8_t type = r.get_u8();
+    const uint8_t flags = r.get_u8();
+    if (!r.status()) {
+      return std::unexpected(SchemaError::INVALID_FORMAT);
+    }
+    if (type > static_cast<uint8_t>(DataType::UNKNOWN_TYPE)) {
+      return std::unexpected(SchemaError::INVALID_FORMAT);
+    }
+    col.type = static_cast<DataType>(type);
+    col.nullable = (flags & 0x01) != 0;
+    col.primary_key = (flags & 0x02) != 0;
     schema.columns_.push_back(col);
     if (col.primary_key) {
       schema.primary_key_index_ = static_cast<int>(schema.columns_.size()) - 1;
     }
+  }
+
+  if (!r.status() || !r.eof()) {
+    return std::unexpected(SchemaError::INVALID_FORMAT);
+  }
+
+  if (pk_slot > 0 && pk_slot <= column_count) {
+    schema.primary_key_index_ = static_cast<int>(pk_slot) - 1;
   }
 
   return schema;
@@ -238,6 +281,10 @@ const char* TableSchema::error_message(SchemaError err) {
       return "NULL constraint violation";
     case SchemaError::COLUMN_NOT_FOUND:
       return "Column not found";
+    case SchemaError::INVALID_ROW:
+      return "Invalid row";
+    case SchemaError::INVALID_FORMAT:
+      return "Invalid serialized format (corrupted data or version mismatch)";
     default:
       return "Unknown error";
   }

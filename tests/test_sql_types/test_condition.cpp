@@ -172,3 +172,66 @@ TEST(Condition, VisitorPattern) {
     CHECK_EQ(visitor.or_count, 1);
     CHECK_EQ(visitor.not_count, 1);
 }
+
+TEST(Condition, PostOrderVisitsChildrenFirst) {
+    struct OrderVisitor : public ConditionVisitor {
+        std::vector<std::string> order;
+        void visit(const CompareCondition& c) override {
+            order.push_back("cmp:" + c.column().str());
+        }
+        void visit(const InCondition& c) override {
+            order.push_back("in:" + c.column().str());
+        }
+        void visit(const AndCondition&) override { order.push_back("and"); }
+        void visit(const OrCondition&) override { order.push_back("or"); }
+        void visit(const NotCondition&) override { order.push_back("not"); }
+    };
+
+    auto cond = make_and(
+        make_compare("a", CompareOp::GT, Value(1)),
+        make_not(make_compare("b", CompareOp::EQ, Value(2))));
+
+    OrderVisitor visitor;
+    walk_condition_post_order(*cond, visitor);
+
+    // 先子后父
+    CHECK_EQ(visitor.order.size(), 4);
+    CHECK_EQ(visitor.order[0], "cmp:a");
+    CHECK_EQ(visitor.order[1], "cmp:b");
+    CHECK_EQ(visitor.order[2], "not");
+    CHECK_EQ(visitor.order[3], "and");
+}
+
+TEST(Condition, VisitorBaseOnlyNeedsOverridesItCaresAbout) {
+    struct CountCompare : public ConditionVisitorBase {
+        int compare_count = 0;
+        void visit(const CompareCondition&) override { compare_count++; }
+    };
+
+    auto cond = make_and(make_compare("a", CompareOp::GT, Value(1)),
+                         make_compare("b", CompareOp::LT, Value(9)));
+    CountCompare visitor;
+    walk_condition_post_order(*cond, visitor);
+    CHECK_EQ(visitor.compare_count, 2);
+}
+
+TEST(Condition, ColumnAccessorCarriesIdentifierSemantics) {
+    // 构造参数统一为 Identifier（大小写不敏感）
+    auto cond = make_compare("AGE", CompareOp::GT, Value(18));
+    const auto* cmp = dynamic_cast<const CompareCondition*>(cond.get());
+    CHECK(cmp != nullptr);
+    CHECK(cmp->column() == Identifier("age"));
+    CHECK(cmp->column() == "AGE");
+    CHECK_EQ(cmp->column().str(), "AGE");   // 原始写法保留
+    CHECK_EQ(cmp->column().lower(), "age"); // 归一化形式
+}
+
+TEST(Condition, CloneIsDeepAndIndependent) {
+    auto cond = make_and(make_compare("a", CompareOp::GT, Value(1)),
+                         make_in("b", false, {Value(2), Value(3)}));
+    auto copy = cond->clone();
+    CHECK(copy != nullptr);
+    CHECK_EQ(copy->to_string(), cond->to_string());
+    CHECK_EQ(copy->child_count(), cond->child_count());
+    CHECK(copy->child_at(0) != cond->child_at(0));   // 深拷贝
+}

@@ -1,6 +1,7 @@
 // compare_op.h
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace sql {

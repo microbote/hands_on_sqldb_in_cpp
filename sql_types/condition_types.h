@@ -1,6 +1,8 @@
 // condition_types.h
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,7 +20,7 @@ namespace sql {
 // ============================================================
 class CompareCondition : public Condition {
  public:
-  CompareCondition(std::string column, CompareOp op, Value value)
+  CompareCondition(Identifier column, CompareOp op, Value value)
       : column_(std::move(column)), op_(op), value_(std::move(value)) {}
 
   ConditionType type() const override { return ConditionType::COMPARE; }
@@ -63,7 +65,7 @@ class CompareCondition : public Condition {
 // ============================================================
 class InCondition : public Condition {
  public:
-  InCondition(std::string column, bool is_not_in, std::vector<Value> values)
+  InCondition(Identifier column, bool is_not_in, std::vector<Value> values)
       : column_(std::move(column)), is_not_in_(is_not_in),
         values_(std::move(values)) {}
 
@@ -251,11 +253,11 @@ class NotCondition : public Condition {
 // ============================================================
 // 工厂函数
 // ============================================================
-inline ConditionPtr make_compare(std::string col, CompareOp op, Value val) {
+inline ConditionPtr make_compare(Identifier col, CompareOp op, Value val) {
   return std::make_unique<CompareCondition>(std::move(col), op, std::move(val));
 }
 
-inline ConditionPtr make_in(std::string col, bool is_not_in,
+inline ConditionPtr make_in(Identifier col, bool is_not_in,
                             std::vector<Value> values) {
   return std::make_unique<InCondition>(std::move(col), is_not_in,
                                        std::move(values));

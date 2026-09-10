@@ -3,7 +3,10 @@
 
 #include <string>
 #include <string_view>
+#include <cctype>
+#include <cstddef>
 #include <functional>
+#include <ostream>
 #include <utility>
 #include <fmt/format.h>
 
@@ -17,7 +20,9 @@ class Identifier {
   Identifier() = default;
 
   // 从字符串构造 - 自动检测并去除引号
-  explicit Identifier(std::string raw) {
+  // （隐式转换：函数参数写 Identifier 时可以直接传 "name" / std::string，
+  //   避免上层到处写 Identifier(...) 包装）
+  Identifier(std::string raw) {
     // 自动检测是否被引号包围
     if (raw.size() >= 2 && ((raw.front() == '"' && raw.back() == '"') || 
       (raw.front() == '\'' && raw.back() == '\''))) {
@@ -32,11 +37,11 @@ class Identifier {
   }
 
   // 从 const char* 构造
-  explicit Identifier(const char* name) 
+  Identifier(const char* name) 
       : Identifier(std::string((name != nullptr) ? name : "")) {}
 
   // 从 string_view 构造
-  explicit Identifier(std::string_view name)
+  Identifier(std::string_view name)
       : Identifier(std::string(name)) {}
 
   // ---- 访问器 ----

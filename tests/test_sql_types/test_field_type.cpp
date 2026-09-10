@@ -33,9 +33,10 @@ TEST(FieldType, Size) {
 
 TEST(FieldType, NameConversion) {
     // 类型 -> 名称
-    CHECK_EQ(data_type_name(DataType::INT), "INT");
-    CHECK_EQ(data_type_name(DataType::VARCHAR), "VARCHAR");
-    CHECK_EQ(data_type_name(DataType::BOOLEAN), "BOOLEAN");
+    // 注意：data_type_name 返回 const char*，用 CHECK_EQ 会退化成指针比较
+    CHECK_STREQ(data_type_name(DataType::INT), "INT");
+    CHECK_STREQ(data_type_name(DataType::VARCHAR), "VARCHAR");
+    CHECK_STREQ(data_type_name(DataType::BOOLEAN), "BOOLEAN");
     
     // 名称 -> 类型
     CHECK(string_to_data_type("INT") == DataType::INT);
