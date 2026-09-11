@@ -294,7 +294,7 @@ opt_order_by:
 
 order_list:
     order_item                  { $$ = create_list($1, LIST_ORDER);}
-    | order_list ',' order_item    { $$ = append_to_list($1, $2); }
+    | order_list ',' order_item    { $$ = append_to_list($1, $3); }
 order_item:
     TOK_IDENT                   { $$ = make_order_node($1, OP_ASC); }
     | TOK_IDENT order_direction { $$ = make_order_node($1, $2); }
