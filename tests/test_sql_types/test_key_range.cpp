@@ -242,13 +242,14 @@ TEST(KeyRange, IntegerRangeMatchesEncodedRange) {
 TEST(KeyRange, TypeIsPropagatedThroughSetOperations) {
   KeyRange a = KeyRange::range(Value(1), Value(10));
   KeyRange b = KeyRange::range(Value(3), Value(8));
-  CHECK(a.intersect(b).type() == DataType::INT);
-  CHECK(a.unite(b)[0].type() == DataType::INT);
-  CHECK(a.subtract(b)[0].type() == DataType::INT);
+  // Value 里的整数统一规范化成 BIGINT（存储层只区分 family）
+  CHECK(a.intersect(b).type() == DataType::BIGINT);
+  CHECK(a.unite(b)[0].type() == DataType::BIGINT);
+  CHECK(a.subtract(b)[0].type() == DataType::BIGINT);
 
   KeyRange unknown = KeyRange::all();
-  CHECK(unknown.intersect(a).type() == DataType::INT);
-  CHECK(a.intersect(unknown).type() == DataType::INT);
+  CHECK(unknown.intersect(a).type() == DataType::BIGINT);
+  CHECK(a.intersect(unknown).type() == DataType::BIGINT);
 }
 
 TEST(KeyRange, UnboundedStringRangeCoversEveryString) {

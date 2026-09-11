@@ -2,12 +2,13 @@
 #pragma once
 
 #include <cassert>
-#include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 
 #include "field_type.h"
 
@@ -16,373 +17,279 @@ namespace sql {
 using Key = std::string;
 
 // ============================================================
-// SQL 值类型 - 使用 union 优化内存
+// Value：SQL 逻辑层的值
 //
-// 内存布局:
-// - 标量类型 (int64_t, bool) 直接存储，无额外开销
-// - 字符串类型使用 new 分配，避免 union 中的复杂对象
-// - 支持 NULL 值
+// 存储策略（与存储层的 key 编码一致）：
+//   - 所有整型（TINYINT/SMALLINT/INT/BIGINT）共用 int64_t，
+//     Value 的逻辑类型统一为 BIGINT；逻辑宽度只存在于 schema。
+//   - DATE/TIME/DATETIME 也用 int64_t（天 / 秒 / 秒）。
+//   - 字符串用 std::string（SSO，无堆分配小字符串）。
+//   - NULL 用 std::monostate。
+//
+// 关于比较（重要）：
+//   本类只提供 C++ 语义的 **相等**（operator==，用于去重/容器）。
+//   全序比较属于存储层，见 KeyCodecs::compare()；
+//   SQL 的三值比较见 sql_truth.h 的 sql_compare()/sql_compare_op()。
+//   NULL 参与 SQL 比较时既不是 TRUE 也不是 FALSE，而是 UNKNOWN，
+//   因此不要把 operator== 当作 SQL 的 "="。
 // ============================================================
 class Value {
-public:
+ public:
   // ----- 构造 -----
-  Value() noexcept : type_(DataType::NULL_TYPE), int_val_(0) {}
+  Value() noexcept : type_(DataType::NULL_TYPE), storage_(std::monostate{}) {}
 
-  explicit Value(int v) noexcept
-      : type_(DataType::INT), int_val_(static_cast<int64_t>(v)) {}
+  Value(int v) noexcept
+      : type_(DataType::BIGINT), storage_(static_cast<int64_t>(v)) {}
 
-  explicit Value(int64_t v) noexcept : type_(DataType::BIGINT), int_val_(v) {}
+  Value(int64_t v) noexcept : type_(DataType::BIGINT), storage_(v) {}
 
-  explicit Value(const std::string &v)
-      : type_(DataType::VARCHAR), str_ptr_(new std::string(v)) {}
+  Value(bool v) noexcept : type_(DataType::BOOLEAN), storage_(v) {}
 
-  explicit Value(const char *v)
-      : type_(DataType::VARCHAR), str_ptr_(new std::string(v)) {}
+  Value(const std::string& v)
+      : type_(DataType::VARCHAR), storage_(std::string(v)) {}
 
-  // 显式指定字符串的逻辑类型（VARCHAR 或 TEXT）。
-  // 取代早期的 Value(str, bool) 技巧：语义清晰，且不会和 bool 构造混淆。
+  Value(std::string&& v)
+      : type_(DataType::VARCHAR), storage_(std::move(v)) {}
+
+  Value(const char* v)
+      : type_(DataType::VARCHAR),
+        storage_(std::string(v != nullptr ? v : "")) {}
+
+  Value(std::string_view v)
+      : type_(DataType::VARCHAR), storage_(std::string(v)) {}
+
+  // 显式指定逻辑类型的字符串（VARCHAR / TEXT）
   Value(std::string v, DataType type)
-      : type_(type), str_ptr_(new std::string(std::move(v))) {
+      : type_(type), storage_(std::move(v)) {
     assert(sql::is_string(type_));
   }
 
-  explicit Value(bool v) noexcept : type_(DataType::BOOLEAN), bool_val_(v) {}
-
-  // ----- 拷贝构造 -----
-  Value(const Value &other) : type_(other.type_) {
-    if (other.is_string()) {
-      str_ptr_ = new std::string(*other.str_ptr_);
-    } else {
-      int_val_ = other.int_val_;  // 覆盖 union 的标量成员（含 bool）
-    }
+  // 显式指定逻辑类型的整数（含整型宽度与时间类型）
+  Value(int64_t v, DataType type) : type_(type), storage_(v) {
+    assert(sql::is_integer(type_) || sql::is_temporal(type_) ||
+           sql::is_boolean(type_));
   }
 
-  // ----- 移动构造：直接转移资源，源置为 NULL -----
-  Value(Value &&other) noexcept : type_(other.type_) {
-    if (other.is_string()) {
-      str_ptr_ = other.str_ptr_;
-      other.str_ptr_ = nullptr;
-      other.type_ = DataType::NULL_TYPE;
-    } else {
-      int_val_ = other.int_val_;
-      other.type_ = DataType::NULL_TYPE;
-    }
-  }
-
-  // ----- 析构 -----
-  ~Value() { cleanup(); }
-
-  // ----- 拷贝赋值 -----
-  Value &operator=(const Value &other) {
-    if (this != &other) {
-      // 如果都是字符串，可以直接赋值避免重新分配
-      if (is_string() && other.is_string()) {
-        *str_ptr_ = *other.str_ptr_;
-        return *this;
-      }
-
-      // 否则需要清理后重新构造
-      cleanup();
-      type_ = other.type_;
-      if (other.is_string()) {
-        str_ptr_ = new std::string(*other.str_ptr_);
-      } else {
-        int_val_ = other.int_val_;
-      }
-    }
-    return *this;
-  }
-
-  // ----- 移动赋值 -----
-  Value &operator=(Value &&other) noexcept {
-    if (this != &other) {
-      cleanup();
-
-      type_ = other.type_;
-      if (other.is_string()) {
-        str_ptr_ = other.str_ptr_;
-        other.str_ptr_ = nullptr;
-        other.type_ = DataType::NULL_TYPE;
-      } else {
-        int_val_ = other.int_val_;
-        other.type_ = DataType::NULL_TYPE;
-      }
-    }
-    return *this;
-  }
+  // ----- 拷贝/移动：variant 自动处理，无需手写 -----
+  Value(const Value&) = default;
+  Value(Value&&) noexcept = default;
+  Value& operator=(const Value&) = default;
+  Value& operator=(Value&&) noexcept = default;
+  ~Value() = default;
 
   // ----- 类型检查 -----
   DataType type() const noexcept { return type_; }
 
-  bool is_null() const noexcept {
-    return type_ == DataType::NULL_TYPE || type_ == DataType::UNKNOWN_TYPE;
-  }
+  bool is_null() const noexcept { return is_null_type(type_); }
 
-  bool is_int() const noexcept {
-    return type_ == DataType::INT || type_ == DataType::BIGINT;
-  }
+  // 逻辑上是不是整数（整型 family）
+  bool is_int() const noexcept { return is_integer(type_); }
 
-  bool is_string() const noexcept {
-    return type_ == DataType::VARCHAR || type_ == DataType::TEXT;
-  }
+  bool is_string() const noexcept { return sql::is_string(type_); }
 
   bool is_bool() const noexcept { return type_ == DataType::BOOLEAN; }
 
-  bool is_numeric() const noexcept { return is_int(); }
+  bool is_numeric() const noexcept { return sql::is_numeric(type_); }
+
+  bool is_temporal() const noexcept { return sql::is_temporal(type_); }
+  bool is_date() const noexcept { return type_ == DataType::DATE; }
+  bool is_time() const noexcept { return type_ == DataType::TIME; }
+  bool is_datetime() const noexcept { return type_ == DataType::DATETIME; }
 
   // ----- 值获取（带安全检查）-----
   int64_t as_int() const {
-    if (!is_int()) {
-      throw std::runtime_error("Value is not an integer");
+    if (!holds_int64()) {
+      throw std::runtime_error("Value is not stored as int64");
     }
-    return int_val_;
+    return std::get<int64_t>(storage_);
   }
 
-  const std::string &as_str() const {
+  const std::string& as_str() const {
     if (!is_string()) {
       throw std::runtime_error("Value is not a string");
     }
-    return *str_ptr_;
+    return std::get<std::string>(storage_);
   }
 
-  const std::string &as_string() const { return as_str(); }
+  const std::string& as_string() const { return as_str(); }
 
   bool as_bool() const {
     if (!is_bool()) {
       throw std::runtime_error("Value is not a boolean");
     }
-    return bool_val_;
+    return std::get<bool>(storage_);
   }
 
-  // ----- 安全的获取方式（不抛异常）-----
+  // ----- 不抛异常的获取 -----
   int64_t get_int(int64_t default_val = 0) const noexcept {
-    return is_int() ? int_val_ : default_val;
+    return holds_int64() ? std::get<int64_t>(storage_) : default_val;
   }
 
   std::string_view get_str_view() const noexcept {
-    return is_string() ? std::string_view(*str_ptr_) : std::string_view();
+    return is_string() ? std::string_view(std::get<std::string>(storage_))
+                       : std::string_view();
   }
 
-  const std::string *get_str_ptr() const noexcept {
-    return is_string() ? str_ptr_ : nullptr;
+  const std::string* get_str_ptr() const noexcept {
+    return is_string() ? &std::get<std::string>(storage_) : nullptr;
   }
 
   bool get_bool(bool default_val = false) const noexcept {
-    return is_bool() ? bool_val_ : default_val;
+    return is_bool() ? std::get<bool>(storage_) : default_val;
   }
 
-  // ----- 判断值是否相等（用于哈希等）-----
+  // C++ 语义的真值判断（NULL -> false）。
+  // 注意：这不是 SQL 的三值逻辑，SQL 判断请用 sql_truth.h。
   bool is_truthy() const {
-    if (is_bool()) {
-      return bool_val_;
+    if (holds_int64()) {
+      return std::get<int64_t>(storage_) != 0;
     }
-    if (is_int()) {
-      return int_val_ != 0;
+    if (is_bool()) {
+      return std::get<bool>(storage_);
     }
     if (is_string()) {
-      return !str_ptr_->empty();
+      return !std::get<std::string>(storage_).empty();
     }
-    return false; // NULL
+    return false;  // NULL
   }
-
-  // ----- 类型转换 ----/
-  explicit operator bool() const { return as_bool(); }
-  explicit operator int64_t() const { return as_int(); }
-  explicit operator std::string() const { return as_str(); }
-  operator std::string_view() const { return get_str_view(); }
-
-  // ----- 比较运算符 -----
-  bool operator==(const Value &other) const {
-    // 类型不同直接返回 false（除非都是 NULL）
-    auto type_class = get_type_class(type_);
-    auto other_class = get_type_class(other.type_);
-    if (type_class != other_class) {
-      // including NULL == NULL is true
-      return false;
-    }
-
-    switch (type_class) {
-    case DataTypeClass::INTEGER:
-      return int_val_ == other.int_val_;
-    case DataTypeClass::STRING:
-      return *str_ptr_ == *other.str_ptr_;
-    case DataTypeClass::BOOLEAN:
-      return bool_val_ == other.bool_val_;
-    case DataTypeClass::UNKNOWN_CLASS:
-      return is_null() && other.is_null();
-    default:
-      return false;
-    }
-  }
-
-  bool operator!=(const Value &other) const { return !(*this == other); }
-
-  bool operator<(const Value &other) const {
-    // NULL 值总是最小
-    if (is_null()) {
-      return !other.is_null();
-    }
-    if (other.is_null()) {
-      return false;
-    }
-    auto type_class = get_type_class(type_);
-    auto other_class = get_type_class(other.type_);
-    // 类型不同时，按类型序号比较
-    if (type_class != other_class) {
-      return static_cast<int>(type_) < static_cast<int>(other.type_);
-    }
-
-    switch (type_) {
-    case DataType::INT:
-    case DataType::BIGINT:
-      return int_val_ < other.int_val_;
-    case DataType::VARCHAR:
-    case DataType::TEXT:
-      return *str_ptr_ < *other.str_ptr_;
-    case DataType::BOOLEAN:
-      return static_cast<int>(bool_val_) < static_cast<int>(other.bool_val_);
-    default:
-      return false;
-    }
-  }
-
-  bool operator>(const Value &other) const { return other < *this; }
-
-  bool operator<=(const Value &other) const { return !(other < *this); }
-
-  bool operator>=(const Value &other) const { return !(*this < other); }
 
   // ----- 类型判断模板 -----
   template <typename T> bool is() const {
     if constexpr (std::is_same_v<T, int>) {
-      return type_ == DataType::INT;
-    } else if constexpr (std::is_same_v<T, int64_t>) {
       return is_int();
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+      return holds_int64();
     } else if constexpr (std::is_same_v<T, std::string>) {
       return is_string();
     } else if constexpr (std::is_same_v<T, bool>) {
-      return type_ == DataType::BOOLEAN;
+      return is_bool();
     } else if constexpr (std::is_same_v<T, std::nullptr_t>) {
       return is_null();
     }
     return false;
   }
 
-  // ----- 转换为字符串 -----
-  std::string to_string() const {
-    switch (type_) {
-    case DataType::INT:
-    case DataType::BIGINT:
-      return std::to_string(int_val_);
-    case DataType::VARCHAR:
-    case DataType::TEXT:
-      return *str_ptr_;
-    case DataType::BOOLEAN:
-      return bool_val_ ? "true" : "false";
-    case DataType::NULL_TYPE:
-      return "NULL";
+  // ----- 相等（C++ 容器语义；不是 SQL 的 =）-----
+  // 同一 family 内相等：所有整型互通、VARCHAR/TEXT 互通。
+  // NULL == NULL 为 true（去重/容器需要），SQL 层由 sql_compare 判定 UNKNOWN。
+  bool operator==(const Value& other) const {
+    if (is_null() || other.is_null()) {
+      return is_null() && other.is_null();
+    }
+    if (is_temporal() || other.is_temporal()) {
+      // DATE / TIME / DATETIME 单位不同，不做隐式换算（SQL 层负责提升）
+      return type_ == other.type_ && holds_int64() && other.holds_int64() &&
+             std::get<int64_t>(storage_) == std::get<int64_t>(other.storage_);
+    }
+    const auto lhs_class = get_type_class(type_);
+    const auto rhs_class = get_type_class(other.type_);
+    if (lhs_class != rhs_class) {
+      return false;
+    }
+    switch (lhs_class) {
+    case DataTypeClass::INTEGER:
+      return std::get<int64_t>(storage_) == std::get<int64_t>(other.storage_);
+    case DataTypeClass::BOOLEAN:
+      return std::get<bool>(storage_) == std::get<bool>(other.storage_);
+    case DataTypeClass::STRING:
+      return std::get<std::string>(storage_) ==
+             std::get<std::string>(other.storage_);
     default:
-      return "UNKNOWN";
+      return false;
     }
   }
+
+  bool operator!=(const Value& other) const { return !(*this == other); }
+
+  // ----- 转换为字符串 -----
+  std::string to_string() const;
 
   // ----- 解析字符串为值 -----
-  static Value from_string(const std::string &str, DataType type) {
-    // 处理 NULL（大小写不敏感："NULL" / "null" / "Null" / "\N"）
-    if (str == "\\N" || iequals_ascii(str, "null")) {
-      return Value();
-    }
+  static Value from_string(const std::string& str, DataType type);
 
-    switch (type) {
-    case DataType::INT:
-    case DataType::BIGINT:
-      // 两个整数类型底层都是 int64_t，统一用 stoll，
-      // 避免 stoi 在 32 位边界上溢出抛异常。
-      return Value(std::stoll(str));
-    case DataType::VARCHAR:
-      return Value(str);
-    case DataType::TEXT:
-      return Value(str, DataType::TEXT);
-    case DataType::BOOLEAN:
-      if (iequals_ascii(str, "true") || str == "1") {
-        return Value(true);
-      }
-      if (iequals_ascii(str, "false") || str == "0") {
-        return Value(false);
-      }
-      throw std::invalid_argument("Invalid boolean: " + str);
-    default:
-      throw std::invalid_argument("Cannot parse to type: " +
-                                  std::to_string(static_cast<int>(type)));
-    }
-  }
-
-  // ----- 静态工厂方法 -----
+  // ----- 静态工厂 -----
   static Value null() { return Value(); }
   static Value boolean(bool v) { return Value(v); }
   static Value integer(int64_t v) { return Value(v); }
-  static Value text(const std::string &v) { return Value(v, DataType::TEXT); }
-
-  // ----- 获取字符串的哈希值 -----
-  size_t hash() const noexcept {
-    if (is_int()) {
-      return std::hash<int64_t>()(int_val_);
-    } else if (is_string()) {
-      return std::hash<std::string>()(*str_ptr_);
-    } else if (is_bool()) {
-      return std::hash<bool>()(bool_val_);
-    }
-    return 0; // NULL 的哈希值
+  static Value bigint(int64_t v) { return Value(v, DataType::BIGINT); }
+  static Value tinyint(int64_t v) { return Value(v, DataType::TINYINT); }
+  static Value smallint(int64_t v) { return Value(v, DataType::SMALLINT); }
+  static Value text(const std::string& v) {
+    return Value(std::string(v), DataType::TEXT);
+  }
+  static Value varchar(const std::string& v) { return Value(v); }
+  static Value date(int64_t days) { return Value(days, DataType::DATE); }
+  static Value time(int64_t seconds) { return Value(seconds, DataType::TIME); }
+  static Value datetime(int64_t seconds) {
+    return Value(seconds, DataType::DATETIME);
   }
 
-  // to 二进制key
+  // ----- 哈希（与 operator== 保持一致）-----
+  size_t hash() const noexcept {
+    if (is_null()) {
+      return 0;
+    }
+    if (is_temporal()) {
+      // 单位不同（DATE/TIME/DATETIME），混入类型避免同值不同型同哈希
+      return std::hash<int64_t>()(std::get<int64_t>(storage_)) ^
+             (static_cast<size_t>(type_) << 1);
+    }
+    if (is_bool()) {
+      return std::hash<bool>()(std::get<bool>(storage_));
+    }
+    if (is_string()) {
+      return std::hash<std::string>()(std::get<std::string>(storage_));
+    }
+    return std::hash<int64_t>()(std::get<int64_t>(storage_));
+  }
+
+  // ============================================================
+  // Key 编码（存储层契约，见 key.h）
+  // ============================================================
+
+  // 不带列类型的编码：NULL 没有族信息，返回空串（NULL 需要列类型才能编码，
+  // 见下面的重载）。
   Key to_key() const;
 
-  static Value from_key(const Key &key, DataType type);
+  // 带列类型的编码：存储层必须用这个版本（NULL 用它所属的列类型编码）。
+  Key to_key(DataType column_type) const;
 
-  // 类型最小值的 key
+  static Value from_key(const Key& key, DataType type);
+
   static Key min_key_for_type(DataType type);
-
-  // 类型最大值的 key
   static Key upper_key_for_type(DataType type);
 
-private:
-  // 类型枚举（由于 field_type.h 中的 DataType 已存在，我们复用它）
+ private:
+  // 存储里是否真的持有 int64（整型或时间）
+  bool holds_int64() const noexcept {
+    return is_integer(type_) || sql::is_temporal(type_);
+  }
+
+  static bool is_null_type(DataType t) {
+    return t == DataType::NULL_TYPE || t == DataType::UNKNOWN_TYPE;
+  }
+
   DataType type_;
-
-  // union 存储标量类型
-  union {
-    int64_t int_val_;      // 用于 INT, BIGINT
-    bool bool_val_;        // 用于 BOOLEAN
-    std::string *str_ptr_; // 指向字符串的指针
-  };
-
-  // 清理资源
-  void cleanup() noexcept {
-    if (is_string() && str_ptr_ != nullptr) {
-      delete str_ptr_;
-      str_ptr_ = nullptr;
-    }
-    type_ = DataType::NULL_TYPE;
-  }
-
-  // 深度比较辅助
-  bool equals_as_ints(const Value &other) const noexcept {
-    return int_val_ == other.int_val_;
-  }
-
-  bool equals_as_strings(const Value &other) const noexcept {
-    return *str_ptr_ == *other.str_ptr_;
-  }
-
-  bool equals_as_bools(const Value &other) const noexcept {
-    return bool_val_ == other.bool_val_;
-  }
+  std::variant<std::monostate, int64_t, bool, std::string> storage_;
 };
 
-// 辅助：提供默认哈希支持
+// 哈希支持
 struct ValueHash {
-  size_t operator()(const Value &v) const noexcept { return v.hash(); }
+  size_t operator()(const Value& v) const noexcept { return v.hash(); }
 };
 
-} // namespace sql
+// key 空间的全序比较（存储层语义）：NULL 最小，其余按编码字节序。
+// Value 本身不再重载 < / > 等操作符，避免把存储序误当作 SQL 比较。
+struct ValueKeyLess {
+  bool operator()(const Value& a, const Value& b) const {
+    return a.to_key() < b.to_key();
+  }
+};
+
+struct ValueKeyEqual {
+  bool operator()(const Value& a, const Value& b) const {
+    return a.to_key() == b.to_key();
+  }
+};
+
+}  // namespace sql

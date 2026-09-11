@@ -126,12 +126,12 @@ class KeyRange {
   // ============================================================
 
   std::optional<Key> low_key() const {
-    if (!low_) {
-      return std::nullopt;
+    if (!low_ || low_->is_null()) {
+      return std::nullopt;  // 无下界，或 NULL 边界（当作 -∞）
     }
     Key k = low_->to_key();
     if (k.empty()) {
-      return std::nullopt;  // NULL 边界当作 -∞
+      return std::nullopt;
     }
     if (low_exclusive_) {
       k = KeyCodecs::inclusive_upper_bound(k);
@@ -140,12 +140,12 @@ class KeyRange {
   }
 
   std::optional<Key> high_key() const {
-    if (!high_) {
-      return std::nullopt;
+    if (!high_ || high_->is_null()) {
+      return std::nullopt;  // 无上界，或 NULL 边界（当作 +∞）
     }
     Key k = high_->to_key();
     if (k.empty()) {
-      return std::nullopt;  // NULL 边界当作 +∞
+      return std::nullopt;
     }
     if (high_inclusive_) {
       k = KeyCodecs::inclusive_upper_bound(k);

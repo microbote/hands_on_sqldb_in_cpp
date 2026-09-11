@@ -24,6 +24,12 @@ TableSchema& TableSchema::add_column(const ColumnDef& col) {
     return *this;
   }
 
+  // 0. 列定义合法性（字符串长度声明）
+  if (!valid_declared_length(col.type, col.length)) {
+    set_error(SchemaError::INVALID_COLUMN_DEF);
+    return *this;
+  }
+
   // 1. 检查主键唯一性
   auto err = check_duplicate_primary_key(col);
   if (err != SchemaError::OK) {
@@ -50,6 +56,11 @@ TableSchema& TableSchema::add_column(const ColumnDef& col) {
 TableSchema& TableSchema::add_column(const Identifier& name, DataType type,
                                      bool pk, bool nullable) {
   return add_column(ColumnDef(name, type, pk, nullable));
+}
+
+TableSchema& TableSchema::add_column(const Identifier& name, DataType type,
+                                     uint32_t length, bool pk, bool nullable) {
+  return add_column(ColumnDef(name, type, length, pk, nullable));
 }
 
 TableSchema& TableSchema::primary_key(const Identifier& name, DataType type) {
@@ -137,6 +148,27 @@ SchemaError TableSchema::validate_value(const ColumnDef& col,
   if (!is_same_family(col.type, value.type())) {
     return SchemaError::COLUMN_TYPE_MISMATCH;
   }
+  // 时间类型之间不做隐式换算：DATE(天) 与 DATETIME(秒) 单位不同，
+  // 直接写入会得到错误的值，需要由 SQL 层显式转换。
+  if (is_temporal(col.type) && is_temporal(value.type()) &&
+      col.type != value.type()) {
+    return SchemaError::COLUMN_TYPE_MISMATCH;
+  }
+  // 同一 family 内还要检查取值范围：Value 统一用 int64 存储，
+  // 列的逻辑宽度只体现在这里（TINYINT/SMALLINT/INT/BIGINT/DATE/TIME/...）
+  if (value.is_int() || value.is_temporal() || value.is_bool()) {
+    const int64_t raw = value.is_bool() ? (value.as_bool() ? 1 : 0)
+                                        : value.as_int();
+    if (!can_represent(col.type, raw)) {
+      return SchemaError::VALUE_OUT_OF_RANGE;
+    }
+  }
+  // 字符串 family 同理由 schema 声明容量：VARCHAR(n)/CHAR(n)/TEXT
+  // 这里按**字节数**校验（UTF-8 中文一个字 3 字节）
+  if (value.is_string() &&
+      !can_represent_length(col.type, col.length, value.as_str().size())) {
+    return SchemaError::VALUE_OUT_OF_RANGE;
+  }
   return SchemaError::OK;
 }
 
@@ -183,7 +215,7 @@ Identifier TableSchema::primary_key_name() const {
 // 序列化（格式 v1：长度前缀，不依赖任何分隔符）
 //
 //   [u8  version][str table_name][u32 pk_slot][u32 column_count]
-//   column_count 个: [str name][u8 type][u8 flags]
+//   column_count 个: [str name][u8 type][u32 declared_length][u8 flags]
 //     flags: bit0 = nullable, bit1 = primary_key
 //   pk_slot: 0 表示没有主键，否则是 primary_key_index_ + 1
 //
@@ -202,6 +234,7 @@ std::string TableSchema::serialize() const {
   for (const auto& col : columns_) {
     w.put_str(col.name.str());
     w.put_u8(static_cast<uint8_t>(col.type));
+    w.put_u32(col.length);
     uint8_t flags = 0;
     if (col.nullable) flags |= 0x01;
     if (col.primary_key) flags |= 0x02;
@@ -232,6 +265,7 @@ std::expected<TableSchema, SchemaError> TableSchema::deserialize(
     ColumnDef col;
     col.name = Identifier(r.get_str());
     const uint8_t type = r.get_u8();
+    const uint32_t length = r.get_u32();
     const uint8_t flags = r.get_u8();
     if (!r.status()) {
       return std::unexpected(SchemaError::INVALID_FORMAT);
@@ -240,8 +274,12 @@ std::expected<TableSchema, SchemaError> TableSchema::deserialize(
       return std::unexpected(SchemaError::INVALID_FORMAT);
     }
     col.type = static_cast<DataType>(type);
+    col.length = length;
     col.nullable = (flags & 0x01) != 0;
     col.primary_key = (flags & 0x02) != 0;
+    if (!valid_declared_length(col.type, col.length)) {
+      return std::unexpected(SchemaError::INVALID_FORMAT);
+    }
     schema.columns_.push_back(col);
     if (col.primary_key) {
       schema.primary_key_index_ = static_cast<int>(schema.columns_.size()) - 1;
@@ -285,6 +323,10 @@ const char* TableSchema::error_message(SchemaError err) {
       return "Invalid row";
     case SchemaError::INVALID_FORMAT:
       return "Invalid serialized format (corrupted data or version mismatch)";
+    case SchemaError::VALUE_OUT_OF_RANGE:
+      return "Value out of range for column type";
+    case SchemaError::INVALID_COLUMN_DEF:
+      return "Invalid column definition (bad declared length)";
     default:
       return "Unknown error";
   }
@@ -323,7 +365,7 @@ std::string TableSchema::to_string() const {
     if (i > 0) { oss << ", ";
 }
     const auto& col = columns_[i];
-    oss << col.name.str() << " " << data_type_name(col.type);
+    oss << col.name.str() << " " << col.type_display();
     if (col.primary_key) { oss << " PRIMARY KEY";
     } else if (!col.nullable) { oss << " NOT NULL";
 }
@@ -362,7 +404,7 @@ std::string TableSchema::to_string_pretty() const {
     }
     
     oss << "  " << std::left << std::setw(25) << col.name.str()
-        << std::setw(15) << data_type_name(col.type)
+        << std::setw(15) << col.type_display()
         << std::setw(10) << nullable
         << constraint << "\n";
   }
@@ -415,7 +457,7 @@ std::string TableSchema::to_string_table() const {
     }
     
     oss << "| " << std::left << std::setw(name_width) << col.name.str()
-        << "| " << std::setw(type_width) << data_type_name(col.type)
+        << "| " << std::setw(type_width) << col.type_display()
         << "| " << std::setw(null_width) << nullable
         << "| " << std::setw(12) << constraint << "|\n";
   }
@@ -466,7 +508,7 @@ int TableSchema::max_type_width() const {
   int max_width = 0;
   for (const auto& col : columns_) {
     max_width = std::max(max_width, 
-                         (int)std::string(data_type_name(col.type)).length());
+                         (int)col.type_display().length());
   }
   return max_width;
 }

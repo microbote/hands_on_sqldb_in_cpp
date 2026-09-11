@@ -85,8 +85,21 @@ TEST(FieldType, StringToDataType) {
     
     // 未知类型
     CHECK(string_to_data_type("FLOAT") == DataType::UNKNOWN_TYPE);
-    CHECK(string_to_data_type("DATE") == DataType::UNKNOWN_TYPE);
     CHECK(string_to_data_type("") == DataType::UNKNOWN_TYPE);
+
+    // 整型家族的别名
+    CHECK(string_to_data_type("TINYINT") == DataType::TINYINT);
+    CHECK(string_to_data_type("INT8") == DataType::TINYINT);
+    CHECK(string_to_data_type("SMALLINT") == DataType::SMALLINT);
+    CHECK(string_to_data_type("INT16") == DataType::SMALLINT);
+    CHECK(string_to_data_type("INT32") == DataType::INT);
+    CHECK(string_to_data_type("INT64") == DataType::BIGINT);
+
+    // 时间类型
+    CHECK(string_to_data_type("DATE") == DataType::DATE);
+    CHECK(string_to_data_type("TIME") == DataType::TIME);
+    CHECK(string_to_data_type("DATETIME") == DataType::DATETIME);
+    CHECK(string_to_data_type("TIMESTAMP") == DataType::DATETIME);
 }
 
 TEST(FieldType, RoundTrip) {

@@ -1,6 +1,7 @@
 // tests/test_sql_types/test_value.cpp
 #include "test_framework.h"
 #include "sql_types/value.h"
+#include "sql_types/key.h"
 
 using namespace sql;
 
@@ -68,12 +69,14 @@ TEST(Value, MoveConstruction) {
     Value orig_int(42);
     Value moved_int(std::move(orig_int));
     CHECK_EQ(moved_int.as_int(), 42);
-    
+
     // 字符串移动
     Value orig_str("test");
     Value moved_str(std::move(orig_str));
     CHECK_EQ(moved_str.as_str(), "test");
-    CHECK(orig_str.is_null());  // 源变为 NULL
+    // 说明：改 std::variant 存储后，被移动对象是"有效但未指定"状态
+    // （标准行为），不再保证变成 NULL。
+    CHECK(orig_str.is_string());
 }
 
 TEST(Value, Assignment) {
@@ -121,22 +124,23 @@ TEST(Value, Equality) {
     CHECK(!(int1 == str1));
 }
 
-TEST(Value, Comparison) {
+TEST(Value, OrderingIsProvidedByKeyCodecNotOperators) {
+    // Value 不再重载 < / > ：全序属于存储层，用 KeyCodecs::compare
     Value int1(1);
     Value int2(2);
-    CHECK(int1 < int2);
-    CHECK(int1 <= int2);
-    CHECK(int2 > int1);
-    CHECK(int2 >= int1);
-    
-    // 字符串比较
-    Value str1("apple");
-    Value str2("banana");
-    CHECK(str1 < str2);
-    
-    // NULL 比较
+    CHECK(KeyCodecs::compare(int1, int2) < 0);
+    CHECK(KeyCodecs::compare(int2, int1) > 0);
+    CHECK(KeyCodecs::compare(int1, Value(1)) == 0);
+    CHECK(KeyCodecs::less(int1, int2));
+
+    // 字符串按字典序
+    CHECK(KeyCodecs::less(Value(std::string("apple")),
+                          Value(std::string("banana"))));
+
+    // NULL 在存储序里最小
     Value null1;
-    CHECK(null1 < int1);  // NULL 总是最小
+    CHECK(KeyCodecs::less(null1, int1));
+    CHECK(KeyCodecs::compare(null1, Value()) == 0);
 }
 
 TEST(Value, StringConversion) {

@@ -77,7 +77,14 @@ typedef enum {
   DT_TEXT,
   DT_BOOLEAN,
   DT_NULL,
-  DT_UNKNOWN
+  DT_UNKNOWN,
+  /* 以下为新增类型（追加在末尾，保持既有枚举值不变） */
+  DT_TINYINT,
+  DT_SMALLINT,
+  DT_DATE,
+  DT_TIME,
+  DT_DATETIME,
+  DT_CHAR
 } CDataType;
 
 static inline const char *data_type_to_string(CDataType dt) {
@@ -94,6 +101,18 @@ static inline const char *data_type_to_string(CDataType dt) {
     return "BOOLEAN";
   case DT_NULL:
     return "NULL";
+  case DT_TINYINT:
+    return "TINYINT";
+  case DT_SMALLINT:
+    return "SMALLINT";
+  case DT_DATE:
+    return "DATE";
+  case DT_TIME:
+    return "TIME";
+  case DT_DATETIME:
+    return "DATETIME";
+  case DT_CHAR:
+    return "CHAR";
   default:
     return "UNKNOWN";
   }

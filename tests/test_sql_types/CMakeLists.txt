@@ -13,9 +13,13 @@ add_executable(test_sql_types
     test_key_set.cpp
     test_key_range.cpp
     test_key_codec.cpp
+    test_type_system.cpp
+    test_string_type.cpp
     test_schema.cpp
     test_serialize.cpp
     test_catalog.cpp
+    test_sql_truth.cpp
+    test_temporal.cpp
     test_query.cpp
 )
 
@@ -29,4 +33,3 @@ target_link_libraries(test_sql_types PRIVATE
 
 # 注册测试
 add_test(NAME test_sql_types COMMAND test_sql_types)
-

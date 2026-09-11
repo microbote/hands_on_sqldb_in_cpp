@@ -25,7 +25,7 @@ std::string Row::to_string() const {
 // 序列化（格式 v1：长度前缀 framing）
 //
 //   [u8 version][u32 field_count]{ [str field] }*
-//   field = 该列的 key 编码；长度 0 表示 NULL
+//   field = 该列的 key 编码（带列类型，NULL 编码成 [族 tag] 0x00）
 //
 // 不能用 '|' 拼接 key：key 编码里含原始字符串字节，值里一旦出现
 // '|'(0x7C) 就会被切错（旧实现的确会）。
@@ -36,7 +36,22 @@ std::string Row::serialize() const {
   w.put_u8(kFormatVersion);
   w.put_u32(static_cast<uint32_t>(values_.size()));
   for (const auto& v : values_) {
-    w.put_str(v.to_key());   // NULL -> 空串 -> 长度为 0
+    // 无 schema 版本：NULL 用无类型 NULL 编码（[0x00] 0x00）
+    w.put_str(v.to_key());
+  }
+  return w.take();
+}
+
+std::string Row::serialize(const TableSchema& schema) const {
+  ByteWriter w;
+  w.put_u8(kFormatVersion);
+  w.put_u32(static_cast<uint32_t>(values_.size()));
+  for (size_t i = 0; i < values_.size(); ++i) {
+    // 有 schema 版本：每列都按它的列类型编码（NULL 用本族的 NULL key）
+    const DataType column_type = i < schema.columns().size()
+                                     ? schema.columns()[i].type
+                                     : values_[i].type();
+    w.put_str(values_[i].to_key(column_type));
   }
   return w.take();
 }
@@ -63,14 +78,16 @@ std::expected<Row, SchemaError> Row::deserialize(const std::string& data,
       return std::unexpected(SchemaError::INVALID_FORMAT);
     }
     const auto& col = schema.columns()[i];
-    if (field.empty()) {
-      row.push_back(Value());          // NULL
-      continue;
-    }
     if (!KeyCodecs::is_valid_key(field, col.type)) {
       return std::unexpected(SchemaError::INVALID_FORMAT);
     }
-    row.push_back(Value::from_key(field, col.type));
+    Value value = Value::from_key(field, col.type);
+    // 读取时也要校验范围：落盘数据可能被外部改写/版本升级
+    const auto err = schema.validate_value(col, value);
+    if (err != SchemaError::OK) {
+      return std::unexpected(err);
+    }
+    row.push_back(std::move(value));
   }
 
   if (!r.eof()) {

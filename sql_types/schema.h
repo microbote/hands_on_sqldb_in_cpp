@@ -22,23 +22,39 @@ class Value;
 struct ColumnDef {
   Identifier name;
   DataType type;
+  // 字符串类型的声明长度（字节）；0 = 未声明，用该类型默认容量。
+  // 其它类型必须为 0（见 valid_declared_length）。
+  uint32_t length = 0;
   bool nullable = true;
   bool primary_key = false;
 
   ColumnDef() = default;
   ColumnDef(const Identifier& n, DataType t, bool pk = false, bool nul = true)
       : name(n), type(t), nullable(nul), primary_key(pk) {}
+  ColumnDef(const Identifier& n, DataType t, uint32_t len, bool pk = false,
+            bool nul = true)
+      : name(n), type(t), length(len), nullable(nul), primary_key(pk) {}
+
+  // 展示用类型名：VARCHAR(10) / CHAR(4) / TEXT / INT
+  std::string type_display() const {
+    std::string s = data_type_name(type);
+    if (is_string(type) && type != DataType::TEXT && length > 0) {
+      s += "(" + std::to_string(length) + ")";
+    }
+    return s;
+  }
 
   std::string to_string() const {
-    std::string s = name.str() + " " + data_type_name(type);
+    std::string s = name.str() + " " + type_display();
     if (primary_key) s += " PRIMARY KEY";
     if (!nullable) s += " NOT NULL";
     return s;
   }
 
   bool operator==(const ColumnDef& other) const {
-    return name == other.name && type == other.type && 
-           nullable == other.nullable && primary_key == other.primary_key;
+    return name == other.name && type == other.type &&
+           length == other.length && nullable == other.nullable &&
+           primary_key == other.primary_key;
   }
 
   bool operator!=(const ColumnDef& other) const {
@@ -57,6 +73,8 @@ enum class SchemaError :uint8_t {
   DUPLICATE_COLUMN_NAME,
   INVALID_ROW,
   INVALID_FORMAT,          // 序列化数据损坏 / 版本不匹配
+  VALUE_OUT_OF_RANGE,      // 值超出列的取值范围（如 300 写进 TINYINT）
+  INVALID_COLUMN_DEF,      // 列定义非法（如 CHAR(300)、TEXT(10)）
   COLUMN_NOT_FOUND,
   COLUMN_ATTR_NULL_MISMATCH,
   COLUMN_SIZE_MISMATCH,
@@ -69,7 +87,7 @@ enum class SchemaError :uint8_t {
 class TableSchema {
  public:
   // 序列化格式版本；格式变化时必须递增，反序列化会校验
-  static constexpr uint8_t kFormatVersion = 1;
+  static constexpr uint8_t kFormatVersion = 2;
 
   TableSchema() = default;
   explicit TableSchema(const Identifier& name);
@@ -99,6 +117,9 @@ class TableSchema {
   TableSchema& add_column(const ColumnDef& col);
   TableSchema& add_column(const Identifier& name, DataType type,
                           bool pk = false, bool nullable = true);
+  // 带声明长度的字符串列：add_column(name, DataType::VARCHAR, 32)
+  TableSchema& add_column(const Identifier& name, DataType type,
+                          uint32_t length, bool pk, bool nullable);
 
   // ----- 查询 -----
   int column_index(const Identifier& name) const;

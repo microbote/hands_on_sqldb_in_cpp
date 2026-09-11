@@ -41,7 +41,11 @@ class Row {
   auto rend() const { return values_.rend(); }
 
   std::string to_string() const;
+
+  // 序列化：推荐用带 schema 的版本 —— NULL 会按所属列的 family 编码
   std::string serialize() const;
+  std::string serialize(const TableSchema& schema) const;
+  // 反序列化（需要 schema 才能解码每列的 key）
   static std::expected<Row, SchemaError> deserialize(
       const std::string& data, const TableSchema& schema);
 

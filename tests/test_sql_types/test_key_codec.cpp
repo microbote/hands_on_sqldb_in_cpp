@@ -99,11 +99,54 @@ TEST(KeyCodec, BoolRoundTrip) {
     CHECK(Value(false).to_key() < Value(true).to_key());
 }
 
-TEST(KeyCodec, NullHasNoKey) {
+TEST(KeyCodec, NullHasItsOwnKeySlot) {
     Value null_value;
-    CHECK(null_value.to_key().empty());
-    CHECK(!KeyCodecs::is_valid_key(null_value.to_key(), DataType::INT));
+    // 不带列类型：NULL 用 kTagNull 编码（[0x00][0x00]），排序在所有值之前
+    const Key typeless = null_value.to_key();
+    CHECK_EQ(typeless.size(), 2);
+    CHECK_EQ(static_cast<uint8_t>(typeless[0]), KeyCodecs::kTagNull);
+    CHECK_EQ(static_cast<uint8_t>(typeless[1]), KeyCodecs::kNullFlag);
+    CHECK(typeless < Value(1).to_key());
+    CHECK(typeless < Value(std::string("")).to_key());
+
+    // 带列类型：NULL 用本族的 tag 编码，正好等于该族的最小 key
+    const Key typed_int = null_value.to_key(DataType::INT);
+    CHECK_EQ(typed_int, Value::min_key_for_type(DataType::INT));
+    CHECK_EQ(typed_int.size(), 2);
+    CHECK_EQ(static_cast<uint8_t>(typed_int[0]), KeyCodecs::kTagInt64);
+
+    const Key typed_str = null_value.to_key(DataType::VARCHAR);
+    CHECK_EQ(typed_str, Value::min_key_for_type(DataType::VARCHAR));
+    CHECK_EQ(static_cast<uint8_t>(typed_str[0]), KeyCodecs::kTagString);
+
+    // NULL 必须在全族范围内，且排在本族所有值之前
+    CHECK(typed_int < Value(INT64_MIN).to_key());
+    CHECK(typed_str < Value(std::string("")).to_key());
+    CHECK(typed_int < Value::upper_key_for_type(DataType::INT));
+
+    // 解码：两种 NULL key 都能解回 NULL
+    CHECK(Value::from_key(typeless, DataType::INT).is_null());
+    CHECK(Value::from_key(typed_int, DataType::INT).is_null());
+    CHECK(KeyCodecs::is_valid_key(typed_int, DataType::INT));
+    CHECK(KeyCodecs::is_valid_key(typeless, DataType::INT));
     CHECK(Value::from_key("", DataType::INT).is_null());
+    CHECK(!KeyCodecs::is_valid_key("", DataType::INT));
+}
+
+TEST(KeyCodec, TemporalTypesShareInt64Encoding) {
+    // DATE/TIME/DATETIME 与整数同族：编码一致、可按字节序排序
+    const Key date_key = Value::date(19000).to_key();
+    const Key datetime_key = Value::datetime(19000).to_key();
+    CHECK_EQ(date_key, datetime_key);
+    CHECK(KeyCodecs::less(Value::date(100), Value::date(200)));
+    CHECK(KeyCodecs::less(Value::datetime(-5), Value::datetime(5)));
+
+    // 解码时保留逻辑类型
+    CHECK(Value::from_key(date_key, DataType::DATE).is_date());
+    CHECK(Value::from_key(datetime_key, DataType::DATETIME).is_datetime());
+
+    // 时间类型与整型属于同一编码族
+    CHECK_EQ(KeyCodecs::tag_of(DataType::DATE), KeyCodecs::kTagInt64);
 }
 
 TEST(KeyCodec, RejectsMalformedKeys) {

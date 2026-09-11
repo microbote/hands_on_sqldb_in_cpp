@@ -61,7 +61,11 @@ class KeySet {
   // 插入（自动去重）
   // ============================================================
   KeySet& add(const sql::Value& val) {
-    if (std::find(points_.begin(), points_.end(), val) == points_.end()) {
+    // 按 key 判断重复：与存储层的全序/去重语义保持一致
+    if (std::none_of(points_.begin(), points_.end(),
+                     [&val](const sql::Value& x) {
+                       return ValueKeyEqual{}(x, val);
+                     })) {
       points_.push_back(val);
       sorted_ = false;
     }
@@ -91,7 +95,10 @@ class KeySet {
   }
 // 删除单值
    bool remove(const sql::Value& val) {
-     auto it = std::find(points_.begin(), points_.end(), val);
+     auto it = std::find_if(points_.begin(), points_.end(),
+                            [&val](const sql::Value& x) {
+                              return ValueKeyEqual{}(x, val);
+                            });
      if (it != points_.end()) {
        points_.erase(it);
        return true;
@@ -108,21 +115,23 @@ class KeySet {
   // 排序和去重（原地操作）
   // ============================================================
   KeySet& sort() {
-    std::sort(points_.begin(), points_.end());
+    std::sort(points_.begin(), points_.end(), ValueKeyLess{});
     sorted_ = true;
     return *this;
   }
 
   KeySet& unique() {
     sort();
-    points_.erase(std::unique(points_.begin(), points_.end()), points_.end());
+    points_.erase(std::unique(points_.begin(), points_.end(), ValueKeyEqual{}),
+                  points_.end());
     sorted_ = true;
     return *this;
   }
 
   KeySet& normalize() {
     sort();
-    points_.erase(std::unique(points_.begin(), points_.end()), points_.end());
+    points_.erase(std::unique(points_.begin(), points_.end(), ValueKeyEqual{}),
+                  points_.end());
     sorted_ = true;
     return *this;
   }
@@ -132,7 +141,7 @@ class KeySet {
   // ============================================================
   void ensure_sorted() const {
     if (!sorted_ && points_.size() > 1) {
-      std::sort(points_.begin(), points_.end());
+      std::sort(points_.begin(), points_.end(), ValueKeyLess{});
       sorted_ = true;
     }
   }
@@ -166,7 +175,8 @@ class KeySet {
     other.ensure_sorted();
     std::vector<sql::Value> result;
     std::set_union(points_.begin(), points_.end(), other.points_.begin(),
-                   other.points_.end(), std::back_inserter(result));
+                   other.points_.end(), std::back_inserter(result),
+                   ValueKeyLess{});
     return KeySet(std::move(result), true);
   }
 
@@ -176,7 +186,8 @@ class KeySet {
     other.ensure_sorted();
     std::vector<sql::Value> result;
     std::set_intersection(points_.begin(), points_.end(), other.points_.begin(),
-                          other.points_.end(), std::back_inserter(result));
+                          other.points_.end(), std::back_inserter(result),
+                          ValueKeyLess{});
     return KeySet(std::move(result), true);
   }
 
@@ -186,7 +197,8 @@ class KeySet {
     other.ensure_sorted();
     std::vector<sql::Value> result;
     std::set_difference(points_.begin(), points_.end(), other.points_.begin(),
-                        other.points_.end(), std::back_inserter(result));
+                        other.points_.end(), std::back_inserter(result),
+                        ValueKeyLess{});
     return KeySet(std::move(result), true);
   }
 
@@ -197,7 +209,7 @@ class KeySet {
     std::vector<sql::Value> result;
     std::set_symmetric_difference(points_.begin(), points_.end(),
                                   other.points_.begin(), other.points_.end(),
-                                  std::back_inserter(result));
+                                  std::back_inserter(result), ValueKeyLess{});
     return KeySet(std::move(result), true);
   }
 
@@ -228,7 +240,8 @@ class KeySet {
     if (points_.empty()) { return false;
 }
     ensure_sorted();
-    return std::binary_search(points_.begin(), points_.end(), val);
+    return std::binary_search(points_.begin(), points_.end(), val,
+                              ValueKeyLess{});
   }
 
   bool contains_all(const KeySet& other) const {
@@ -237,7 +250,7 @@ class KeySet {
     ensure_sorted();
     other.ensure_sorted();
     return std::includes(points_.begin(), points_.end(), other.points_.begin(),
-                         other.points_.end());
+                         other.points_.end(), ValueKeyLess{});
   }
 
   bool contains_any(const KeySet& other) const {
@@ -247,7 +260,8 @@ class KeySet {
     other.ensure_sorted();
     std::vector<sql::Value> result;
     std::set_intersection(points_.begin(), points_.end(), other.points_.begin(),
-                          other.points_.end(), std::back_inserter(result));
+                          other.points_.end(), std::back_inserter(result),
+                          ValueKeyLess{});
     return !result.empty();
   }
 
@@ -256,7 +270,8 @@ class KeySet {
 }
     ensure_sorted();
     other.ensure_sorted();
-    return points_ == other.points_;
+    return std::equal(points_.begin(), points_.end(), other.points_.begin(),
+                      ValueKeyEqual{});
   }
 
   // ============================================================

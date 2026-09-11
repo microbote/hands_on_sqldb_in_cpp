@@ -20,6 +20,7 @@ add_library(sql_types STATIC
     sql_types/key_range.cpp
     sql_types/row.cpp
     sql_types/schema.cpp
+    sql_types/temporal.cpp
     sql_types/value.cpp
 )
 
