@@ -16,6 +16,7 @@ typedef enum {
     NODE_NUMBER,
     NODE_STRING,
     NODE_IDENT,
+    NODE_LITERAL,       /* NULL / TRUE / FALSE 关键字字面量 */
 
     NODE_USE,
     NODE_SELECT,
@@ -46,6 +47,7 @@ static inline const char * node_type_to_string(NodeType type) {
         case NODE_NUMBER: return "NUMBER";
         case NODE_STRING: return "STRING";
         case NODE_IDENT: return "IDENT";
+        case NODE_LITERAL: return "LITERAL";
         case NODE_USE: return "USE";
         case NODE_SELECT: return "SELECT";
         case NODE_INSERT: return "INSERT";
@@ -88,11 +90,26 @@ NodeLifetime* get_node_lifetime(NodeType type);
 
 // NODE_NUMBER
 typedef struct NumberNode{
-    int value;
+    int64_t value;
 } NumberNode;
-ASTNode* make_number_node(int num);
+ASTNode* make_number_node(int64_t num);
 int print_number_node(ASTNode* node, int indent, int offset, char* buffer, size_t buffer_size);
 void free_number_node(ASTNode* node);
+
+// NODE_LITERAL: NULL / TRUE / FALSE
+typedef enum {
+    LITERAL_NULL,
+    LITERAL_TRUE,
+    LITERAL_FALSE
+} LiteralKind;
+
+typedef struct LiteralNode {
+    LiteralKind kind;
+} LiteralNode;
+ASTNode* make_literal_node(LiteralKind kind);
+const char* literal_kind_to_string(LiteralKind kind);
+int print_literal_node(ASTNode* node, int indent, int offset, char* buffer, size_t buffer_size);
+void free_literal_node(ASTNode* node);
 
 // NODE_STRING
 typedef struct StringNode{
@@ -308,14 +325,16 @@ void free_drop_table_node(ASTNode* node);
 // NODE_COLUMN_DEF
 typedef struct ColumnDefNode {
     char *name;              // 列名
-    CDataType data_type;      // 数据类型
+    CDataType data_type;     // 数据类型
+    unsigned length;         // 字符串类型的声明长度（0 = 未声明）
     int is_primary_key;      // 是否为主键
     int nullable;            // 是否允许为空
 } ColumnDefNode;
 
 
 ASTNode* make_column_def_node(const char* name, CDataType data_type,
-                              int is_primary_key, int nullable);
+                              unsigned length, int is_primary_key,
+                              int nullable);
 
 int print_column_def_node(ASTNode* node, int indent, int offset, char* buffer, size_t buffer_size);
 void free_column_def_node(ASTNode* node);

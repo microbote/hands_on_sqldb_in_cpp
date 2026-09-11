@@ -118,7 +118,7 @@ static int print_title(const char *title, int indent, int offset, char *buffer,
 /* ============================================================
    NODE_NUMBER
    ============================================================ */
-ASTNode *make_number_node(int num) {
+ASTNode *make_number_node(int64_t num) {
   ASTNode *node = ast_alloc_node(NODE_NUMBER, sizeof(NumberNode));
   USE_DATA(data, node, NumberNode);
   if (data == nullptr) {
@@ -132,12 +132,49 @@ int print_number_node(ASTNode *node, int indent, int offset, char *buffer,
                       size_t buffer_size) {
   NumberNode *data = (NumberNode *)node->data;
   offset = append_indent(buffer, buffer_size, offset, indent);
-  offset =
-      safe_append(buffer, buffer_size, offset, "NUMBER(%d)\n", data->value);
+  offset = safe_append(buffer, buffer_size, offset, "NUMBER(%lld)\n",
+                       (long long)data->value);
   return offset;
 }
 
 void free_number_node(ASTNode *node) { free(node); }
+
+/* ============================================================
+   NODE_LITERAL (NULL / TRUE / FALSE)
+   ============================================================ */
+const char *literal_kind_to_string(LiteralKind kind) {
+  switch (kind) {
+  case LITERAL_NULL:
+    return "NULL";
+  case LITERAL_TRUE:
+    return "TRUE";
+  case LITERAL_FALSE:
+    return "FALSE";
+  default:
+    return "UNKNOWN_LITERAL";
+  }
+}
+
+ASTNode *make_literal_node(LiteralKind kind) {
+  ASTNode *node = ast_alloc_node(NODE_LITERAL, sizeof(LiteralNode));
+  USE_DATA(data, node, LiteralNode);
+  if (data == nullptr) {
+    return NULL;
+  }
+  data->kind = kind;
+  return node;
+}
+
+int print_literal_node(ASTNode *node, int indent, int offset, char *buffer,
+                       size_t buffer_size) {
+  LiteralNode *data = (LiteralNode *)node->data;
+  offset = append_indent(buffer, buffer_size, offset, indent);
+  offset = safe_append(buffer, buffer_size, offset, "LITERAL(%s)\n",
+                       literal_kind_to_string(data->kind));
+  return offset;
+}
+
+void free_literal_node(ASTNode *node) { free(node); }
 
 /* ============================================================
    NODE_STRING
@@ -917,7 +954,8 @@ void free_drop_table_node(ASTNode *node) {
    NODE_COLUMN_DEF
    ============================================================ */
 ASTNode *make_column_def_node(const char *name, CDataType data_type,
-                              int is_primary_key, int nullable) {
+                              unsigned length, int is_primary_key,
+                              int nullable) {
   ASTNode *node = ast_alloc_node(NODE_COLUMN_DEF, sizeof(ColumnDefNode));
   USE_DATA(data, node, ColumnDefNode);
   if (data == nullptr) {
@@ -926,19 +964,35 @@ ASTNode *make_column_def_node(const char *name, CDataType data_type,
   }
   data->name = strdup(name);
   data->data_type = data_type;
+  data->length = length;
   data->is_primary_key = is_primary_key;
   data->nullable = nullable;
   return node;
 }
 
+/* 类型名 + 可选长度，例如 VARCHAR(32) */
+static void format_column_type(const ColumnDefNode *data, char *out,
+                               size_t out_size) {
+  if (data->length > 0 && (data->data_type == DT_CHAR ||
+                           data->data_type == DT_VARCHAR)) {
+    snprintf(out, out_size, "%s(%u)", data_type_to_string(data->data_type),
+             data->length);
+  } else {
+    snprintf(out, out_size, "%s", data_type_to_string(data->data_type));
+  }
+}
+
 int print_column_def_node(ASTNode *node, int indent, int offset, char *buffer,
                           size_t buffer_size) {
   ColumnDefNode *data = (ColumnDefNode *)node->data;
+  char type_name[64];
+  format_column_type(data, type_name, sizeof(type_name));
   offset = append_indent(buffer, buffer_size, offset, indent);
   offset = safe_append(buffer, buffer_size, offset,
-                       "COLUMN_DEFINE(NAME='%s', DATA_TYPE=%s, PRIMARY_KEY=%d, NULLABLE=%d)\n",
+                       "COLUMN_DEFINE(NAME='%s', DATA_TYPE=%s, PRIMARY_KEY=%d, "
+                       "NULLABLE=%d)\n",
                        (data->name != nullptr) ? data->name : "",
-                       data_type_to_string(data->data_type),
+                       type_name,
                        data->is_primary_key, data->nullable);
   return offset;
 }
@@ -953,80 +1007,70 @@ void free_column_def_node(ASTNode *node) {
 
 /* ============================================================
    NodeLifetime 注册表
+
+   纯 C 风格：按 NodeType 的声明顺序逐个列出（不使用指定下标初始化），
+   下面用 typedef 数组做一次编译期长度检查，避免加了节点却忘了登记。
    ============================================================ */
 static NodeLifetime nodes[NODE_TYPE_COUNT] = {
-    [NODE_NUMBER] = {NODE_NUMBER, (NodeDataConstructor)make_number_node,
-                     (NodeDataDestructor)free_number_node,
-                     (NodeDataPrinter)print_number_node},
-    [NODE_STRING] = {NODE_STRING, (NodeDataConstructor)make_string_node,
-                     (NodeDataDestructor)free_string_node,
-                     (NodeDataPrinter)print_string_node},
-    [NODE_IDENT] = {NODE_IDENT, (NodeDataConstructor)make_ident_node,
-                    (NodeDataDestructor)free_ident_node,
-                    (NodeDataPrinter)print_ident_node},
-    [NODE_USE] = {NODE_USE, (NodeDataConstructor)make_use_node,
-                  (NodeDataDestructor)free_use_node,
-                  (NodeDataPrinter)print_use_node},
-    [NODE_SELECT] = {NODE_SELECT, (NodeDataConstructor)make_select_node,
-                     (NodeDataDestructor)free_select_node,
-                     (NodeDataPrinter)print_select_node},
-    [NODE_INSERT] = {NODE_INSERT, (NodeDataConstructor)make_insert_node,
-                     (NodeDataDestructor)free_insert_node,
-                     (NodeDataPrinter)print_insert_node},
-    [NODE_UPDATE] = {NODE_UPDATE, (NodeDataConstructor)make_update_node,
-                     (NodeDataDestructor)free_update_node,
-                     (NodeDataPrinter)print_update_node},
-    [NODE_DELETE] = {NODE_DELETE, (NodeDataConstructor)make_delete_node,
-                     (NodeDataDestructor)free_delete_node,
-                     (NodeDataPrinter)print_delete_node},
-    [NODE_COMPARE] = {NODE_COMPARE, (NodeDataConstructor)make_compare_node,
-                      (NodeDataDestructor)free_compare_node,
-                      (NodeDataPrinter)print_compare_node},
-    [NODE_BINARY_OP] = {NODE_BINARY_OP, (NodeDataConstructor)make_binary_node,
-                        (NodeDataDestructor)free_binary_node,
-                        (NodeDataPrinter)print_binary_node},
-    [NODE_ASSIGNMENT] = {NODE_ASSIGNMENT,
-                         (NodeDataConstructor)make_assignment_node,
-                         (NodeDataDestructor)free_assignment_node,
-                         (NodeDataPrinter)print_assignment_node},
-    [NODE_LIST] = {NODE_LIST, (NodeDataConstructor)create_list,
-                   (NodeDataDestructor)free_list, (NodeDataPrinter)print_list},
-    [NODE_NOT] = {NODE_NOT, (NodeDataConstructor)make_not_node,
-                  (NodeDataDestructor)free_not_node,
-                  (NodeDataPrinter)print_not_node},
-    [NODE_IN] = {NODE_IN, (NodeDataConstructor)make_in_node,
-                 (NodeDataDestructor)free_in_node,
-                 (NodeDataPrinter)print_in_node},
-    [NODE_NOT_IN] = {NODE_NOT_IN, (NodeDataConstructor)make_not_in_node,
-                     (NodeDataDestructor)free_in_node,
-                     (NodeDataPrinter)print_in_node},
-    [NODE_ORDER] = {NODE_ORDER, (NodeDataConstructor)make_order_node,
-                    (NodeDataDestructor)free_order_node,
-                    (NodeDataPrinter)print_order_node},
-    [NODE_LIMIT] = {NODE_LIMIT, (NodeDataConstructor)make_limit_node,
-                    (NodeDataDestructor)free_limit_node,
-                    (NodeDataPrinter)print_limit_node},
-    [NODE_CREATE_DATABASE] = {NODE_CREATE_DATABASE,
-                              (NodeDataConstructor)make_create_database_node,
-                              (NodeDataDestructor)free_create_database_node,
-                              (NodeDataPrinter)print_create_database_node},
-    [NODE_DROP_DATABASE] = {NODE_DROP_DATABASE,
-                            (NodeDataConstructor)make_drop_database_node,
-                            (NodeDataDestructor)free_drop_database_node,
-                            (NodeDataPrinter)print_drop_database_node},
-    [NODE_CREATE_TABLE] = {NODE_CREATE_TABLE,
-                           (NodeDataConstructor)make_create_table_node,
-                           (NodeDataDestructor)free_create_table_node,
-                           (NodeDataPrinter)print_create_table_node},
-    [NODE_DROP_TABLE] = {NODE_DROP_TABLE,
-                         (NodeDataConstructor)make_drop_table_node,
-                         (NodeDataDestructor)free_drop_table_node,
-                         (NodeDataPrinter)print_drop_table_node},
-    [NODE_COLUMN_DEF] = {NODE_COLUMN_DEF,
-                         (NodeDataConstructor)make_column_def_node,
-                         (NodeDataDestructor)free_column_def_node,
-                         (NodeDataPrinter)print_column_def_node},
+    {NODE_NUMBER, (NodeDataConstructor)make_number_node,
+     (NodeDataDestructor)free_number_node, (NodeDataPrinter)print_number_node},
+    {NODE_STRING, (NodeDataConstructor)make_string_node,
+     (NodeDataDestructor)free_string_node, (NodeDataPrinter)print_string_node},
+    {NODE_IDENT, (NodeDataConstructor)make_ident_node,
+     (NodeDataDestructor)free_ident_node, (NodeDataPrinter)print_ident_node},
+    {NODE_LITERAL, (NodeDataConstructor)make_literal_node,
+     (NodeDataDestructor)free_literal_node,
+     (NodeDataPrinter)print_literal_node},
+    {NODE_USE, (NodeDataConstructor)make_use_node,
+     (NodeDataDestructor)free_use_node, (NodeDataPrinter)print_use_node},
+    {NODE_SELECT, (NodeDataConstructor)make_select_node,
+     (NodeDataDestructor)free_select_node, (NodeDataPrinter)print_select_node},
+    {NODE_INSERT, (NodeDataConstructor)make_insert_node,
+     (NodeDataDestructor)free_insert_node, (NodeDataPrinter)print_insert_node},
+    {NODE_UPDATE, (NodeDataConstructor)make_update_node,
+     (NodeDataDestructor)free_update_node, (NodeDataPrinter)print_update_node},
+    {NODE_DELETE, (NodeDataConstructor)make_delete_node,
+     (NodeDataDestructor)free_delete_node, (NodeDataPrinter)print_delete_node},
+    {NODE_COMPARE, (NodeDataConstructor)make_compare_node,
+     (NodeDataDestructor)free_compare_node,
+     (NodeDataPrinter)print_compare_node},
+    {NODE_BINARY_OP, (NodeDataConstructor)make_binary_node,
+     (NodeDataDestructor)free_binary_node, (NodeDataPrinter)print_binary_node},
+    {NODE_ASSIGNMENT, (NodeDataConstructor)make_assignment_node,
+     (NodeDataDestructor)free_assignment_node,
+     (NodeDataPrinter)print_assignment_node},
+    {NODE_LIST, (NodeDataConstructor)create_list, (NodeDataDestructor)free_list,
+     (NodeDataPrinter)print_list},
+    {NODE_NOT, (NodeDataConstructor)make_not_node,
+     (NodeDataDestructor)free_not_node, (NodeDataPrinter)print_not_node},
+    {NODE_IN, (NodeDataConstructor)make_in_node,
+     (NodeDataDestructor)free_in_node, (NodeDataPrinter)print_in_node},
+    {NODE_NOT_IN, (NodeDataConstructor)make_not_in_node,
+     (NodeDataDestructor)free_in_node, (NodeDataPrinter)print_in_node},
+    {NODE_ORDER, (NodeDataConstructor)make_order_node,
+     (NodeDataDestructor)free_order_node, (NodeDataPrinter)print_order_node},
+    {NODE_LIMIT, (NodeDataConstructor)make_limit_node,
+     (NodeDataDestructor)free_limit_node, (NodeDataPrinter)print_limit_node},
+    {NODE_CREATE_DATABASE, (NodeDataConstructor)make_create_database_node,
+     (NodeDataDestructor)free_create_database_node,
+     (NodeDataPrinter)print_create_database_node},
+    {NODE_DROP_DATABASE, (NodeDataConstructor)make_drop_database_node,
+     (NodeDataDestructor)free_drop_database_node,
+     (NodeDataPrinter)print_drop_database_node},
+    {NODE_CREATE_TABLE, (NodeDataConstructor)make_create_table_node,
+     (NodeDataDestructor)free_create_table_node,
+     (NodeDataPrinter)print_create_table_node},
+    {NODE_DROP_TABLE, (NodeDataConstructor)make_drop_table_node,
+     (NodeDataDestructor)free_drop_table_node,
+     (NodeDataPrinter)print_drop_table_node},
+    {NODE_COLUMN_DEF, (NodeDataConstructor)make_column_def_node,
+     (NodeDataDestructor)free_column_def_node,
+     (NodeDataPrinter)print_column_def_node},
 };
+
+/* 编译期检查：登记表必须覆盖 NODE_TYPE_COUNT 个节点（纯 C，不用 C++） */
+typedef char node_lifetime_table_size_check
+    [(sizeof(nodes) / sizeof(nodes[0])) == NODE_TYPE_COUNT ? 1 : -1];
 
 NodeLifetime *get_node_lifetime(NodeType type) {
   if (type < 0 || type >= NODE_TYPE_COUNT) {

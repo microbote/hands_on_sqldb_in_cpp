@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <optional>
+#include <functional>
 #include <vector>
 
 #include "ast.h"
@@ -120,6 +121,15 @@ public:
     // 设置调试模式
     void set_debug(bool enable) { debug_ = enable; }
     bool debug_enabled() const { return debug_; }
+
+    // 日志回调：库本身不打印任何东西，需要输出的调用方自己注册。
+    // 例如 CLI(main.cpp) 注册一个打到 stdout 的回调来保留交互体验。
+    using LogCallback = std::function<void(const std::string&)>;
+    void set_log_callback(LogCallback callback) {
+        log_ = std::move(callback);
+    }
+    // 供 C 侧的 yyerror 等回调使用
+    void log_message(const std::string& message) const { log(message); }
     
     // 获取最后错误信息
     std::string last_error() const { return last_error_; }
@@ -135,8 +145,14 @@ public:
 private:
     bool do_parse(const std::string& sql, ASTNode** result);
     std::string error_detail() const;
+    void log(const std::string& message) const {
+        if (log_) {
+            log_(message);
+        }
+    }
     
     std::string last_error_;
+    LogCallback log_;
     bool debug_ = false;
     size_t parse_count_ = 0;
     size_t error_count_ = 0;

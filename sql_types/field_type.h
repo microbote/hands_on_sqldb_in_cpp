@@ -42,13 +42,78 @@ enum class DataType : uint8_t {
   UNKNOWN_TYPE
 };
 
-enum class DataTypeClass : uint8_t {
+enum class DataTypeFamily : uint8_t {
   INTEGER,
   STRING,
   BOOLEAN,
   TEMPORAL,
-  UNKNOWN_CLASS
+  UNKNOWN_FAMILY
 };
+
+// ============================================================
+// C-API 互操作（定义放在前面：长度/别名等工具函数会用到）
+// ============================================================
+inline CDataType to_c(DataType type) {
+  switch (type) {
+  case DataType::TINYINT:
+    return DT_TINYINT;
+  case DataType::SMALLINT:
+    return DT_SMALLINT;
+  case DataType::INT:
+    return DT_INT;
+  case DataType::BIGINT:
+    return DT_BIGINT;
+  case DataType::CHAR:
+    return DT_CHAR;
+  case DataType::VARCHAR:
+    return DT_VARCHAR;
+  case DataType::TEXT:
+    return DT_TEXT;
+  case DataType::BOOLEAN:
+    return DT_BOOLEAN;
+  case DataType::DATE:
+    return DT_DATE;
+  case DataType::TIME:
+    return DT_TIME;
+  case DataType::DATETIME:
+    return DT_DATETIME;
+  case DataType::NULL_TYPE:
+    return DT_NULL;
+  default:
+    return DT_UNKNOWN;
+  }
+}
+
+inline DataType from_c(::CDataType type) {
+  switch (type) {
+  case DT_TINYINT:
+    return DataType::TINYINT;
+  case DT_SMALLINT:
+    return DataType::SMALLINT;
+  case DT_INT:
+    return DataType::INT;
+  case DT_BIGINT:
+    return DataType::BIGINT;
+  case DT_CHAR:
+    return DataType::CHAR;
+  case DT_VARCHAR:
+    return DataType::VARCHAR;
+  case DT_TEXT:
+    return DataType::TEXT;
+  case DT_BOOLEAN:
+    return DataType::BOOLEAN;
+  case DT_DATE:
+    return DataType::DATE;
+  case DT_TIME:
+    return DataType::TIME;
+  case DT_DATETIME:
+    return DataType::DATETIME;
+  case DT_NULL:
+    return DataType::NULL_TYPE;
+  default:
+    return DataType::UNKNOWN_TYPE;
+  }
+}
 
 // ------------------------------------------------------------
 // family 判定
@@ -89,20 +154,20 @@ inline bool is_hashable(DataType type) { return is_orderable(type); }
 
 inline bool is_indexable(DataType type) { return is_orderable(type); }
 
-inline DataTypeClass get_type_class(DataType type) {
+inline DataTypeFamily get_type_family(DataType type) {
   if (is_integer(type)) {
-    return DataTypeClass::INTEGER;
+    return DataTypeFamily::INTEGER;
   }
   if (is_string(type)) {
-    return DataTypeClass::STRING;
+    return DataTypeFamily::STRING;
   }
   if (is_boolean(type)) {
-    return DataTypeClass::BOOLEAN;
+    return DataTypeFamily::BOOLEAN;
   }
   if (is_temporal(type)) {
-    return DataTypeClass::TEMPORAL;
+    return DataTypeFamily::TEMPORAL;
   }
-  return DataTypeClass::UNKNOWN_CLASS;
+  return DataTypeFamily::UNKNOWN_FAMILY;
 }
 
 // ------------------------------------------------------------
@@ -179,9 +244,10 @@ inline constexpr int64_t kDateTimeMaxSeconds =
 //   TEXT        : 65535，不接受声明长度
 // 长度单位是 **字节**（UTF-8 中文一个字 3 字节）。
 // ------------------------------------------------------------
-inline constexpr uint32_t kMaxCharLength = 255;
-inline constexpr uint32_t kMaxVarcharLength = 65535;
-inline constexpr uint32_t kMaxTextLength = 65535;
+// 长度上限来自 common/c_types.h（与 parser 侧共用同一份定义）
+inline constexpr uint32_t kMaxCharLength = CTYPE_MAX_CHAR_LEN;
+inline constexpr uint32_t kMaxVarcharLength = CTYPE_MAX_VARCHAR_LEN;
+inline constexpr uint32_t kMaxTextLength = CTYPE_MAX_TEXT_LEN;
 
 // 该字符串类型的实际容量（declared_length = 0 表示未声明）
 inline uint32_t string_capacity(DataType type, uint32_t declared_length = 0) {
@@ -202,18 +268,10 @@ inline uint32_t string_capacity(DataType type, uint32_t declared_length = 0) {
 // 只有**显式写出**的长度才会被这里判非法（如 CHAR(300) / TEXT(10)）。
 inline bool valid_declared_length(DataType type, uint32_t declared_length) {
   if (declared_length == 0) {
-    return true;   // 未声明
+    return true;  // 未声明
   }
-  switch (type) {
-  case DataType::CHAR:
-    return declared_length <= kMaxCharLength;
-  case DataType::VARCHAR:
-    return declared_length <= kMaxVarcharLength;
-  case DataType::TEXT:
-    return declared_length == 0;   // TEXT 不接受声明长度
-  default:
-    return false;                  // 非字符串类型不能带长度
-  }
+  // 具体上限与 parser 侧共用同一份实现
+  return c_type_length_valid(to_c(type), declared_length) != 0;
 }
 
 // 字符串内容长度是否放得进该列（长度单位为字节）
@@ -391,47 +449,8 @@ inline const char *data_type_name(DataType type) {
 // 未知类型返回 DataType::UNKNOWN_TYPE
 // ============================================================
 inline DataType string_to_data_type(std::string_view str) {
-  auto eq = [](std::string_view s, std::string_view literal) {
-    return iequals_ascii(s, literal);
-  };
-
-  if (eq(str, "tinyint") || eq(str, "int8")) {
-    return DataType::TINYINT;
-  }
-  if (eq(str, "smallint") || eq(str, "int16")) {
-    return DataType::SMALLINT;
-  }
-  if (eq(str, "int") || eq(str, "integer") || eq(str, "int32")) {
-    return DataType::INT;
-  }
-  if (eq(str, "bigint") || eq(str, "int64")) {
-    return DataType::BIGINT;
-  }
-  if (eq(str, "char") || eq(str, "character")) {
-    return DataType::CHAR;
-  }
-  if (eq(str, "varchar") || eq(str, "varying")) {
-    return DataType::VARCHAR;
-  }
-  if (eq(str, "text")) {
-    return DataType::TEXT;
-  }
-  if (eq(str, "boolean") || eq(str, "bool")) {
-    return DataType::BOOLEAN;
-  }
-  if (eq(str, "date")) {
-    return DataType::DATE;
-  }
-  if (eq(str, "time")) {
-    return DataType::TIME;
-  }
-  if (eq(str, "datetime") || eq(str, "timestamp")) {
-    return DataType::DATETIME;
-  }
-  if (eq(str, "null")) {
-    return DataType::NULL_TYPE;
-  }
-  return DataType::UNKNOWN_TYPE;
+  // 别名表本体在 common/c_types.h（与 parser 共用，唯一数据源）
+  return from_c(c_type_lookup(std::string(str).c_str()));
 }
 
 // ============================================================
@@ -495,71 +514,6 @@ inline bool parse_type_with_length(std::string_view text, DataType& type,
     return false;
   }
   return true;
-}
-
-// ============================================================
-// C-API 互操作
-// ============================================================
-inline CDataType to_c(DataType type) {
-  switch (type) {
-  case DataType::TINYINT:
-    return DT_TINYINT;
-  case DataType::SMALLINT:
-    return DT_SMALLINT;
-  case DataType::INT:
-    return DT_INT;
-  case DataType::BIGINT:
-    return DT_BIGINT;
-  case DataType::CHAR:
-    return DT_CHAR;
-  case DataType::VARCHAR:
-    return DT_VARCHAR;
-  case DataType::TEXT:
-    return DT_TEXT;
-  case DataType::BOOLEAN:
-    return DT_BOOLEAN;
-  case DataType::DATE:
-    return DT_DATE;
-  case DataType::TIME:
-    return DT_TIME;
-  case DataType::DATETIME:
-    return DT_DATETIME;
-  case DataType::NULL_TYPE:
-    return DT_NULL;
-  default:
-    return DT_UNKNOWN;
-  }
-}
-
-inline DataType from_c(::CDataType type) {
-  switch (type) {
-  case DT_TINYINT:
-    return DataType::TINYINT;
-  case DT_SMALLINT:
-    return DataType::SMALLINT;
-  case DT_INT:
-    return DataType::INT;
-  case DT_BIGINT:
-    return DataType::BIGINT;
-  case DT_CHAR:
-    return DataType::CHAR;
-  case DT_VARCHAR:
-    return DataType::VARCHAR;
-  case DT_TEXT:
-    return DataType::TEXT;
-  case DT_BOOLEAN:
-    return DataType::BOOLEAN;
-  case DT_DATE:
-    return DataType::DATE;
-  case DT_TIME:
-    return DataType::TIME;
-  case DT_DATETIME:
-    return DataType::DATETIME;
-  case DT_NULL:
-    return DataType::NULL_TYPE;
-  default:
-    return DataType::UNKNOWN_TYPE;
-  }
 }
 
 } // namespace sql

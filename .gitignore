@@ -14,16 +14,17 @@ build/
 # ============================================================
 # 可执行文件
 # ============================================================
-sql_engine
-test_parser
-test_statement
-test_condition
-test_optimizer
-test_executor
-test_middle
-test_relation
-test_mock_engine
-test_leveldb_engine
+# 只忽略仓库根目录下的可执行文件，不要误伤 tests/test_parser/ 这类目录
+/sql_engine
+/test_parser
+/test_statement
+/test_condition
+/test_optimizer
+/test_executor
+/test_middle
+/test_relation
+/test_mock_engine
+/test_leveldb_engine
     
 
 # ============================================================

@@ -8,7 +8,7 @@ add_subdirectory(test_fwk)
 
 # 添加各个模块的测试
 add_subdirectory(test_sql_types)
+add_subdirectory(test_parser)
 
 # 未来其他模块的测试
-# add_subdirectory(test_parser)
 # add_subdirectory(test_storage)

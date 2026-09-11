@@ -1,10 +1,16 @@
 %code requires {
 #include "ast.h"
+
+/* data_type 的语义值：类型 + 可选的显式长度（VARCHAR(n) / CHAR(n)） */
+typedef struct CTypeSpec {
+    CDataType type;
+    unsigned length;     /* 0 = 未声明 */
+    int has_length;      /* 是否显式写了 (n) */
+} CTypeSpec;
 }
 
 %{
 #include "ast.h"
-#include "parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,18 +18,30 @@
 extern int yylex();
 void yyerror(const char *s);
 
+/* LIMIT/OFFSET 的 AST 字段是 int，这里做一次显式的范围检查 */
+static int sql_limit_to_int(int64_t value, int *out) {
+    if (value < 0 || value > 2147483647LL) {
+        return 0;
+    }
+    *out = (int)value;
+    return 1;
+}
+
 %}
 
 %debug
 %verbose
+%define parse.error detailed
 
 
 /* yyltype, yylval */
 %union {
     int num;
+    int64_t i64;
     char* str;
     COpType op;
     CDataType dt;
+    CTypeSpec spec;
     struct ASTNode* node;
     struct ASTNode* list;
 }
@@ -38,11 +56,11 @@ void yyerror(const char *s);
 /* DDL */
 %token TOK_CREATE TOK_DROP TOK_DATABASE TOK_TABLE
 %token TOK_PRIMARY TOK_KEY
-%token TOK_NULL
-%token TOK_INT TOK_BIGINT TOK_VARCHAR TOK_TEXT TOK_BOOLEAN
+%token TOK_NULL TOK_TRUE TOK_FALSE
+%token TOK_LEX_ERROR
 
-%token <num> TOK_NUMBER
-%token <str> TOK_IDENT TOK_STRING
+%token <i64> TOK_NUMBER
+%token <str> TOK_IDENT TOK_STRING TOK_TYPE_NAME
 
 /* DML */
 %type <node> input statement select_stmt insert_stmt update_stmt delete_stmt
@@ -64,7 +82,7 @@ void yyerror(const char *s);
 %type <node> use_stmt create_db_stmt drop_db_stmt create_table_stmt drop_table_stmt
 %type <list> column_def_list
 %type <node> column_def
-%type <dt> data_type 
+%type <spec> data_type 
 %type <num> opt_nullable opt_primary_key
 
 
@@ -138,16 +156,47 @@ column_def_list:
 
 column_def:
     TOK_IDENT data_type opt_primary_key opt_nullable {
-        $$ = make_column_def_node($1, $2, $3, $4);
+        $$ = make_column_def_node($1, $2.type, $2.length, $3, $4);
     }
     ;
 
+/* 类型：名字来自 common/c_types.h 的别名表（与 sql_types 共用一份定义），
+   长度校验也用同一份规则（CHAR <= 255 / VARCHAR <= 65535 / 不接受长度的类型报错）。 */
 data_type:
-    TOK_INT          { $$ = DT_INT; }
-    | TOK_BIGINT     { $$ = DT_BIGINT; }
-    | TOK_VARCHAR    { $$ = DT_VARCHAR; }
-    | TOK_TEXT       { $$ = DT_TEXT; }
-    | TOK_BOOLEAN    { $$ = DT_BOOLEAN; }
+    TOK_TYPE_NAME {
+        CDataType type = c_type_lookup($1);
+        if (type == DT_UNKNOWN) {
+            yyerror("unknown data type");
+            free($1);
+            YYERROR;
+        }
+        $$.type = type;
+        $$.length = 0;
+        $$.has_length = 0;
+        free($1);
+    }
+    | TOK_TYPE_NAME '(' TOK_NUMBER ')' {
+        CDataType type = c_type_lookup($1);
+        if (type == DT_UNKNOWN) {
+            yyerror("unknown data type");
+            free($1);
+            YYERROR;
+        }
+        if ($3 <= 0 || $3 > (int64_t)c_type_max_length(type) ||
+            !c_type_accepts_length(type)) {
+            if (c_type_accepts_length(type)) {
+                yyerror("declared length out of range for this type");
+            } else {
+                yyerror("this data type does not accept a length");
+            }
+            free($1);
+            YYERROR;
+        }
+        $$.type = type;
+        $$.length = (unsigned)$3;
+        $$.has_length = 1;
+        free($1);
+    }
     ;
 
 opt_primary_key:
@@ -214,7 +263,11 @@ value_item_list:
 
 value_item:
     TOK_NUMBER                   { $$ = make_number_node($1); }
+    | '-' TOK_NUMBER             { $$ = make_number_node(-$2); }
     | TOK_STRING                 { $$ = make_string_node($1); }
+    | TOK_NULL                   { $$ = make_literal_node(LITERAL_NULL); }
+    | TOK_TRUE                   { $$ = make_literal_node(LITERAL_TRUE); }
+    | TOK_FALSE                  { $$ = make_literal_node(LITERAL_FALSE); }
     ;
 
 
@@ -231,7 +284,7 @@ assignment_list:
     ;
 
 assignment:
-    TOK_IDENT TOK_EQ value_item    {printf("DEBUG: assignment: %s = ...\n", $1);  $$ = make_assignment_node($1, $3); }
+    TOK_IDENT TOK_EQ value_item    { $$ = make_assignment_node($1, $3); }
     ;
 
 
@@ -295,6 +348,8 @@ opt_order_by:
 order_list:
     order_item                  { $$ = create_list($1, LIST_ORDER);}
     | order_list ',' order_item    { $$ = append_to_list($1, $3); }
+    ;
+
 order_item:
     TOK_IDENT                   { $$ = make_order_node($1, OP_ASC); }
     | TOK_IDENT order_direction { $$ = make_order_node($1, $2); }
@@ -310,10 +365,34 @@ order_direction:
    ============================================================ */
 opt_limit:
     %empty                       { $$ = NULL; }
-    | TOK_LIMIT TOK_NUMBER       { $$ = make_limit_node($2, 0); }
-    | TOK_LIMIT TOK_NUMBER TOK_OFFSET TOK_NUMBER { $$ = make_limit_node($2, $4); }
-    | TOK_LIMIT TOK_NUMBER ',' TOK_NUMBER { $$ = make_limit_node($4, $2); }  /* MySQL 风格 */
+    | TOK_LIMIT TOK_NUMBER {
+        int limit_value = 0;
+        if (!sql_limit_to_int($2, &limit_value)) {
+            yyerror("LIMIT out of range");
+            YYERROR;
+        }
+        $$ = make_limit_node(limit_value, 0);
+    }
+    | TOK_LIMIT TOK_NUMBER TOK_OFFSET TOK_NUMBER {
+        int limit_value = 0;
+        int offset_value = 0;
+        if (!sql_limit_to_int($2, &limit_value) ||
+            !sql_limit_to_int($4, &offset_value)) {
+            yyerror("LIMIT/OFFSET out of range");
+            YYERROR;
+        }
+        $$ = make_limit_node(limit_value, offset_value);
+    }
+    | TOK_LIMIT TOK_NUMBER ',' TOK_NUMBER {  /* MySQL 风格: LIMIT offset, count */
+        int limit_value = 0;
+        int offset_value = 0;
+        if (!sql_limit_to_int($4, &limit_value) ||
+            !sql_limit_to_int($2, &offset_value)) {
+            yyerror("LIMIT out of range");
+            YYERROR;
+        }
+        $$ = make_limit_node(limit_value, offset_value);
+    }
     ;
 
 %%
-

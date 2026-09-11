@@ -2,8 +2,15 @@
 # 编译器和编译选项
 # ============================================================
 CXX      = /usr/local/opt/llvm/bin/clang++
+# 生成的 lex.yy.c / parser.tab.c 按 C 编译（parser 保持 C 风格，
+# 也让 yyerror/yyparse 等符号保持 C 链接）
+CC       = /usr/local/opt/llvm/bin/clang
+CFLAGS   = -std=c11 -g \
+           -I$(SRC_DIR) \
+           -I$(PARSER_DIR)
 CXXFLAGS = -std=c++23 -stdlib=libc++ -g -Wall -Wextra \
            -I$(SRC_DIR) \
+           -I$(PARSER_DIR) \
            -I../Debug/include \
            -I/usr/local/include \
            -I/usr/local/opt/readline/include \
@@ -65,9 +72,9 @@ RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
                  $(RELATION_DIR)/database_manager.cpp
 
 # Tests
-TESTS_SRCS     = $(TESTS_DIR)/test_ast.cpp \
-                 $(TESTS_DIR)/test_parser.cpp \
-                 $(TESTS_DIR)/test_statement.cpp \
+# parser 的测试已迁移到 tests/test_parser/（走 CMake/ctest），
+# 见下面的 sql-types/sql-parser 目标。
+TESTS_SRCS     = $(TESTS_DIR)/test_statement.cpp \
                  $(TESTS_DIR)/test_condition.cpp \
                  $(TESTS_DIR)/test_optimizer.cpp \
                  $(TESTS_DIR)/test_executor.cpp \
@@ -113,7 +120,7 @@ CORE_OBJS = $(PARSER_OBJS) $(STORAGE_OBJS) $(RELATION_OBJS) \
 # ============================================================
 # 测试目标
 # ============================================================
-TEST_TARGETS = test_ast test_parser test_statement test_condition \
+TEST_TARGETS = test_statement test_condition \
                test_optimizer test_executor test_middle \
                test_mock_engine test_leveldb_engine test_relation
 
@@ -153,10 +160,10 @@ $(BUILD_DIR)/parser.o: $(PARSER_DIR)/parser.cpp $(PARSER_HDR) | $(BUILD_DIR)
 
 # ---- Parser 的 .c（Flex/Bison 生成） ----
 $(BUILD_DIR)/lex.yy.o: $(PARSER_DIR)/lex.yy.c $(LEX_HDR) $(YACC_HDR) $(AST_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -Wno-unused-function -c $< -o $@
+	$(CC) $(CFLAGS) -Wno-unused-function -c $< -o $@
 
 $(BUILD_DIR)/parser.tab.o: $(PARSER_DIR)/parser.tab.c $(YACC_HDR) $(AST_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -Wno-unused-function -c $< -o $@
+	$(CC) $(CFLAGS) -Wno-unused-function -c $< -o $@
 
 # ---- Storage ----
 $(BUILD_DIR)/kv_factory.o: $(STORAGE_DIR)/kv_engine/kv_factory.cpp $(STORAGE_HDR) | $(BUILD_DIR)
@@ -194,12 +201,6 @@ $(BUILD_DIR)/condition.o : $(QUERY_DIR)/statement/condition.cpp $(QUERY_HDR) $(R
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ---- Tests ----
-$(BUILD_DIR)/test_ast.o: $(TESTS_DIR)/test_ast.cpp $(AST_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(BUILD_DIR)/test_parser.o: $(TESTS_DIR)/test_parser.cpp $(PARSER_HDR) $(YACC_HDR) $(LEX_HDR) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
 $(BUILD_DIR)/test_statement.o: $(TESTS_DIR)/test_statement.cpp $(AST_HDR) $(QUERY_DIR)/statement.h $(STORAGE_DIR)/kv_engine/kv_engine.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -237,12 +238,6 @@ $(TARGET): $(MAIN_OBJ) $(CORE_OBJS)
 # ============================================================
 # 链接测试程序
 # ============================================================
-test_ast: $(BUILD_DIR)/test_ast.o $(PARSER_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-test_parser: $(BUILD_DIR)/test_parser.o $(PARSER_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
 test_statement: $(BUILD_DIR)/test_statement.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -278,7 +273,7 @@ test: $(TEST_TARGETS)
 	@echo "║     ✅ 所有测试通过                    ║"
 	@echo "╚══════════════════════════════════════════╝"
 
-test-quick: test_parser test_statement test_relation
+test-quick: test_statement test_relation
 	@echo ""
 	@echo "✅ 快速测试完成"
 
@@ -296,7 +291,7 @@ $(foreach t,$(TEST_TARGETS),$(eval $(call TEST_RULE,$(t))))
 # ============================================================
 # sql_types 模块（新构建系统走 CMake，与上面的 legacy 目标解耦）
 # ============================================================
-.PHONY: sql-types sql-types-test
+.PHONY: sql-types sql-types-test parser-test cmake-test
 
 sql-types:
 	cmake --build $(BUILD_DIR) --target sql_types
@@ -304,6 +299,15 @@ sql-types:
 sql-types-test:
 	cmake --build $(BUILD_DIR) -j4
 	./$(BUILD_DIR)/run_tests/test_sql_types
+
+parser-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_parser
+
+# 跑 CMake/ctest 里的全部测试（sql_types + parser）
+cmake-test:
+	cmake --build $(BUILD_DIR) -j4
+	ctest --test-dir $(BUILD_DIR) --output-on-failure
 
 # ============================================================
 # 运行主程序

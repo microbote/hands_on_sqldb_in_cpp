@@ -181,17 +181,17 @@ class Value {
       return type_ == other.type_ && holds_int64() && other.holds_int64() &&
              std::get<int64_t>(storage_) == std::get<int64_t>(other.storage_);
     }
-    const auto lhs_class = get_type_class(type_);
-    const auto rhs_class = get_type_class(other.type_);
+    const auto lhs_class = get_type_family(type_);
+    const auto rhs_class = get_type_family(other.type_);
     if (lhs_class != rhs_class) {
       return false;
     }
     switch (lhs_class) {
-    case DataTypeClass::INTEGER:
+    case DataTypeFamily::INTEGER:
       return std::get<int64_t>(storage_) == std::get<int64_t>(other.storage_);
-    case DataTypeClass::BOOLEAN:
+    case DataTypeFamily::BOOLEAN:
       return std::get<bool>(storage_) == std::get<bool>(other.storage_);
-    case DataTypeClass::STRING:
+    case DataTypeFamily::STRING:
       return std::get<std::string>(storage_) ==
              std::get<std::string>(other.storage_);
     default:

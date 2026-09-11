@@ -1,19 +1,20 @@
 // parser.cpp
 #include "parser.h"
-#include "lex.yy.h"
-#include "parser.tab.h"
 #include <cstring>
-#include <iostream>
 #include <sstream>
 #include <vector>
 
-// Flex/Bison 外部声明
-extern int yyparse();
-extern void yy_delete_buffer(YY_BUFFER_STATE buffer);
-extern YY_BUFFER_STATE yy_scan_string(const char *str);
-extern ASTNode *g_parsed_ast;
-extern int yylineno;
+// 生成代码按 C 编译，因此把 flex/bison 的头文件整体放进 extern "C"
+// 用尖括号：只在 -I 路径（build/parser 或 parser/）里查找，
+// 不会被源码目录里可能残留的旧生成文件优先命中。
+extern "C" {
+#include <lex.yy.h>
+#include <parser.tab.h>
+// lex.yy.h 没有导出这个调试开关，但 lex.yy.c 里定义了它
 extern int yy_flex_debug;
+}
+
+// ast.cpp 里的调试开关（C++ 链接）
 extern int ast_debug;
 
 namespace parser {
@@ -37,19 +38,22 @@ extern "C" {
 #endif 
 void yyerror(const char *s) {
   if (g_parser_state.instance != nullptr) {
-    std::string error = s;
-    if (yylineno > 0) {
-      error = "line " + std::to_string(yylineno) + ": " + error;
+    // 只记录第一个错误：词法层报出的具体错误（例如整数字面量越界）
+    // 不应该被随后的 "syntax error" 覆盖。
+    if (!g_parser_state.has_error) {
+      std::string error = s;
+      if (yylineno > 0) {
+        error = "line " + std::to_string(yylineno) + ": " + error;
+      }
+      g_parser_state.instance->set_last_error(error);
+      g_parser_state.error_buffer = error;
+      g_parser_state.has_error = true;
     }
-    g_parser_state.instance->set_last_error(error);
-    g_parser_state.error_buffer = error;
-    g_parser_state.has_error = true;
-  }
 
-  // 调试模式下输出到 stderr
-  if ((g_parser_state.instance != nullptr) &&
-      g_parser_state.instance->debug_enabled()) {
-    std::cerr << "[Parser] " << s << '\n';
+    // 调试模式下走日志回调（默认无输出）
+    if (g_parser_state.instance->debug_enabled()) {
+      g_parser_state.instance->log_message(std::string("[Parser] ") + s);
+    }
   }
 }
 #ifdef __cplusplus
@@ -66,12 +70,12 @@ Parser::Parser() {
   g_parser_state.error_buffer.clear();
   g_parser_state.has_error = false;
 
-  std::cout << "[Parser] Created" << '\n';
+  log("[Parser] Created");
 }
 
 Parser::~Parser() {
-  std::cout << "[Parser] Destroyed (parses: " << parse_count_
-            << ", errors: " << error_count_ << ")" << '\n';
+  log("[Parser] Destroyed (parses: " + std::to_string(parse_count_) +
+      ", errors: " + std::to_string(error_count_) + ")");
 
   // 清理全局状态
   g_parser_state.instance = nullptr;
@@ -88,7 +92,7 @@ ParseResult Parser::parse(const std::string &sql) {
   parse_count_++;
 
   if (success && (raw_ast != nullptr)) {
-    std::cout << "[Parser] Parse successful" << '\n';
+    log("[Parser] Parse successful");
     return ParseResult(sql, raw_ast);
   }
   error_count_++;
@@ -98,7 +102,7 @@ ParseResult Parser::parse(const std::string &sql) {
   if (last_error_.empty()) {
     last_error_ = "Syntax error";
   }
-  std::cout << "[Parser] Parse failed: " << last_error_ << '\n';
+  log("[Parser] Parse failed: " + last_error_);
   return ParseResult(sql, ParseError(last_error_));
 }
 
@@ -126,13 +130,13 @@ std::vector<ParseResult> Parser::parse_multi(const std::string &sql) {
     if (!statement.empty()) {
       stmt_count++;
       std::string sql_stmt = statement + ";";
-      std::cout << "[Parser] Parsing statement [" << stmt_count << "]: "
-                << sql_stmt << '\n';
+      log("[Parser] Parsing statement [" + std::to_string(stmt_count) +
+          "]: " + sql_stmt);
       results.push_back(parse(sql_stmt));
     }
   }
 
-  std::cout << "[Parser] Parsed " << stmt_count << " statements" << '\n';
+  log("[Parser] Parsed " + std::to_string(stmt_count) + " statements");
   return results;
 }
 
@@ -145,7 +149,7 @@ bool Parser::do_parse(const std::string &sql, ASTNode **result) {
   *result = nullptr;
 
   if (debug_) {
-    std::cout << "[Parser] Parsing: " << sql << '\n';
+    log("[Parser] Parsing: " + sql);
     // 启用 Flex 调试输出
     yy_flex_debug = 1;
     ast_debug = 1;
@@ -180,7 +184,7 @@ bool Parser::do_parse(const std::string &sql, ASTNode **result) {
           "Syntax error (parse_result=" + std::to_string(parse_result) + ")";
     }
     if (debug_) {
-      std::cout << "[Parser] Parse failed: " << last_error_ << '\n';
+      log("[Parser] Parse failed: " + last_error_);
     }
     return false;
   }
@@ -190,8 +194,8 @@ bool Parser::do_parse(const std::string &sql, ASTNode **result) {
   g_parsed_ast = nullptr;
 
   if (debug_) {
-    std::cout << "[Parser] Parse succeeded, AST at " << (void *)*result
-              << '\n';
+    log("[Parser] Parse succeeded, AST at " +
+        std::to_string(reinterpret_cast<uintptr_t>(*result)));
   }
 
   return true;
