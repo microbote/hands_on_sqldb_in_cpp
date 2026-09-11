@@ -94,6 +94,28 @@ target_link_libraries(sql_types PUBLIC
 # 如果使用 C++23 和 libc++
 target_compile_features(sql_types PUBLIC cxx_std_23)
 
+# ============================================================
+# statement 静态库：AST -> sql::Query（StatementBuilder）
+#                     语义校验（StatementValidator）
+# ============================================================
+add_library(sql_statement STATIC
+    statement/stmt_builder.cpp
+    statement/stmt_validator.cpp
+)
+
+target_include_directories(sql_statement PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}            # "sql_types/query.h" ...
+    ${CMAKE_CURRENT_SOURCE_DIR}/sql_types  # "catalog.h" / "schema.h"
+    ${CMAKE_CURRENT_SOURCE_DIR}/statement  # "stmt_defs.h"
+)
+
+target_link_libraries(sql_statement PUBLIC
+    sql_types
+    sql_parser_lib
+)
+
+target_compile_features(sql_statement PUBLIC cxx_std_23)
+
 # 添加测试子目录
 enable_testing()
 add_subdirectory(tests)

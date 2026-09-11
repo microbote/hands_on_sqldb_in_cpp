@@ -13,6 +13,9 @@ class Catalog {
  public:
   virtual ~Catalog() = default;
 
+  virtual bool is_open() const = 0;
+  // 当前选中的数据库（未选中时返回空 Identifier）
+  virtual Identifier current_database() const = 0;
   // ---- 数据库元数据 ----
   virtual bool database_exists(const Identifier& db_name) const = 0;
   virtual std::vector<Identifier> list_databases() const = 0;

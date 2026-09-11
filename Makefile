@@ -72,10 +72,10 @@ RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
                  $(RELATION_DIR)/database_manager.cpp
 
 # Tests
-# parser 的测试已迁移到 tests/test_parser/（走 CMake/ctest），
-# 见下面的 sql-types/sql-parser 目标。
-TESTS_SRCS     = $(TESTS_DIR)/test_statement.cpp \
-                 $(TESTS_DIR)/test_condition.cpp \
+# parser 测试在 tests/test_parser/、statement 测试在 tests/test_statement/、
+# sql_types 测试在 tests/test_sql_types/，三者都走 CMake/ctest
+# （见下面的 sql-types-test / parser-test / statement-test / cmake-test 目标）。
+TESTS_SRCS     = $(TESTS_DIR)/test_condition.cpp \
                  $(TESTS_DIR)/test_optimizer.cpp \
                  $(TESTS_DIR)/test_executor.cpp \
                  $(TESTS_DIR)/test_middle.cpp \
@@ -120,7 +120,7 @@ CORE_OBJS = $(PARSER_OBJS) $(STORAGE_OBJS) $(RELATION_OBJS) \
 # ============================================================
 # 测试目标
 # ============================================================
-TEST_TARGETS = test_statement test_condition \
+TEST_TARGETS = test_condition \
                test_optimizer test_executor test_middle \
                test_mock_engine test_leveldb_engine test_relation
 
@@ -201,9 +201,6 @@ $(BUILD_DIR)/condition.o : $(QUERY_DIR)/statement/condition.cpp $(QUERY_HDR) $(R
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # ---- Tests ----
-$(BUILD_DIR)/test_statement.o: $(TESTS_DIR)/test_statement.cpp $(AST_HDR) $(QUERY_DIR)/statement.h $(STORAGE_DIR)/kv_engine/kv_engine.h | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
 $(BUILD_DIR)/test_optimizer.o: $(TESTS_DIR)/test_optimizer.cpp $(QUERY_DIR)/optimizer.h $(RELATION_DIR)/database_manager.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -238,9 +235,6 @@ $(TARGET): $(MAIN_OBJ) $(CORE_OBJS)
 # ============================================================
 # 链接测试程序
 # ============================================================
-test_statement: $(BUILD_DIR)/test_statement.o $(CORE_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
 test_condition: $(BUILD_DIR)/test_condition.o $(CORE_OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -273,7 +267,7 @@ test: $(TEST_TARGETS)
 	@echo "║     ✅ 所有测试通过                    ║"
 	@echo "╚══════════════════════════════════════════╝"
 
-test-quick: test_statement test_relation
+test-quick: test_relation
 	@echo ""
 	@echo "✅ 快速测试完成"
 
@@ -291,7 +285,7 @@ $(foreach t,$(TEST_TARGETS),$(eval $(call TEST_RULE,$(t))))
 # ============================================================
 # sql_types 模块（新构建系统走 CMake，与上面的 legacy 目标解耦）
 # ============================================================
-.PHONY: sql-types sql-types-test parser-test cmake-test
+.PHONY: sql-types sql-types-test parser-test statement-test cmake-test
 
 sql-types:
 	cmake --build $(BUILD_DIR) --target sql_types
@@ -303,6 +297,10 @@ sql-types-test:
 parser-test:
 	cmake --build $(BUILD_DIR) -j4
 	./$(BUILD_DIR)/run_tests/test_parser
+
+statement-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_statement
 
 # 跑 CMake/ctest 里的全部测试（sql_types + parser）
 cmake-test:

@@ -14,6 +14,9 @@ namespace {
 
 class MemoryCatalog : public Catalog {
  public:
+  bool is_open() const override { return !current_db_.empty(); }
+  Identifier current_database() const override { return current_db_; }
+
   bool database_exists(const Identifier& db_name) const override {
     return databases_.find(db_name) != databases_.end();
   }
@@ -60,7 +63,11 @@ class MemoryCatalog : public Catalog {
   }
 
   bool create_database(const Identifier& db_name) override {
-    return databases_.emplace(db_name, TableMap{}).second;
+    const bool created = databases_.emplace(db_name, TableMap{}).second;
+    if (created && current_db_.empty()) {
+      current_db_ = db_name;   // 简化：建库即进入该库
+    }
+    return created;
   }
 
   bool drop_database(const Identifier& db_name) override {
@@ -88,6 +95,7 @@ class MemoryCatalog : public Catalog {
  private:
   using TableMap = std::unordered_map<Identifier, TableSchema, IdentifierHash>;
   std::unordered_map<Identifier, TableMap, IdentifierHash> databases_;
+  Identifier current_db_;
 };
 
 TableSchema make_users() {

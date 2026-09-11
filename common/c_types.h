@@ -27,7 +27,11 @@ typedef enum {
   OP_IS_NULL,
   OP_IS_NOT_NULL,
   OP_LIKE,
-  OP_UNKNOWN
+  OP_UNKNOWN,
+  /* 追加在末尾：保持既有枚举值不变。
+     parser 目前把 "NOT LIKE" 解析成 NOT(LIKE)，这个值主要供
+     sql_types::CompareOp::NOT_LIKE 的桥接使用。 */
+  OP_NOT_LIKE
 } COpType;
 
 static inline const char *op_to_string(COpType op) {
@@ -64,6 +68,8 @@ static inline const char *op_to_string(COpType op) {
     return "IS NOT NULL";
   case OP_LIKE:
     return "LIKE";
+  case OP_NOT_LIKE:
+    return "NOT LIKE";
   default:
     return "UNKNOWN";
   }

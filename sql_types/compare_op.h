@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+#include "common/c_types.h"
+
 namespace sql {
 
 // ============================================================
@@ -77,5 +79,64 @@ CompareOp string_to_compare_op(const std::string& str);
 
 // 翻转（NOT 下推用）：EQ ↔ NE, GT ↔ LE, GE ↔ LT
 CompareOp flip_compare_op(CompareOp op);
+
+// ============================================================
+// C-API 互操作（与 DataType ↔ CDataType 对应）
+// AST/parser 用的是 COpType，进入 sql_types 之前必须转换到这里，
+// 不要在 statement 层再写第三套字符串映射。
+// ============================================================
+inline COpType to_c(CompareOp op) {
+  switch (op) {
+  case CompareOp::EQ:
+    return OP_EQ;
+  case CompareOp::NE:
+    return OP_NE;
+  case CompareOp::GT:
+    return OP_GT;
+  case CompareOp::GE:
+    return OP_GE;
+  case CompareOp::LT:
+    return OP_LT;
+  case CompareOp::LE:
+    return OP_LE;
+  case CompareOp::LIKE:
+    return OP_LIKE;
+  case CompareOp::NOT_LIKE:
+    return OP_NOT_LIKE;
+  case CompareOp::IS_NULL:
+    return OP_IS_NULL;
+  case CompareOp::IS_NOT_NULL:
+    return OP_IS_NOT_NULL;
+  default:
+    return OP_UNKNOWN;
+  }
+}
+
+inline CompareOp from_c(::COpType op) {
+  switch (op) {
+  case OP_EQ:
+    return CompareOp::EQ;
+  case OP_NE:
+    return CompareOp::NE;
+  case OP_GT:
+    return CompareOp::GT;
+  case OP_GE:
+    return CompareOp::GE;
+  case OP_LT:
+    return CompareOp::LT;
+  case OP_LE:
+    return CompareOp::LE;
+  case OP_LIKE:
+    return CompareOp::LIKE;
+  case OP_NOT_LIKE:
+    return CompareOp::NOT_LIKE;
+  case OP_IS_NULL:
+    return CompareOp::IS_NULL;
+  case OP_IS_NOT_NULL:
+    return CompareOp::IS_NOT_NULL;
+  default:
+    return CompareOp::UNKNOWN;
+  }
+}
 
 }  // namespace sql
