@@ -14,6 +14,8 @@
 #include <string>
 #include <utility>
 
+#include "common/source_span.h"
+
 namespace stmt {
 
 enum class StmtErrorCode : uint8_t {
@@ -98,10 +100,14 @@ inline const char *stmt_error_message(StmtErrorCode err) {
 struct StmtError {
   StmtErrorCode code = StmtErrorCode::OK;
   std::string message;
+  // 出错位置（来自 AST 节点；未知时为全 0，见 sspan_valid()）
+  SSpan span = sspan_unknown();
 
   StmtError() = default;
   StmtError(StmtErrorCode c, std::string msg)
       : code(c), message(std::move(msg)) {}
+  StmtError(StmtErrorCode c, std::string msg, SSpan where)
+      : code(c), message(std::move(msg)), span(where) {}
 
   bool ok() const { return code == StmtErrorCode::OK; }
   explicit operator bool() const { return ok(); }
@@ -113,10 +119,19 @@ struct StmtError {
   }
 
   std::string to_string() const {
-    if (!message.empty()) {
-      return message;
+    const std::string base =
+        message.empty() ? std::string(stmt_error_message(code)) : message;
+    if (!sspan_valid(span)) {
+      return base;
     }
-    return stmt_error_message(code);
+    return base + " (line " + std::to_string(span.begin_line) + ":" +
+           std::to_string(span.begin_column) + ")";
+  }
+
+  // 补上位置（便于调用方在拿到错误后再附加上下文）
+  StmtError &with_span(SSpan where) {
+    span = where;
+    return *this;
   }
 };
 

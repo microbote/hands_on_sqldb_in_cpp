@@ -43,6 +43,11 @@ ASTNode *g_parsed_ast = NULL;
 /* ============================================================
    基础分配函数
    ============================================================ */
+/* 安全 strdup：允许传入 NULL（构造器不应当在 nullptr 名字上崩溃） */
+static char *ast_strdup(const char *text) {
+  return (text != NULL) ? strdup(text) : NULL;
+}
+
 ASTNode *ast_alloc_node(NodeType type, size_t data_size) {
   size_t total_size = AST_NODE_SIZE(data_size);
   ASTNode *node = (ASTNode *)calloc(1, total_size);
@@ -51,7 +56,16 @@ ASTNode *ast_alloc_node(NodeType type, size_t data_size) {
   }
   node->type = type;
   node->next = NULL;
+  node->span = sspan_unknown();
   return node;
+}
+
+void ast_set_span(ASTNode *node, uint32_t begin_line, uint32_t begin_column,
+                  uint32_t end_line, uint32_t end_column) {
+  if (node == nullptr) {
+    return;
+  }
+  node->span = sspan_make(begin_line, begin_column, end_line, end_column);
 }
 
 /* ============================================================
@@ -185,7 +199,7 @@ ASTNode *make_string_node(const char *str) {
   if (data == nullptr) {
     return NULL;
   }
-  data->value = strdup(str);
+  data->value = ast_strdup(str);
   return node;
 }
 
@@ -215,7 +229,7 @@ ASTNode *make_ident_node(const char *name) {
   if (data == nullptr) {
     return NULL;
   }
-  data->name = strdup(name);
+  data->name = ast_strdup(name);
   return node;
 }
 
@@ -247,7 +261,7 @@ ASTNode *make_select_node(const char *table, ASTNode *columns,
   if (data == nullptr) {
     return NULL;
   }
-  data->table = strdup(table);
+  data->table = ast_strdup(table);
   data->columns = columns;
   data->condition = condition;
   data->order_by = order_by;
@@ -320,7 +334,7 @@ ASTNode *make_insert_node(const char *table, ASTNode *columns,
     free(node);
     return NULL;
   }
-  data->table = strdup(table);
+  data->table = ast_strdup(table);
   data->columns = columns;
   data->values = values;
   return node;
@@ -370,7 +384,7 @@ ASTNode *make_update_node(const char *table, ASTNode *assignments,
     free(node);
     return NULL;
   }
-  data->table = strdup(table);
+  data->table = ast_strdup(table);
   data->assignments = assignments;
   data->condition = condition;
   return node;
@@ -418,7 +432,7 @@ ASTNode *make_delete_node(const char *table, ASTNode *condition) {
     free(node);
     return NULL;
   }
-  data->table = strdup(table);
+  data->table = ast_strdup(table);
   data->condition = condition;
   return node;
 }
@@ -458,7 +472,7 @@ ASTNode *make_assignment_node(const char *column, ASTNode *value) {
     free(node);
     return NULL;
   }
-  data->column = strdup(column);
+  data->column = ast_strdup(column);
   data->value = value;
   return node;
 }
@@ -500,7 +514,7 @@ ASTNode *make_compare_node(const char *column, COpType optype, ASTNode *right) {
     free(node);
     return NULL;
   }
-  data->column = strdup(column);
+  data->column = ast_strdup(column);
   data->op = optype;
   data->right = right;
   return node;
@@ -543,7 +557,7 @@ ASTNode *make_in_node(const char *column, ASTNode *values) {
     free(node);
     return NULL;
   }
-  data->column = strdup(column);
+  data->column = ast_strdup(column);
   data->values = values;
   data->excluded = 0;
   return node;
@@ -740,7 +754,7 @@ ASTNode *make_order_node(const char *column, COpType direction) {
     free(node);
     return NULL;
   }
-  data->column = strdup(column);
+  data->column = ast_strdup(column);
   data->direction = direction;
   return node;
 }
@@ -799,7 +813,7 @@ ASTNode *make_use_node(const char *db_name) {
   if (data == nullptr) {
     return NULL;
   }
-  data->db_name = strdup(db_name);
+  data->db_name = ast_strdup(db_name);
   return node;
 }
 
@@ -829,7 +843,7 @@ ASTNode *make_create_database_node(const char *db_name) {
   if (data == nullptr) {
     return NULL;
   }
-  data->db_name = strdup(db_name);
+  data->db_name = ast_strdup(db_name);
   return node;
 }
 
@@ -859,7 +873,7 @@ ASTNode *make_drop_database_node(const char *db_name) {
   if (data == nullptr) {
     return NULL;
   }
-  data->db_name = strdup(db_name);
+  data->db_name = ast_strdup(db_name);
   return node;
 }
 
@@ -890,7 +904,7 @@ ASTNode *make_create_table_node(const char *table_name, ASTNode *columns) {
     free(node);
     return NULL;
   }
-  data->table_name = strdup(table_name);
+  data->table_name = ast_strdup(table_name);
   data->columns = columns;
   return node;
 }
@@ -929,7 +943,7 @@ ASTNode *make_drop_table_node(const char *table_name) {
     free(node);
     return NULL;
   }
-  data->table_name = strdup(table_name);
+  data->table_name = ast_strdup(table_name);
   return node;
 }
 
@@ -962,7 +976,7 @@ ASTNode *make_column_def_node(const char *name, CDataType data_type,
     free(node);
     return NULL;
   }
-  data->name = strdup(name);
+  data->name = ast_strdup(name);
   data->data_type = data_type;
   data->length = length;
   data->is_primary_key = is_primary_key;

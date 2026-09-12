@@ -34,7 +34,7 @@ using Key = std::string;
 //   因此不要把 operator== 当作 SQL 的 "="。
 // ============================================================
 class Value {
- public:
+public:
   // ----- 构造 -----
   Value() noexcept : type_(DataType::NULL_TYPE), storage_(std::monostate{}) {}
 
@@ -45,22 +45,20 @@ class Value {
 
   Value(bool v) noexcept : type_(DataType::BOOLEAN), storage_(v) {}
 
-  Value(const std::string& v)
+  Value(const std::string &v)
       : type_(DataType::VARCHAR), storage_(std::string(v)) {}
 
-  Value(std::string&& v)
-      : type_(DataType::VARCHAR), storage_(std::move(v)) {}
+  Value(std::string &&v) : type_(DataType::VARCHAR), storage_(std::move(v)) {}
 
-  Value(const char* v)
-      : type_(DataType::VARCHAR),
-        storage_(std::string(v != nullptr ? v : "")) {}
+  Value(const char *v)
+      : type_(DataType::VARCHAR), storage_(std::string(v != nullptr ? v : "")) {
+  }
 
   Value(std::string_view v)
       : type_(DataType::VARCHAR), storage_(std::string(v)) {}
 
   // 显式指定逻辑类型的字符串（VARCHAR / TEXT）
-  Value(std::string v, DataType type)
-      : type_(type), storage_(std::move(v)) {
+  Value(std::string v, DataType type) : type_(type), storage_(std::move(v)) {
     assert(sql::is_string(type_));
   }
 
@@ -71,10 +69,10 @@ class Value {
   }
 
   // ----- 拷贝/移动：variant 自动处理，无需手写 -----
-  Value(const Value&) = default;
-  Value(Value&&) noexcept = default;
-  Value& operator=(const Value&) = default;
-  Value& operator=(Value&&) noexcept = default;
+  Value(const Value &) = default;
+  Value(Value &&) noexcept = default;
+  Value &operator=(const Value &) = default;
+  Value &operator=(Value &&) noexcept = default;
   ~Value() = default;
 
   // ----- 类型检查 -----
@@ -104,14 +102,14 @@ class Value {
     return std::get<int64_t>(storage_);
   }
 
-  const std::string& as_str() const {
+  const std::string &as_str() const {
     if (!is_string()) {
       throw std::runtime_error("Value is not a string");
     }
     return std::get<std::string>(storage_);
   }
 
-  const std::string& as_string() const { return as_str(); }
+  const std::string &as_string() const { return as_str(); }
 
   bool as_bool() const {
     if (!is_bool()) {
@@ -130,7 +128,7 @@ class Value {
                        : std::string_view();
   }
 
-  const std::string* get_str_ptr() const noexcept {
+  const std::string *get_str_ptr() const noexcept {
     return is_string() ? &std::get<std::string>(storage_) : nullptr;
   }
 
@@ -150,7 +148,7 @@ class Value {
     if (is_string()) {
       return !std::get<std::string>(storage_).empty();
     }
-    return false;  // NULL
+    return false; // NULL
   }
 
   // ----- 类型判断模板 -----
@@ -172,7 +170,7 @@ class Value {
   // ----- 相等（C++ 容器语义；不是 SQL 的 =）-----
   // 同一 family 内相等：所有整型互通、VARCHAR/TEXT 互通。
   // NULL == NULL 为 true（去重/容器需要），SQL 层由 sql_compare 判定 UNKNOWN。
-  bool operator==(const Value& other) const {
+  bool operator==(const Value &other) const {
     if (is_null() || other.is_null()) {
       return is_null() && other.is_null();
     }
@@ -199,13 +197,13 @@ class Value {
     }
   }
 
-  bool operator!=(const Value& other) const { return !(*this == other); }
+  bool operator!=(const Value &other) const { return !(*this == other); }
 
   // ----- 转换为字符串 -----
   std::string to_string() const;
 
   // ----- 解析字符串为值 -----
-  static Value from_string(const std::string& str, DataType type);
+  static Value from_string(const std::string &str, DataType type);
 
   // ----- 静态工厂 -----
   static Value null() { return Value(); }
@@ -214,10 +212,10 @@ class Value {
   static Value bigint(int64_t v) { return Value(v, DataType::BIGINT); }
   static Value tinyint(int64_t v) { return Value(v, DataType::TINYINT); }
   static Value smallint(int64_t v) { return Value(v, DataType::SMALLINT); }
-  static Value text(const std::string& v) {
+  static Value text(const std::string &v) {
     return Value(std::string(v), DataType::TEXT);
   }
-  static Value varchar(const std::string& v) { return Value(v); }
+  static Value varchar(const std::string &v) { return Value(v); }
   static Value date(int64_t days) { return Value(days, DataType::DATE); }
   static Value time(int64_t seconds) { return Value(seconds, DataType::TIME); }
   static Value datetime(int64_t seconds) {
@@ -254,12 +252,18 @@ class Value {
   // 带列类型的编码：存储层必须用这个版本（NULL 用它所属的列类型编码）。
   Key to_key(DataType column_type) const;
 
-  static Value from_key(const Key& key, DataType type);
+  static Value from_key(const Key &key, DataType type);
 
   static Key min_key_for_type(DataType type);
   static Key upper_key_for_type(DataType type);
 
- private:
+  // 该类型的 NULL key（= 族最小值，也是 -∞ 的物理表示）
+  static Key null_key_for_type(DataType type);
+
+  // "第一个非 NULL 值"的前缀 key（[tag][0x01]），用于排除 NULL 的下界
+  static Key first_value_key_for_type(DataType type);
+
+private:
   // 存储里是否真的持有 int64（整型或时间）
   bool holds_int64() const noexcept {
     return is_integer(type_) || sql::is_temporal(type_);
@@ -275,21 +279,21 @@ class Value {
 
 // 哈希支持
 struct ValueHash {
-  size_t operator()(const Value& v) const noexcept { return v.hash(); }
+  size_t operator()(const Value &v) const noexcept { return v.hash(); }
 };
 
 // key 空间的全序比较（存储层语义）：NULL 最小，其余按编码字节序。
 // Value 本身不再重载 < / > 等操作符，避免把存储序误当作 SQL 比较。
 struct ValueKeyLess {
-  bool operator()(const Value& a, const Value& b) const {
+  bool operator()(const Value &a, const Value &b) const {
     return a.to_key() < b.to_key();
   }
 };
 
 struct ValueKeyEqual {
-  bool operator()(const Value& a, const Value& b) const {
+  bool operator()(const Value &a, const Value &b) const {
     return a.to_key() == b.to_key();
   }
 };
 
-}  // namespace sql
+} // namespace sql

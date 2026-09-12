@@ -31,38 +31,44 @@ public:
   ~StatementBuilder() = default;
 
   // AST -> Query；失败时错误值里同时带错误码与可读信息
-  std::expected<sql::Query, StmtError> build(ASTNode *ast);
+  std::expected<sql::Query, StmtError> build(const ASTNode *ast);
 
 private:
   // ---- 各语句类型 ----
-  std::expected<sql::Query, StmtError> build_stmt_use(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_select(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_insert(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_update(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_delete(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_create_database(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_drop_database(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_create_table(ASTNode *ast);
-  std::expected<sql::Query, StmtError> build_stmt_drop_table(ASTNode *ast);
+  std::expected<sql::Query, StmtError> build_stmt_use(const ASTNode *ast);
+  std::expected<sql::Query, StmtError> build_stmt_select(const ASTNode *ast);
+  std::expected<sql::Query, StmtError> build_stmt_insert(const ASTNode *ast);
+  std::expected<sql::Query, StmtError> build_stmt_update(const ASTNode *ast);
+  std::expected<sql::Query, StmtError> build_stmt_delete(const ASTNode *ast);
+  std::expected<sql::Query, StmtError>
+  build_stmt_create_database(const ASTNode *ast);
+  std::expected<sql::Query, StmtError>
+  build_stmt_drop_database(const ASTNode *ast);
+  std::expected<sql::Query, StmtError>
+  build_stmt_create_table(const ASTNode *ast);
+  std::expected<sql::Query, StmtError>
+  build_stmt_drop_table(const ASTNode *ast);
 
   // ---- 片段转换 ----
-  std::expected<sql::Value, StmtError> build_value(ASTNode *ast);
+  std::expected<sql::Value, StmtError> build_value(const ASTNode *ast);
   std::expected<std::vector<sql::Value>, StmtError>
-  build_value_list(ASTNode *ast);
+  build_value_list(const ASTNode *ast);
   std::expected<std::vector<sql::Identifier>, StmtError>
-  build_column_list(ASTNode *ast);
+  build_column_list(const ASTNode *ast);
   std::expected<std::vector<sql::ColumnRef>, StmtError>
-  build_select_columns(ASTNode *ast);
+  build_select_columns(const ASTNode *ast);
   std::expected<std::vector<sql::OrderByItem>, StmtError>
-  build_order_by(ASTNode *ast);
-  std::expected<sql::LimitClause, StmtError> build_limit(ASTNode *ast);
-  std::expected<sql::ConditionPtr, StmtError> build_condition(ASTNode *ast);
+  build_order_by(const ASTNode *ast);
+  std::expected<sql::LimitClause, StmtError> build_limit(const ASTNode *ast);
+  std::expected<sql::ConditionPtr, StmtError>
+  build_condition(const ASTNode *ast);
   std::expected<std::vector<sql::ColumnDef>, StmtError>
-  build_column_defs(ASTNode *ast);
+  build_column_defs(const ASTNode *ast);
 
   // ---- 工具 ----
   // 构造错误值（不修改对象状态）
-  static StmtError make_error(StmtErrorCode code, std::string message);
+  static StmtError make_error(StmtErrorCode code, std::string message,
+                              SSpan span = sspan_unknown());
   static bool is_list_node(const ASTNode *ast);
   static const ASTNodeList *as_list(const ASTNode *ast);
 };

@@ -32,6 +32,8 @@ static int sql_limit_to_int(int64_t value, int *out) {
 %debug
 %verbose
 %define parse.error detailed
+/* 打开位置跟踪：语法动作里可以用 @$/@1 拿到 token/规则的起止行列 */
+%locations
 
 
 /* yyltype, yylval */
@@ -116,18 +118,26 @@ statement:
    DDL: DATABASE
    ============================================================ */
 use_stmt:
-    TOK_USE TOK_IDENT { $$ = make_use_node($2); }
+    TOK_USE TOK_IDENT {
+        $$ = make_use_node($2);
+        AST_SET_SPAN($$, @$);
+        ((DatabaseNode*)$$->data)->db_span = sspan_make(@2.first_line, @2.first_column, @2.last_line, @2.last_column);
+    }
     ;
 
 create_db_stmt:
     TOK_CREATE TOK_DATABASE TOK_IDENT {
         $$ = make_create_database_node($3);
+        AST_SET_SPAN($$, @$);
+        ((DatabaseNode*)$$->data)->db_span = sspan_make(@3.first_line, @3.first_column, @3.last_line, @3.last_column);
     }
     ;
 
 drop_db_stmt:
     TOK_DROP TOK_DATABASE TOK_IDENT {
         $$ = make_drop_database_node($3);
+        AST_SET_SPAN($$, @$);
+        ((DatabaseNode*)$$->data)->db_span = sspan_make(@3.first_line, @3.first_column, @3.last_line, @3.last_column);
     }
     ;
 
@@ -137,12 +147,16 @@ drop_db_stmt:
 create_table_stmt:
     TOK_CREATE TOK_TABLE TOK_IDENT '(' column_def_list ')' {
         $$ = make_create_table_node($3, $5);
+        AST_SET_SPAN($$, @$);
+        ((CreateTableNode*)$$->data)->table_span = sspan_make(@3.first_line, @3.first_column, @3.last_line, @3.last_column);
     }
     ;
 
 drop_table_stmt:
     TOK_DROP TOK_TABLE TOK_IDENT {
         $$ = make_drop_table_node($3);
+        AST_SET_SPAN($$, @$);
+        ((DropTableNode*)$$->data)->table_span = sspan_make(@3.first_line, @3.first_column, @3.last_line, @3.last_column);
     }
     ;
 
@@ -157,6 +171,7 @@ column_def_list:
 column_def:
     TOK_IDENT data_type opt_primary_key opt_nullable {
         $$ = make_column_def_node($1, $2.type, $2.length, $3, $4);
+        AST_SET_SPAN($$, @$);
     }
     ;
 
@@ -217,11 +232,17 @@ select_stmt:
     TOK_SELECT select_list TOK_FROM TOK_IDENT opt_where opt_order_by opt_limit
     {
         $$ = make_select_node($4, $2, $5, $6, $7);
+        AST_SET_SPAN($$, @$);
+        ((SelectNode*)$$->data)->table_span = sspan_make(@4.first_line, @4.first_column, @4.last_line, @4.last_column);
     }
     ;
 
 select_list:
-    '*'                          { $$ = create_list(make_ident_node("*"), LIST_COLUMN); }
+    '*'                          {
+        ASTNode* item = make_ident_node("*");
+        AST_SET_SPAN(item, @1);
+        $$ = create_list(item, LIST_COLUMN);
+    }
     | column_name_list           { $$ = $1; }
     ;
 
@@ -229,8 +250,16 @@ select_list:
    列名列表
    ============================================================ */
 column_name_list:
-    TOK_IDENT                    { $$ = create_list(make_ident_node($1), LIST_COLUMN); }
-    | column_name_list ',' TOK_IDENT { $$ = append_to_list($1, make_ident_node($3)); }
+    TOK_IDENT {
+        ASTNode* item = make_ident_node($1);
+        AST_SET_SPAN(item, @1);
+        $$ = create_list(item, LIST_COLUMN);
+    }
+    | column_name_list ',' TOK_IDENT {
+        ASTNode* item = make_ident_node($3);
+        AST_SET_SPAN(item, @3);
+        $$ = append_to_list($1, item);
+    }
     ;
 
 
@@ -241,6 +270,8 @@ insert_stmt:
     TOK_INSERT TOK_INTO TOK_IDENT insert_columns TOK_VALUES insert_values
     {
         $$ = make_insert_node($3, $4, $6);
+        AST_SET_SPAN($$, @$);
+        ((InsertNode*)$$->data)->table_span = sspan_make(@3.first_line, @3.first_column, @3.last_line, @3.last_column);
     }
     ;
 
@@ -262,12 +293,12 @@ value_item_list:
     ;
 
 value_item:
-    TOK_NUMBER                   { $$ = make_number_node($1); }
-    | '-' TOK_NUMBER             { $$ = make_number_node(-$2); }
-    | TOK_STRING                 { $$ = make_string_node($1); }
-    | TOK_NULL                   { $$ = make_literal_node(LITERAL_NULL); }
-    | TOK_TRUE                   { $$ = make_literal_node(LITERAL_TRUE); }
-    | TOK_FALSE                  { $$ = make_literal_node(LITERAL_FALSE); }
+    TOK_NUMBER                   { $$ = make_number_node($1); AST_SET_SPAN($$, @$); }
+    | '-' TOK_NUMBER             { $$ = make_number_node(-$2); AST_SET_SPAN($$, @$); }
+    | TOK_STRING                 { $$ = make_string_node($1); AST_SET_SPAN($$, @$); }
+    | TOK_NULL                   { $$ = make_literal_node(LITERAL_NULL); AST_SET_SPAN($$, @$); }
+    | TOK_TRUE                   { $$ = make_literal_node(LITERAL_TRUE); AST_SET_SPAN($$, @$); }
+    | TOK_FALSE                  { $$ = make_literal_node(LITERAL_FALSE); AST_SET_SPAN($$, @$); }
     ;
 
 
@@ -275,6 +306,8 @@ update_stmt:
     TOK_UPDATE TOK_IDENT TOK_SET assignment_list opt_where
     {
         $$ = make_update_node($2, $4, $5);
+        AST_SET_SPAN($$, @$);
+        ((UpdateNode*)$$->data)->table_span = sspan_make(@2.first_line, @2.first_column, @2.last_line, @2.last_column);
     }
     ;
 
@@ -284,7 +317,10 @@ assignment_list:
     ;
 
 assignment:
-    TOK_IDENT TOK_EQ value_item    { $$ = make_assignment_node($1, $3); }
+    TOK_IDENT TOK_EQ value_item    {
+        $$ = make_assignment_node($1, $3);
+        AST_SET_SPAN($$, @$);
+    }
     ;
 
 
@@ -292,6 +328,8 @@ delete_stmt:
     TOK_DELETE TOK_FROM TOK_IDENT opt_where
     {
         $$ = make_delete_node($3, $4);
+        AST_SET_SPAN($$, @$);
+        ((DeleteNode*)$$->data)->table_span = sspan_make(@3.first_line, @3.first_column, @3.last_line, @3.last_column);
     }
     ;
 
@@ -305,24 +343,54 @@ opt_where:
 
 condition_expr:
     condition_term               { $$ = $1; }
-    | condition_expr TOK_OR condition_term { $$ = make_binary_node($1, OP_OR, $3); }
+    | condition_expr TOK_OR condition_term {
+        $$ = make_binary_node($1, OP_OR, $3);
+        AST_SET_SPAN($$, @$);
+    }
     ;
 
 condition_term:
     condition_factor             { $$ = $1; }
-    | condition_term TOK_AND condition_factor { $$ = make_binary_node($1, OP_AND, $3); }
+    | condition_term TOK_AND condition_factor {
+        $$ = make_binary_node($1, OP_AND, $3);
+        AST_SET_SPAN($$, @$);
+    }
     ;
 
 condition_factor:
-    TOK_IDENT compare_op value_item           { $$ = make_compare_node($1, $2, $3); }
-    | TOK_IDENT TOK_IN in_values         { $$ = make_in_node($1, $3); }
-    | TOK_IDENT TOK_NOT TOK_IN in_values { $$ = make_not_node(make_in_node($1, $4)); }
-    | TOK_IDENT TOK_LIKE TOK_STRING { $$ = make_compare_node($1, OP_LIKE, make_string_node($3));}
-    | TOK_IDENT TOK_NOT TOK_LIKE TOK_STRING { $$ = make_not_node(make_compare_node($1, OP_LIKE, make_string_node($4)));}
-    | TOK_IDENT TOK_IS TOK_NULL { $$ = make_compare_node($1, OP_IS_NULL, NULL); }
-    | TOK_IDENT TOK_IS TOK_NOT TOK_NULL { $$ = make_compare_node($1, OP_IS_NOT_NULL, NULL);}
+    TOK_IDENT compare_op value_item {
+        $$ = make_compare_node($1, $2, $3);
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT TOK_IN in_values {
+        $$ = make_in_node($1, $3);
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT TOK_NOT TOK_IN in_values {
+        $$ = make_not_node(make_in_node($1, $4));
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT TOK_LIKE TOK_STRING {
+        $$ = make_compare_node($1, OP_LIKE, make_string_node($3));
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT TOK_NOT TOK_LIKE TOK_STRING {
+        $$ = make_not_node(make_compare_node($1, OP_LIKE, make_string_node($4)));
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT TOK_IS TOK_NULL {
+        $$ = make_compare_node($1, OP_IS_NULL, NULL);
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT TOK_IS TOK_NOT TOK_NULL {
+        $$ = make_compare_node($1, OP_IS_NOT_NULL, NULL);
+        AST_SET_SPAN($$, @$);
+    }
     | '(' condition_expr ')' { $$ = $2; }
-    | TOK_NOT condition_factor { $$ = make_not_node($2); }
+    | TOK_NOT condition_factor {
+        $$ = make_not_node($2);
+        AST_SET_SPAN($$, @1);
+    }
     ;
 
 /* ============================================================
@@ -351,8 +419,14 @@ order_list:
     ;
 
 order_item:
-    TOK_IDENT                   { $$ = make_order_node($1, OP_ASC); }
-    | TOK_IDENT order_direction { $$ = make_order_node($1, $2); }
+    TOK_IDENT                   {
+        $$ = make_order_node($1, OP_ASC);
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_IDENT order_direction {
+        $$ = make_order_node($1, $2);
+        AST_SET_SPAN($$, @$);
+    }
     ;
 
 order_direction:

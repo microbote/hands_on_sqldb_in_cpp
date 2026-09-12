@@ -12,6 +12,8 @@ extern "C" {
 #include <parser.tab.h>
 // lex.yy.h 没有导出这个调试开关，但 lex.yy.c 里定义了它
 extern int yy_flex_debug;
+// 在 sql.l 里实现：重置行列计数（每次解析前调用）
+void lex_reset_location(void);
 }
 
 // ast.cpp 里的调试开关（C++ 链接）
@@ -158,8 +160,8 @@ bool Parser::do_parse(const std::string &sql, ASTNode **result) {
     ast_debug = 0;
   }
 
-  // 重置行号
-  yylineno = 1;
+  // 重置位置跟踪（行号 + 列号），供 Bison 的 @$/@n 使用
+  lex_reset_location();
 
   // 扫描 SQL 字符串
   YY_BUFFER_STATE buffer = yy_scan_string(sql.c_str());

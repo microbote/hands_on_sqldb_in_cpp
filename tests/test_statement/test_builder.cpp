@@ -249,3 +249,22 @@ TEST(Builder, BuilderDoesNotTakeAstOwnership) {
   CHECK(parsed.ast.get() != nullptr);
   CHECK(parsed.ast->type == NODE_SELECT);
 }
+
+TEST(Builder, AcceptsConstAst) {
+  // builder 只读 AST：接口是 const ASTNode*，调用方保留所有权
+  parser::Parser parser;
+  auto parsed = parser.parse("SELECT id FROM users WHERE age > 18;");
+  CHECK(parsed.success);
+  if (!parsed.success) {
+    return;
+  }
+  const ASTNode *ast = parsed.ast.get();
+  stmt::StatementBuilder builder;
+  auto built = builder.build(ast);
+  CHECK(built.has_value());
+  if (built.has_value()) {
+    CHECK(built->is_select());
+  }
+  // 传 const 指针不会改变 AST：再读一次仍然有效
+  CHECK(ast->type == NODE_SELECT);
+}

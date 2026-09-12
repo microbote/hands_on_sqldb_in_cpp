@@ -4,11 +4,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <initializer_list>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <iterator>
 
 #include "key_range.h"
 #include "value.h"
@@ -25,7 +25,7 @@ namespace sql {
 //   - 拆分为多个 KeyRange
 // ============================================================
 class KeySet {
- public:
+public:
   // ============================================================
   // 构造
   // ============================================================
@@ -33,15 +33,15 @@ class KeySet {
 
   KeySet(std::initializer_list<sql::Value> init) : points_(init) {}
 
-  explicit KeySet(const std::vector<sql::Value>& points) : points_(points) {}
+  explicit KeySet(const std::vector<sql::Value> &points) : points_(points) {}
 
-  explicit KeySet(std::vector<sql::Value>&& points)
+  explicit KeySet(std::vector<sql::Value> &&points)
       : points_(std::move(points)) {}
 
   // ============================================================
   // 访问器
   // ============================================================
-  const std::vector<sql::Value>& points() const {
+  const std::vector<sql::Value> &points() const {
     ensure_sorted();
     return points_;
   }
@@ -49,7 +49,7 @@ class KeySet {
   // 非 const 版本会暴露可变引用：无法知道调用方是否修改内容，
   // 因此必须让惰性排序标志失效。否则 contains()/equals() 里的
   // binary_search 会在未排序的数据上给出假阴性。
-  std::vector<sql::Value>& points() {
+  std::vector<sql::Value> &points() {
     sorted_ = false;
     return points_;
   }
@@ -60,67 +60,65 @@ class KeySet {
   // ============================================================
   // 插入（自动去重）
   // ============================================================
-  KeySet& add(const sql::Value& val) {
+  KeySet &add(const sql::Value &val) {
     // 按 key 判断重复：与存储层的全序/去重语义保持一致
-    if (std::none_of(points_.begin(), points_.end(),
-                     [&val](const sql::Value& x) {
-                       return ValueKeyEqual{}(x, val);
-                     })) {
+    if (std::none_of(
+            points_.begin(), points_.end(),
+            [&val](const sql::Value &x) { return ValueKeyEqual{}(x, val); })) {
       points_.push_back(val);
       sorted_ = false;
     }
     return *this;
   }
 
-  KeySet& add_all(const std::vector<sql::Value>& vals) {
-    for (const auto& v : vals) {
+  KeySet &add_all(const std::vector<sql::Value> &vals) {
+    for (const auto &v : vals) {
       add(v);
     }
     return *this;
   }
 
-  KeySet& add_all(std::initializer_list<sql::Value> vals) {
-    for (const auto& v : vals) {
+  KeySet &add_all(std::initializer_list<sql::Value> vals) {
+    for (const auto &v : vals) {
       add(v);
     }
     return *this;
   }
 
   // 从另一个 KeySet 添加
-  KeySet& add_all(const KeySet& other) {
-    for (const auto& v : other.points_) {
+  KeySet &add_all(const KeySet &other) {
+    for (const auto &v : other.points_) {
       add(v);
     }
     return *this;
   }
-// 删除单值
-   bool remove(const sql::Value& val) {
-     auto it = std::find_if(points_.begin(), points_.end(),
-                            [&val](const sql::Value& x) {
-                              return ValueKeyEqual{}(x, val);
-                            });
-     if (it != points_.end()) {
-       points_.erase(it);
-       return true;
-     }
-     return false;
-   }
-   
-   // 清空
-   void clear() {
-     points_.clear();
-     sorted_ = true;  // 空集是已排序的
-   }
+  // 删除单值
+  bool remove(const sql::Value &val) {
+    auto it = std::find_if(
+        points_.begin(), points_.end(),
+        [&val](const sql::Value &x) { return ValueKeyEqual{}(x, val); });
+    if (it != points_.end()) {
+      points_.erase(it);
+      return true;
+    }
+    return false;
+  }
+
+  // 清空
+  void clear() {
+    points_.clear();
+    sorted_ = true; // 空集是已排序的
+  }
   // ============================================================
   // 排序和去重（原地操作）
   // ============================================================
-  KeySet& sort() {
+  KeySet &sort() {
     std::sort(points_.begin(), points_.end(), ValueKeyLess{});
     sorted_ = true;
     return *this;
   }
 
-  KeySet& unique() {
+  KeySet &unique() {
     sort();
     points_.erase(std::unique(points_.begin(), points_.end(), ValueKeyEqual{}),
                   points_.end());
@@ -128,7 +126,7 @@ class KeySet {
     return *this;
   }
 
-  KeySet& normalize() {
+  KeySet &normalize() {
     sort();
     points_.erase(std::unique(points_.begin(), points_.end(), ValueKeyEqual{}),
                   points_.end());
@@ -150,27 +148,27 @@ class KeySet {
 
   // 最小值（请在 points_ 非空时调用）
   sql::Value min() const {
-     if (points_.empty()) {
-       throw std::runtime_error("KeySet::min() on empty set");
-     }
-     ensure_sorted();
-     return points_.front();
-   }
-   
-   // 最大值
-   sql::Value max() const {
-     if (points_.empty()) {
-       throw std::runtime_error("KeySet::max() on empty set");
-     }
-     ensure_sorted();
-     return points_.back();
-   }
+    if (points_.empty()) {
+      throw std::runtime_error("KeySet::min() on empty set");
+    }
+    ensure_sorted();
+    return points_.front();
+  }
+
+  // 最大值
+  sql::Value max() const {
+    if (points_.empty()) {
+      throw std::runtime_error("KeySet::max() on empty set");
+    }
+    ensure_sorted();
+    return points_.back();
+  }
   // ============================================================
   // 集合运算（返回新的 KeySet）
   // ============================================================
 
   // 并集
-  KeySet unite(const KeySet& other) const {
+  KeySet unite(const KeySet &other) const {
     ensure_sorted();
     other.ensure_sorted();
     std::vector<sql::Value> result;
@@ -181,7 +179,7 @@ class KeySet {
   }
 
   // 交集
-  KeySet intersect(const KeySet& other) const {
+  KeySet intersect(const KeySet &other) const {
     ensure_sorted();
     other.ensure_sorted();
     std::vector<sql::Value> result;
@@ -192,7 +190,7 @@ class KeySet {
   }
 
   // 差集: *this - other
-  KeySet subtract(const KeySet& other) const {
+  KeySet subtract(const KeySet &other) const {
     ensure_sorted();
     other.ensure_sorted();
     std::vector<sql::Value> result;
@@ -203,7 +201,7 @@ class KeySet {
   }
 
   // 对称差集: (A - B) ∪ (B - A)
-  KeySet symmetric_difference(const KeySet& other) const {
+  KeySet symmetric_difference(const KeySet &other) const {
     ensure_sorted();
     other.ensure_sorted();
     std::vector<sql::Value> result;
@@ -217,17 +215,17 @@ class KeySet {
   // 原地集合操作
   // ============================================================
 
-  KeySet& unite_with(const KeySet& other) {
+  KeySet &unite_with(const KeySet &other) {
     *this = unite(other);
     return *this;
   }
 
-  KeySet& intersect_with(const KeySet& other) {
+  KeySet &intersect_with(const KeySet &other) {
     *this = intersect(other);
     return *this;
   }
 
-  KeySet& subtract_with(const KeySet& other) {
+  KeySet &subtract_with(const KeySet &other) {
     *this = subtract(other);
     return *this;
   }
@@ -236,26 +234,29 @@ class KeySet {
   // 查询
   // ============================================================
 
-  bool contains(const sql::Value& val) const {
-    if (points_.empty()) { return false;
-}
+  bool contains(const sql::Value &val) const {
+    if (points_.empty()) {
+      return false;
+    }
     ensure_sorted();
     return std::binary_search(points_.begin(), points_.end(), val,
                               ValueKeyLess{});
   }
 
-  bool contains_all(const KeySet& other) const {
-    if (other.empty()) { return true;
-}
+  bool contains_all(const KeySet &other) const {
+    if (other.empty()) {
+      return true;
+    }
     ensure_sorted();
     other.ensure_sorted();
     return std::includes(points_.begin(), points_.end(), other.points_.begin(),
                          other.points_.end(), ValueKeyLess{});
   }
 
-  bool contains_any(const KeySet& other) const {
-    if (empty() || other.empty()) { return false;
-}
+  bool contains_any(const KeySet &other) const {
+    if (empty() || other.empty()) {
+      return false;
+    }
     ensure_sorted();
     other.ensure_sorted();
     std::vector<sql::Value> result;
@@ -265,9 +266,10 @@ class KeySet {
     return !result.empty();
   }
 
-  bool equals(const KeySet& other) const {
-    if (size() != other.size()) { return false;
-}
+  bool equals(const KeySet &other) const {
+    if (size() != other.size()) {
+      return false;
+    }
     ensure_sorted();
     other.ensure_sorted();
     return std::equal(points_.begin(), points_.end(), other.points_.begin(),
@@ -281,23 +283,25 @@ class KeySet {
   bool all_int() const {
     ensure_sorted();
     return std::all_of(points_.begin(), points_.end(),
-                       [](const sql::Value& v) { return v.is_int(); });
+                       [](const sql::Value &v) { return v.is_int(); });
   }
 
   bool all_string() const {
     ensure_sorted();
     return std::all_of(points_.begin(), points_.end(),
-                       [](const sql::Value& v) { return v.is_string(); });
+                       [](const sql::Value &v) { return v.is_string(); });
   }
 
   // ============================================================
   // 转换为 KeyRange（连续点集）
   // ============================================================
   std::optional<KeyRange> to_range() const {
-    if (points_.empty()) { return KeyRange::empty();
-}
-    if (!all_int()) { return std::nullopt;
-}
+    if (points_.empty()) {
+      return KeyRange::empty();
+    }
+    if (!all_int()) {
+      return std::nullopt;
+    }
 
     ensure_sorted();
 
@@ -308,17 +312,19 @@ class KeySet {
       }
     }
 
-    return KeyRange::range(points_.front(),
-                           sql::Value(points_.back().as_int() + 1));
+    // 用闭区间表示连续点集：不再做 back()+1（INT64_MAX 会溢出）
+    return KeyRange::closed(points_.front(), points_.back());
   }
 
   // 将点集拆分为多个连续范围
   std::vector<KeyRange> to_ranges() const {
     std::vector<KeyRange> result;
-    if (points_.empty()) { return result;
-}
-    if (!all_int()) { return result;
-}
+    if (points_.empty()) {
+      return result;
+    }
+    if (!all_int()) {
+      return result;
+    }
 
     ensure_sorted();
 
@@ -327,35 +333,35 @@ class KeySet {
 
     for (size_t i = 1; i < points_.size(); ++i) {
       if (points_[i].as_int() - current.as_int() != 1) {
-        result.push_back(
-            KeyRange::range(start, sql::Value(current.as_int() + 1)));
+        result.push_back(KeyRange::closed(start, current));
         start = points_[i];
       }
       current = points_[i];
     }
-    result.push_back(KeyRange::range(start, sql::Value(current.as_int() + 1)));
+    result.push_back(KeyRange::closed(start, current));
 
     return result;
   }
 
   // 是否有与 KeyRange 重叠
-   bool is_intersect(const KeyRange& range) const {
-     if (points_.empty() || range.is_empty()) return false;
-     ensure_sorted();
-     
-     // 直接用 range 内部逻辑，让 range 处理无穷
-     return range.intersects_set(*this);
-   }
+  bool is_intersect(const KeyRange &range) const {
+    if (points_.empty() || range.is_empty())
+      return false;
+    ensure_sorted();
 
-   // 过滤出范围内的点
-   KeySet filter(const KeyRange& range) const {
-     if (points_.empty() || range.is_empty()) {
-       return {};
-     }
-     
-     ensure_sorted();
-     return range.filter_set(*this);
-   }
+    // 直接用 range 内部逻辑，让 range 处理无穷
+    return range.intersects_set(*this);
+  }
+
+  // 过滤出范围内的点
+  KeySet filter(const KeyRange &range) const {
+    if (points_.empty() || range.is_empty()) {
+      return {};
+    }
+
+    ensure_sorted();
+    return range.filter_set(*this);
+  }
   // ============================================================
   // 迭代器支持
   // ============================================================
@@ -367,34 +373,36 @@ class KeySet {
   }
   auto end() const { return points_.cend(); }
 
-   // 反转（用于降序遍历）
-   auto rbegin() const {
-     ensure_sorted();
-     return points_.crbegin();
-   }
-   auto rend() const { return points_.crend(); }
-   
-   // 迭代器访问（直接通过容器）
-   const sql::Value& at(size_t i) const {
-     ensure_sorted();
-     return points_.at(i);
-   }
-   
-   // 随机访问操作符
-   const sql::Value& operator[](size_t i) const {
-     ensure_sorted();
-     return points_[i];
-   }
+  // 反转（用于降序遍历）
+  auto rbegin() const {
+    ensure_sorted();
+    return points_.crbegin();
+  }
+  auto rend() const { return points_.crend(); }
+
+  // 迭代器访问（直接通过容器）
+  const sql::Value &at(size_t i) const {
+    ensure_sorted();
+    return points_.at(i);
+  }
+
+  // 随机访问操作符
+  const sql::Value &operator[](size_t i) const {
+    ensure_sorted();
+    return points_[i];
+  }
   // ============================================================
   // 序列化
   // ============================================================
   std::string to_string() const {
-    if (points_.empty()) { return "{}";
-}
+    if (points_.empty()) {
+      return "{}";
+    }
     ensure_sorted();
     std::string s = "{";
     for (size_t i = 0; i < points_.size(); ++i) {
-      if (i > 0) s += ", ";
+      if (i > 0)
+        s += ", ";
       s += points_[i].to_string();
     }
     s += "}";
@@ -402,25 +410,27 @@ class KeySet {
   }
 
   // 完整字符串（不排序）
-   std::string to_string_raw() const {
-     std::string s = "[";
-     for (size_t i = 0; i < points_.size(); ++i) {
-       if (i > 0) s += ", ";
-       s += points_[i].to_string();
-     }
-     s += "]";
-     return s;
-   }
-   
-   // 类型检查辅助（用于测试）
-   DataType data_type() const {
-     if (points_.empty()) return DataType::UNKNOWN_TYPE;
-     return points_.front().type();
-   }
+  std::string to_string_raw() const {
+    std::string s = "[";
+    for (size_t i = 0; i < points_.size(); ++i) {
+      if (i > 0)
+        s += ", ";
+      s += points_[i].to_string();
+    }
+    s += "]";
+    return s;
+  }
 
- private:
+  // 类型检查辅助（用于测试）
+  DataType data_type() const {
+    if (points_.empty())
+      return DataType::UNKNOWN_TYPE;
+    return points_.front().type();
+  }
+
+private:
   // 私有构造函数（用于已知已排序的情况）
-  KeySet(std::vector<sql::Value>&& points, bool sorted)
+  KeySet(std::vector<sql::Value> &&points, bool sorted)
       : points_(std::move(points)), sorted_(sorted) {}
 
   mutable std::vector<sql::Value> points_;
@@ -430,10 +440,10 @@ class KeySet {
 // ============================================================
 // 比较操作符
 // ============================================================
-inline bool operator==(const KeySet& a, const KeySet& b) { return a.equals(b); }
+inline bool operator==(const KeySet &a, const KeySet &b) { return a.equals(b); }
 
-inline bool operator!=(const KeySet& a, const KeySet& b) {
+inline bool operator!=(const KeySet &a, const KeySet &b) {
   return !a.equals(b);
 }
 
-}  // namespace query
+} // namespace sql

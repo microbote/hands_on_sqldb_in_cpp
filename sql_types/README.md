@@ -163,6 +163,79 @@ key = [1 字节 family tag][1 字节 null flag][payload]
   "扫描 `to_str_key_range()` 得到的区间"完全一致；字符串单点/闭区间因此可用。
 - 集合运算会传播已知类型（`type()`）。
 
+#### `to_str_key_range()` 返回的 `StrKeyRange`（物理扫描用）
+
+物理层只认**一种形式**：半开区间。语义层（NULL / 开闭 / inclusivity）在
+`to_str_key_range()` 里被**压平**进 key，扫描方只需要 `Seek(start)` + `key() < end`。
+
+```cpp
+struct StrKeyRange {
+  Key start, end;                                  // 都是具体 key
+  bool is_empty() const { return !(start < end); }  // start >= end 即空
+};
+```
+
+压平规则：
+
+| 语义（KeyRange） | 物理（StrKeyRange） |
+|---|---|
+| 下界无界（-∞）或"含 NULL" | `start = [tag][0x00]`（NULL 的 key，也是族最小值） |
+| 下界是值 v（闭） | `start = key(v)` |
+| 下界是值 v（开） | `start = key(v) + 0x00` |
+| 下界"排除 NULL" | `start = [tag][0x00] + 0x00`（等价 `[tag][0x01]`） |
+| 上界无界（+∞） | `end = [tag+1]`（恰好大于本族所有 key，本身即排他） |
+| 上界是值 v（开） | `end = key(v)` |
+| 上界是值 v（闭） | `end = key(v) + 0x00` |
+| 空集 | `start == end` |
+
+- **为什么不用 flag**：扫描层越简单越好；开闭在语义层决定完，压平后一种形式，
+  不存在"消费方漏看标志位 → 静默少扫一条数据"的风险（这是 flags 方案的主要失败模式）。
+- **`+0x00` 是普适后继**：追加一个 0x00 永远落在紧跟其后的位置——不溢出、不越族、
+  不会被解码成合法值（解码要求终止符在末尾），也不与任何值的 key 冲突。
+  因此 `<= 类型最大值`、`> x`、`(a, b]` 都能表达，而 `[tag+1]` 依然胜任 +∞。
+- tag 空间约定：family tag ∈ {0x00,0x01,0x02,0x03}（永远 < 0x0F），
+  **没有值的 key 以 0xFF 开头** → `[0xFF]` 可安全用作"全局 +∞"
+  （也是 `upper_key_for_type(UNKNOWN)`），还可用于"某前缀内所有键"的上界。
+- `start`/`end` 是**扫描边界**，不是可写入存储的合法 key
+  （`is_valid_key()` 对 `key+0x00` 与族上界都返回 false）。
+
+#### KeyRange 的完备性（NULL / ±∞ / 开闭 / 集合运算）
+
+| 维度 | 表示 | 备注 |
+|---|---|---|
+| -∞ | `low_ == nullopt` | 压平为族最小值（NULL 的 key） |
+| +∞ | `high_ == nullopt` | 压平为族上界 `[tag+1]`（排他） |
+| 含 NULL | 无下界，或 `low_ = NULL` 且 `low_exclusive_ = false` | 两者等价，构造/运算结果会 `normalize()` 成"无下界" |
+| 不含 NULL | `low_ = NULL` 且 `low_exclusive_ = true` | 压平为 `NULL key + 0x00`；有具体值下界时天然不含 NULL |
+| 只有 NULL | `high_ = NULL` 且 `high_inclusive_ = true` | 单点；`to_string()` 打印 `{NULL}` |
+| 上界为 NULL 且排他 | — | 视为**空集**（没有值比 NULL 更小） |
+| 开闭 | `low_exclusive_` / `high_inclusive_` | 四种组合都支持，含 `(a, b]`（`subtract` 会产生） |
+| 单点 | `[v, v]` | 不再用 `[v, v+1)`，避免 `INT64_MAX` 处 +1 溢出 |
+| 空集 | `is_empty()` | 含"上界 NULL 排他"与"low > high"两种退化情形 |
+
+比较谓词工厂（优化器直接用，已按三值逻辑排除 NULL）：
+
+| 谓词 | 工厂 | 结果 |
+|------|------|------|
+| `id > 5` | `gt(Value(5))` | `(5, +∞)`，不含 NULL |
+| `id >= 5` | `ge(Value(5))` | `[5, +∞)`，不含 NULL |
+| `id < 5` | `lt(Value(5))` | `(-∞, 5)`，不含 NULL（与裸 `to(5)` 不同） |
+| `id <= 5` | `le(Value(5))` | `(-∞, 5]`，不含 NULL |
+| `id = 5` | `eq(Value(5))` | 单点 |
+| `id IS NULL` | `null_only(type)` | 只有 NULL |
+| `id IS NOT NULL` | `non_null(type)` | 只有非 NULL |
+| 无谓词全表 | `all(type)` | 含 NULL |
+| 参数为 NULL | 上述比较工厂 | 空集（比较永不成立）；`eq(NULL, type)` = `IS NULL` |
+
+集合运算（`intersect` / `unite` / `subtract` / `complement`）全部基于编码 key 比较，
+因此 NULL 语义自动保持，且满足这些关系（有测试）：
+
+```
+all ∩ non_null = non_null          complement(non_null)  = null_only
+null_only ∪ non_null = all         complement(null_only) = non_null
+all − non_null = null_only         non_null − null_only  = non_null
+```
+
 ### 7. 序列化格式 v1（`row.cpp` / `schema.cpp`）
 
 两者都用 `byte_buffer.h` 的**长度前缀 framing**，不用 `|` `,` `:` 分隔符

@@ -6,6 +6,8 @@ add_executable(test_statement
     test_builder.cpp
     test_validator.cpp
     test_pipeline.cpp
+    test_source_span.cpp
+    test_highlight.cpp
 )
 
 target_include_directories(test_statement PRIVATE

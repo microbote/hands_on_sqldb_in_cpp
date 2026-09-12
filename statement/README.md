@@ -11,8 +11,10 @@ SQL 文本 --parser--> AST --StatementBuilder--> sql::Query --StatementValidator
 
 | 类 | 输入 | 输出 | 做什么 | 不做什么 |
 |----|------|------|--------|----------|
-| `StatementBuilder` | `ASTNode*` | `std::expected<sql::Query, StmtError>` | 节点结构转换、结构校验（字段是否齐全、值节点是否合法）、SQL 语义规范化（如 PRIMARY KEY ⇒ NOT NULL） | 不查 Catalog、不碰存储、**不接管 AST 所有权** |
+| `StatementBuilder` | `const ASTNode*` | `std::expected<sql::Query, StmtError>` | 节点结构转换、结构校验（字段是否齐全、值节点是否合法）、SQL 语义规范化（如 PRIMARY KEY ⇒ NOT NULL） | 不查 Catalog、不碰存储、**不接管 AST 所有权、不改 AST**（接口是 `const ASTNode*`，生命周期由调用方管理） |
 | `StatementValidator` | `const sql::Query&` + `const sql::Catalog&` | `std::expected<void, StmtError>` | 库/表/列是否存在、值类型族与取值范围、主键约束、DDL 语义（重复建库/建表、删不存在的对象） | 不修改数据；**校验通过 ≠ 已执行** |
+
+辅助：`statement/source_span.h`（位置格式化、caret 渲染、名字→位置解析）。
 
 调用方（未来的执行器/shell）需要自己把通过校验的 DDL 落到 Catalog 上，
 或者走上层事务接口 —— validator 是只读的。
@@ -39,6 +41,7 @@ enum class StmtErrorCode : uint8_t {
 struct StmtError {              // 错误是"值"：码 + 上下文信息
   StmtErrorCode code = StmtErrorCode::OK;
   std::string message;
+  SSpan span;                   // 出错位置（来自 AST；未知时 sspan_valid() == 0）
   bool ok() const;
   explicit operator bool() const;
   std::string to_string() const;   // message 为空时退回 stmt_error_message(code)
@@ -60,73 +63,86 @@ if (auto ok = validator.validate(*query); !ok) { // expected<void, StmtError>
 }
 ```
 
-为什么不用 `struct { bool ok; StmtErrorCode error; std::string message;
-std::optional<Query> query; }` 这种"结果结构体"：`ok`/`error`/`query.has_value()`
-三者可以互相矛盾且无法约束；它本质是手写的 `expected`，会丢掉
-`and_then/or_else/value_or` 等设施，并让模块内出现两种风格。
-把"信息"放进错误类型本身，既保住了 `expected` 的现代用法，
-又让错误码（控制流）与消息（日志/CLI）各归其位。
+## 错误定位（source span）
 
-## AST → Query 映射
+错误不只有"哪条语句错了"，还能指出"**哪个名字/字面量错了**"。链路：
 
-| AST 节点 | 产物 |
-|----------|------|
-| `NODE_USE` | `sql::UseDatabaseQuery` |
-| `NODE_SELECT` | `sql::SelectQuery`（列列表、WHERE、ORDER BY、LIMIT） |
-| `NODE_INSERT` | `sql::InsertQuery`（列清单可空、VALUES 一行） |
-| `NODE_UPDATE` | `sql::UpdateQuery`（SET 列表、WHERE） |
-| `NODE_DELETE` | `sql::DeleteQuery`（WHERE） |
-| `NODE_CREATE_TABLE` | `sql::CreateTableQuery`（`ColumnDef` 含声明长度） |
-| `NODE_DROP_TABLE` | `sql::DropTableQuery` |
-| `NODE_CREATE_DATABASE` / `NODE_DROP_DATABASE` | `CreateDatabaseQuery` / `DropDatabaseQuery` |
+```
+sql.l（%option yylineno + 自己维护列号）
+   │  yylloc{first_line, first_column, last_line, last_column}
+   ▼
+sql.y（%locations；AST_SET_SPAN($$, @$) / @n）
+   │  ASTNode::span、SelectNode::table_span、DatabaseNode::db_span ...
+   ▼
+StmtError.span（builder 直接取节点位置；validator 用 resolver 按名字查位置）
+   │
+   ▼
+sspan_caret(sql, span) → CLI 展示
+```
 
-值节点：`NODE_NUMBER`→整数、`NODE_STRING`→VARCHAR、`NODE_LITERAL`→NULL/TRUE/FALSE
-（**NULL 与空串是两回事**）。
-
-比较操作符通过 `sql::from_c()` 从 `COpType` 转换（桥接函数在
-`sql_types/compare_op.h`，不要在 statement 层再写字符串映射）。
-
-## 与 Catalog 的关系
-
-`sql::Catalog` 除元数据外还提供会话状态：
+用法（validator 想要位置就多传一个 resolver）：
 
 ```cpp
-virtual bool is_open() const;
-virtual sql::Identifier current_database() const;
+stmt::StatementBuilder builder;
+auto query = builder.build(ast.get());
+
+stmt::StatementValidator validator(catalog, stmt::make_span_resolver(ast.get()));
+if (auto ok = validator.validate(*query); !ok) {
+  // "column not found: nope (line 1:27)  [27,31)"
+  fmt::print("{}\n{}\n", ok.error().to_string(),
+             stmt::sspan_caret(sql, ok.error().span, ok.error().message,
+                               sql::ansi::enabled_by_default()));
+}
 ```
 
-不带库名的表（SELECT/INSERT/UPDATE/DELETE）用 `current_database()` 解析；
-`StatementValidator` 构造时若 `!catalog.is_open()`，任何 `validate()` 都返回
-`VALIDATOR_NOT_INIT`。
+输出形如（值级定位：INSERT/UPDATE 的错误直接指向那个字面量）：
 
-## 校验规则一览
+```
+INSERT INTO users (id, age) VALUES (1, 'abc');
+                                       ^^^^^ Type mismatch @ age (line 1:40-45)
 
-| 语句 | 规则 |
-|------|------|
-| `USE` / `DROP DATABASE` | 库必须存在 |
-| `CREATE DATABASE` | 库不能已存在 |
-| `CREATE TABLE` | 库存在、表不存在、schema 合法（有主键、列名不重复、声明长度合法） |
-| `DROP TABLE` | 库与表都存在 |
-| `SELECT` | 表存在；SELECT 列表 / WHERE / ORDER BY 引用的列都存在 |
-| `INSERT` | 表存在；显式列清单里的列存在；值个数与列数一致；值类型族与范围匹配（含 `VARCHAR(n)` 长度、TINYINT 范围）；NOT NULL 列必须有值 |
-| `UPDATE` | 表存在；SET 的列存在且类型匹配；主键列不允许更新；WHERE 引用的列存在 |
-| `DELETE` | 表存在；WHERE 引用的列存在 |
-
-列值校验直接复用 `sql::TableSchema::validate_value()`，
-所以类型族、整数宽度、字符串长度、时间类型、NULL 约束的规则与 sql_types 完全一致，
-不会出现"两套规则不一致"。
-
-## 构建与测试
-
-```bash
-cmake --build build -j4
-ctest --test-dir build -R test_statement --output-on-failure
-make statement-test        # 等价
+SELECT * FROM users WHERE nope = 1;
+                          ^^^^ column not found: nope (line 1:27-31)
 ```
 
-测试在 `tests/test_statement/`：
+- **定位优先级**：值自身的位置（`InsertQuery::value_spans` /
+  `UpdateQuery::Assignment::value_span`）> 名字的位置（resolver）> 未知；
+  这两处 span 是 builder 从 AST 值节点带过来的，**只用于诊断**，
+  不参与比较/编码/键，构造 Query 的其它代码可以不填。
+- `make_span_resolver(ast)` 会遍历 AST 收集"名字 → 位置"（表名/库名/列名，
+  大小写不敏感）；**不传 resolver 时 span 为"未知"**，其余行为完全不变。
+- `sspan_to_string(span)` 得到 `line 1:27-31`（跨行是 `line 2:3..4:5`）。
+- 位置是"行/列（按字节）"，列区间左闭右开；多行 token（字符串、空行）也正确。
+- 语法错误的位置仍由 parser 的 `line N` 给出（`ParseResult::error`）。
 
-- `test_builder.cpp`：AST → Query 的字段级断言（含 NULL/TRUE/FALSE/负数、`VARCHAR(32)`）。
-- `test_validator.cpp`：每条校验规则的命中与放行（含只读语义：校验不执行 DDL）。
-- `test_pipeline.cpp`：SQL 文本 → 解析 → 构建 → 校验 → 执行 的端到端流程。
-- `memory_catalog.h`：测试用的内存 Catalog 实现。
+## 语法高亮
+
+`statement/sql_highlight.h` 提供两个纯展示函数（`colors=false` 时原样返回）：
+
+```cpp
+stmt::highlight_sql(sql, colors);              // 整条语句着色
+stmt::highlight_span(sql, span, colors);       // 只把 span 覆盖的片段标亮红
+stmt::sspan_caret(sql, span, label, colors);   // 报错行 + caret，颜色如上
+```
+
+**实现原则：不自己扫描 SQL，复用 lexer 的 token 流。**
+
+```
+SQL 文本 ──► parser/sql.l（唯一的词法规则）
+                │  lex_collect_tokens()  ← 与解析共用同一套规则
+                ▼
+        token 流 (kind, span, offset, length)
+                │  statement/sql_highlight.cpp 只做 kind → 颜色
+                ▼
+        着色文本（token 之间的空隙原样复制，逐字节还原原文）
+```
+
+- 颜色表：`TOK_TYPE_NAME` 青、`TOK_STRING` 绿、`TOK_NUMBER` 黄、
+  `TOK_NULL/TRUE/FALSE` 品红、其它 `TOK_*`（含 `IN/IS/LIKE` 与所有关键字）粗蓝、
+  比较运算符粗体、`TOK_IDENT` 与单字符标点不着色、`TOK_LEX_ERROR` 标红。
+  **这里没有关键字清单**：`sql.l` 里新增关键字只改 `sql.l`/`sql.y`，高亮自动跟随。
+- 空白与注释不产生 token，由调用方用相邻 token 的 `offset` 之间的空隙还原，
+  所以"去掉 ANSI 转义后 == 原文"是一条可测的不变量（已有用例）。
+- 限制：`lex_collect_tokens()` 会自行建立/销毁扫描缓冲，**不能在 `yyparse()`
+  进行中调用**；它与解析器一样是非重入的。
+

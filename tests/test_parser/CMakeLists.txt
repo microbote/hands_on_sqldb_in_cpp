@@ -8,6 +8,8 @@ add_executable(test_parser
     test_literals.cpp
     test_clauses.cpp
     test_sql_statements.cpp
+    test_source_span.cpp
+    test_lex_tokens.cpp
     test_error_reporting.cpp
 )
 

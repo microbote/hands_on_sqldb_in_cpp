@@ -10,9 +10,9 @@
 
 namespace stmt {
 
-StmtError StatementBuilder::make_error(StmtErrorCode code,
-                                       std::string message) {
-  return StmtError(code, std::move(message));
+StmtError StatementBuilder::make_error(StmtErrorCode code, std::string message,
+                                       SSpan span) {
+  return StmtError(code, std::move(message), span);
 }
 
 bool StatementBuilder::is_list_node(const ASTNode *ast) {
@@ -29,35 +29,46 @@ const ASTNodeList *StatementBuilder::as_list(const ASTNode *ast) {
 // ============================================================
 // 入口
 // ============================================================
-std::expected<sql::Query, StmtError> StatementBuilder::build(ASTNode *ast) {
+std::expected<sql::Query, StmtError>
+StatementBuilder::build(const ASTNode *ast) {
   if (ast == nullptr) {
     return std::unexpected(
         make_error(StmtErrorCode::AST_IS_NULL, "AST is null"));
   }
 
+  // 统一的 span 兜底：具体失败点没给位置时，用整条语句的位置
+  auto finish = [ast](std::expected<sql::Query, StmtError> result)
+      -> std::expected<sql::Query, StmtError> {
+    if (!result.has_value() && !sspan_valid(result.error().span)) {
+      result.error().span = ast->span;
+    }
+    return result;
+  };
+
   switch (ast->type) {
   case NODE_USE:
-    return build_stmt_use(ast);
+    return finish(build_stmt_use(ast));
   case NODE_SELECT:
-    return build_stmt_select(ast);
+    return finish(build_stmt_select(ast));
   case NODE_INSERT:
-    return build_stmt_insert(ast);
+    return finish(build_stmt_insert(ast));
   case NODE_UPDATE:
-    return build_stmt_update(ast);
+    return finish(build_stmt_update(ast));
   case NODE_DELETE:
-    return build_stmt_delete(ast);
+    return finish(build_stmt_delete(ast));
   case NODE_CREATE_DATABASE:
-    return build_stmt_create_database(ast);
+    return finish(build_stmt_create_database(ast));
   case NODE_DROP_DATABASE:
-    return build_stmt_drop_database(ast);
+    return finish(build_stmt_drop_database(ast));
   case NODE_CREATE_TABLE:
-    return build_stmt_create_table(ast);
+    return finish(build_stmt_create_table(ast));
   case NODE_DROP_TABLE:
-    return build_stmt_drop_table(ast);
+    return finish(build_stmt_drop_table(ast));
   default:
-    return std::unexpected(make_error(StmtErrorCode::UNKNOWN_AST_Type,
-                                      std::string("unknown AST node type: ") +
-                                          node_type_to_string(ast->type)));
+    return std::unexpected(make_error(
+        StmtErrorCode::UNKNOWN_AST_Type,
+        std::string("unknown AST node type: ") + std::to_string(ast->type) +
+            std::string(", ") + node_type_to_string(ast->type)));
   }
 }
 
@@ -65,10 +76,10 @@ std::expected<sql::Query, StmtError> StatementBuilder::build(ASTNode *ast) {
 // 值与列表
 // ============================================================
 std::expected<sql::Value, StmtError>
-StatementBuilder::build_value(ASTNode *ast) {
+StatementBuilder::build_value(const ASTNode *ast) {
   if (ast == nullptr) {
-    return std::unexpected(
-        make_error(StmtErrorCode::INVALID_AST_NODE, "value node is null"));
+    return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
+                                      "value node is null", ast->span));
   }
 
   switch (ast->type) {
@@ -92,26 +103,27 @@ StatementBuilder::build_value(ASTNode *ast) {
     default:
       break;
     }
-    return std::unexpected(
-        make_error(StmtErrorCode::INVALID_AST_NODE, "unknown literal kind"));
+    return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
+                                      "unknown literal kind", ast->span));
   }
   default:
     return std::unexpected(make_error(StmtErrorCode::UNSUPPORTED_AST_NODE,
                                       std::string("unsupported value node: ") +
-                                          node_type_to_string(ast->type)));
+                                          node_type_to_string(ast->type),
+                                      ast->span));
   }
 }
 
 std::expected<std::vector<sql::Value>, StmtError>
-StatementBuilder::build_value_list(ASTNode *ast) {
+StatementBuilder::build_value_list(const ASTNode *ast) {
   std::vector<sql::Value> values;
   const ASTNodeList *list = as_list(ast);
   if (list == nullptr) {
-    return std::unexpected(
-        make_error(StmtErrorCode::INVALID_AST_NODE, "value list is missing"));
+    return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
+                                      "value list is missing", ast->span));
   }
   for (const ASTNode *item = list->head; item != nullptr; item = item->next) {
-    auto value = build_value(const_cast<ASTNode *>(item));
+    auto value = build_value((item));
     if (!value.has_value()) {
       return std::unexpected(value.error());
     }
@@ -121,7 +133,7 @@ StatementBuilder::build_value_list(ASTNode *ast) {
 }
 
 std::expected<std::vector<sql::Identifier>, StmtError>
-StatementBuilder::build_column_list(ASTNode *ast) {
+StatementBuilder::build_column_list(const ASTNode *ast) {
   std::vector<sql::Identifier> columns;
   if (ast == nullptr) {
     return columns; // 允许缺省（INSERT 不写列名）
@@ -143,7 +155,7 @@ StatementBuilder::build_column_list(ASTNode *ast) {
 }
 
 std::expected<std::vector<sql::ColumnRef>, StmtError>
-StatementBuilder::build_select_columns(ASTNode *ast) {
+StatementBuilder::build_select_columns(const ASTNode *ast) {
   std::vector<sql::ColumnRef> columns;
   if (ast == nullptr) {
     return columns; // SELECT *（空 = 通配）
@@ -167,7 +179,7 @@ StatementBuilder::build_select_columns(ASTNode *ast) {
 }
 
 std::expected<std::vector<sql::OrderByItem>, StmtError>
-StatementBuilder::build_order_by(ASTNode *ast) {
+StatementBuilder::build_order_by(const ASTNode *ast) {
   std::vector<sql::OrderByItem> items;
   if (ast == nullptr) {
     return items;
@@ -194,7 +206,7 @@ StatementBuilder::build_order_by(ASTNode *ast) {
 }
 
 std::expected<sql::LimitClause, StmtError>
-StatementBuilder::build_limit(ASTNode *ast) {
+StatementBuilder::build_limit(const ASTNode *ast) {
   sql::LimitClause clause;
   if (ast == nullptr) {
     return clause;
@@ -214,7 +226,7 @@ StatementBuilder::build_limit(ASTNode *ast) {
 }
 
 std::expected<sql::ConditionPtr, StmtError>
-StatementBuilder::build_condition(ASTNode *ast) {
+StatementBuilder::build_condition(const ASTNode *ast) {
   if (ast == nullptr) {
     return sql::ConditionPtr(nullptr); // 无条件
   }
@@ -225,19 +237,21 @@ StatementBuilder::build_condition(ASTNode *ast) {
     const auto op = sql::from_c(data->op);
     if (op == sql::CompareOp::UNKNOWN) {
       return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
-                                        "unknown comparison operator"));
+                                        "unknown comparison operator",
+                                        ast->span));
     }
     sql::Value value;
     if (data->right != nullptr) {
       // IS [NOT] NULL 没有右值
-      auto built = build_value(const_cast<ASTNode *>(data->right));
+      auto built = build_value((data->right));
       if (!built.has_value()) {
         return std::unexpected(built.error());
       }
       value = std::move(*built);
     } else if (!sql::is_null_op(op)) {
       return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
-                                        "comparison is missing right operand"));
+                                        "comparison is missing right operand",
+                                        ast->span));
     }
     return sql::make_compare(
         sql::Identifier(data->column != nullptr ? data->column : ""), op,
@@ -246,7 +260,7 @@ StatementBuilder::build_condition(ASTNode *ast) {
   case NODE_IN:
   case NODE_NOT_IN: {
     const auto *data = reinterpret_cast<const InNode *>(ast->data);
-    auto values = build_value_list(const_cast<ASTNode *>(data->values));
+    auto values = build_value_list((data->values));
     if (!values.has_value()) {
       return std::unexpected(values.error());
     }
@@ -257,11 +271,11 @@ StatementBuilder::build_condition(ASTNode *ast) {
   }
   case NODE_BINARY_OP: {
     const auto *data = reinterpret_cast<const BinaryOpNode *>(ast->data);
-    auto left = build_condition(const_cast<ASTNode *>(data->left));
+    auto left = build_condition((data->left));
     if (!left.has_value()) {
       return std::unexpected(left.error());
     }
-    auto right = build_condition(const_cast<ASTNode *>(data->right));
+    auto right = build_condition((data->right));
     if (!right.has_value()) {
       return std::unexpected(right.error());
     }
@@ -272,12 +286,12 @@ StatementBuilder::build_condition(ASTNode *ast) {
       return sql::make_or(std::move(*left), std::move(*right));
     default:
       return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
-                                        "unknown logical operator"));
+                                        "unknown logical operator", ast->span));
     }
   }
   case NODE_NOT: {
     const auto *data = reinterpret_cast<const NotNode *>(ast->data);
-    auto child = build_condition(const_cast<ASTNode *>(data->child));
+    auto child = build_condition((data->child));
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
@@ -287,22 +301,25 @@ StatementBuilder::build_condition(ASTNode *ast) {
     return std::unexpected(
         make_error(StmtErrorCode::INVALID_AST_NODE,
                    std::string("malformed condition node: ") +
-                       node_type_to_string(ast->type)));
+                       node_type_to_string(ast->type),
+                   ast->span));
   }
 }
 
 std::expected<std::vector<sql::ColumnDef>, StmtError>
-StatementBuilder::build_column_defs(ASTNode *ast) {
+StatementBuilder::build_column_defs(const ASTNode *ast) {
   std::vector<sql::ColumnDef> columns;
   const ASTNodeList *list = as_list(ast);
   if (list == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
-                                      "column definition list is missing"));
+                                      "column definition list is missing",
+                                      ast->span));
   }
   for (const ASTNode *item = list->head; item != nullptr; item = item->next) {
     if (item->type != NODE_COLUMN_DEF) {
       return std::unexpected(make_error(StmtErrorCode::INVALID_AST_NODE,
-                                        "expected a column definition"));
+                                        "expected a column definition",
+                                        ast->span));
     }
     const auto *data = reinterpret_cast<const ColumnDefNode *>(item->data);
     sql::ColumnDef column;
@@ -321,11 +338,12 @@ StatementBuilder::build_column_defs(ASTNode *ast) {
 // 各语句
 // ============================================================
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_use(ASTNode *ast) {
+StatementBuilder::build_stmt_use(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const DatabaseNode *>(ast->data);
   if (data->db_name == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "USE is missing database name"));
+                                      "USE is missing database name",
+                                      data->db_span));
   }
   sql::UseDatabaseQuery query;
   query.database = sql::Identifier(data->db_name);
@@ -333,35 +351,36 @@ StatementBuilder::build_stmt_use(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_select(ASTNode *ast) {
+StatementBuilder::build_stmt_select(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const SelectNode *>(ast->data);
   if (data->table == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "SELECT is missing table name"));
+                                      "SELECT is missing table name",
+                                      data->table_span));
   }
 
   sql::SelectQuery query;
   query.table = sql::Identifier(data->table);
 
-  auto columns = build_select_columns(const_cast<ASTNode *>(data->columns));
+  auto columns = build_select_columns((data->columns));
   if (!columns.has_value()) {
     return std::unexpected(columns.error());
   }
   query.columns = std::move(*columns);
 
-  auto where = build_condition(const_cast<ASTNode *>(data->condition));
+  auto where = build_condition((data->condition));
   if (!where.has_value()) {
     return std::unexpected(where.error());
   }
   query.where = std::move(*where);
 
-  auto order = build_order_by(const_cast<ASTNode *>(data->order_by));
+  auto order = build_order_by((data->order_by));
   if (!order.has_value()) {
     return std::unexpected(order.error());
   }
   query.order_by = std::move(*order);
 
-  auto limit = build_limit(const_cast<ASTNode *>(data->limit));
+  auto limit = build_limit((data->limit));
   if (!limit.has_value()) {
     return std::unexpected(limit.error());
   }
@@ -371,17 +390,18 @@ StatementBuilder::build_stmt_select(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_insert(ASTNode *ast) {
+StatementBuilder::build_stmt_insert(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const InsertNode *>(ast->data);
   if (data->table == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "INSERT is missing table name"));
+                                      "INSERT is missing table name",
+                                      data->table_span));
   }
 
   sql::InsertQuery query;
   query.table = sql::Identifier(data->table);
 
-  auto columns = build_column_list(const_cast<ASTNode *>(data->columns));
+  auto columns = build_column_list((data->columns));
   if (!columns.has_value()) {
     return std::unexpected(columns.error());
   }
@@ -397,29 +417,43 @@ StatementBuilder::build_stmt_insert(ASTNode *ast) {
   // 若将来支持多行（元素是 NODE_LIST），这里也能直接处理。
   if (values->head->type == NODE_LIST) {
     for (const ASTNode *row = values->head; row != nullptr; row = row->next) {
-      auto row_values = build_value_list(const_cast<ASTNode *>(row));
+      auto row_values = build_value_list((row));
       if (!row_values.has_value()) {
         return std::unexpected(row_values.error());
       }
       query.values.push_back(std::move(*row_values));
+      std::vector<SSpan> spans;
+      const auto *row_list = as_list(row);
+      for (const ASTNode *item = row_list->head; item != nullptr;
+           item = item->next) {
+        spans.push_back(item->span);
+      }
+      query.value_spans.push_back(std::move(spans));
     }
   } else {
-    auto row_values = build_value_list(const_cast<ASTNode *>(data->values));
+    auto row_values = build_value_list((data->values));
     if (!row_values.has_value()) {
       return std::unexpected(row_values.error());
     }
     query.values.push_back(std::move(*row_values));
+    std::vector<SSpan> spans;
+    for (const ASTNode *item = values->head; item != nullptr;
+         item = item->next) {
+      spans.push_back(item->span);
+    }
+    query.value_spans.push_back(std::move(spans));
   }
 
   return sql::Query(std::move(query));
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_update(ASTNode *ast) {
+StatementBuilder::build_stmt_update(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const UpdateNode *>(ast->data);
   if (data->table == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "UPDATE is missing table name"));
+                                      "UPDATE is missing table name",
+                                      data->table_span));
   }
 
   sql::UpdateQuery query;
@@ -437,7 +471,7 @@ StatementBuilder::build_stmt_update(ASTNode *ast) {
                                         "SET list contains non-assignment"));
     }
     const auto *assign = reinterpret_cast<const AssignmentNode *>(item->data);
-    auto value = build_value(const_cast<ASTNode *>(assign->value));
+    auto value = build_value((assign->value));
     if (!value.has_value()) {
       return std::unexpected(value.error());
     }
@@ -445,10 +479,12 @@ StatementBuilder::build_stmt_update(ASTNode *ast) {
     out.column =
         sql::Identifier(assign->column != nullptr ? assign->column : "");
     out.value = std::move(*value);
+    out.value_span =
+        assign->value != nullptr ? assign->value->span : sspan_unknown();
     query.assignments.push_back(std::move(out));
   }
 
-  auto where = build_condition(const_cast<ASTNode *>(data->condition));
+  auto where = build_condition((data->condition));
   if (!where.has_value()) {
     return std::unexpected(where.error());
   }
@@ -458,17 +494,18 @@ StatementBuilder::build_stmt_update(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_delete(ASTNode *ast) {
+StatementBuilder::build_stmt_delete(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const DeleteNode *>(ast->data);
   if (data->table == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "DELETE is missing table name"));
+                                      "DELETE is missing table name",
+                                      data->table_span));
   }
 
   sql::DeleteQuery query;
   query.table = sql::Identifier(data->table);
 
-  auto where = build_condition(const_cast<ASTNode *>(data->condition));
+  auto where = build_condition((data->condition));
   if (!where.has_value()) {
     return std::unexpected(where.error());
   }
@@ -478,11 +515,12 @@ StatementBuilder::build_stmt_delete(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_create_database(ASTNode *ast) {
+StatementBuilder::build_stmt_create_database(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const DatabaseNode *>(ast->data);
   if (data->db_name == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "CREATE DATABASE is missing name"));
+                                      "CREATE DATABASE is missing name",
+                                      data->db_span));
   }
   sql::CreateDatabaseQuery query;
   query.database = sql::Identifier(data->db_name);
@@ -490,11 +528,12 @@ StatementBuilder::build_stmt_create_database(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_drop_database(ASTNode *ast) {
+StatementBuilder::build_stmt_drop_database(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const DatabaseNode *>(ast->data);
   if (data->db_name == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "DROP DATABASE is missing name"));
+                                      "DROP DATABASE is missing name",
+                                      data->db_span));
   }
   sql::DropDatabaseQuery query;
   query.database = sql::Identifier(data->db_name);
@@ -502,17 +541,18 @@ StatementBuilder::build_stmt_drop_database(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_create_table(ASTNode *ast) {
+StatementBuilder::build_stmt_create_table(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const CreateTableNode *>(ast->data);
   if (data->table_name == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "CREATE TABLE is missing table name"));
+                                      "CREATE TABLE is missing table name",
+                                      data->table_span));
   }
 
   sql::CreateTableQuery query;
   query.table = sql::Identifier(data->table_name);
 
-  auto columns = build_column_defs(const_cast<ASTNode *>(data->columns));
+  auto columns = build_column_defs((data->columns));
   if (!columns.has_value()) {
     return std::unexpected(columns.error());
   }
@@ -522,11 +562,12 @@ StatementBuilder::build_stmt_create_table(ASTNode *ast) {
 }
 
 std::expected<sql::Query, StmtError>
-StatementBuilder::build_stmt_drop_table(ASTNode *ast) {
+StatementBuilder::build_stmt_drop_table(const ASTNode *ast) {
   const auto *data = reinterpret_cast<const DropTableNode *>(ast->data);
   if (data->table_name == nullptr) {
     return std::unexpected(make_error(StmtErrorCode::EMPTY_STATEMENT,
-                                      "DROP TABLE is missing table name"));
+                                      "DROP TABLE is missing table name",
+                                      data->table_span));
   }
   sql::DropTableQuery query;
   query.table = sql::Identifier(data->table_name);

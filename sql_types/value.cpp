@@ -16,7 +16,7 @@ bool is_null_text(std::string_view text) {
   return text == "\\N" || iequals_ascii(text, "null");
 }
 
-}  // namespace
+} // namespace
 
 std::string Value::to_string() const {
   if (is_null()) {
@@ -40,7 +40,7 @@ std::string Value::to_string() const {
   }
 }
 
-Value Value::from_string(const std::string& str, DataType type) {
+Value Value::from_string(const std::string &str, DataType type) {
   if (is_null_text(str)) {
     return Value();
   }
@@ -108,7 +108,7 @@ Key Value::to_key(DataType column_type) const {
   return KeyCodecs::to_key(*this, column_type);
 }
 
-Value Value::from_key(const Key& key, DataType type) {
+Value Value::from_key(const Key &key, DataType type) {
   return KeyCodecs::from_key(key, type);
 }
 
@@ -120,4 +120,12 @@ Key Value::upper_key_for_type(DataType type) {
   return KeyCodecs::upper_key_for_type(type);
 }
 
-}  // namespace sql
+Key Value::null_key_for_type(DataType type) {
+  return KeyCodecs::null_key_for_type(type);
+}
+
+Key Value::first_value_key_for_type(DataType type) {
+  return KeyCodecs::first_value_key(type);
+}
+
+} // namespace sql

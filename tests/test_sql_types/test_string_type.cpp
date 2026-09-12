@@ -294,8 +294,8 @@ TEST(StringType, DeclaredLengthIsNotPartOfTheKey) {
     // 族扫描仍然覆盖 CHAR/VARCHAR/TEXT 的全部值
     const auto range = KeyRange::all(DataType::TEXT).to_str_key_range();
     const Key k = value.to_key(DataType::CHAR);
-    CHECK(range.low <= k);
-    CHECK(k < range.high);
+    CHECK(range.start <= k);
+    CHECK(k < range.end);
 }
 
 TEST(StringType, TwoColumnsWithDifferentLengthsShareEncoding) {

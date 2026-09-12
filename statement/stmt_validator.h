@@ -15,6 +15,7 @@
 
 #include "catalog.h"
 #include "schema.h"
+#include "source_span.h"
 #include "sql_types/condition.h"
 #include "sql_types/identifier.h"
 #include "sql_types/query.h"
@@ -25,8 +26,11 @@ namespace stmt {
 
 class StatementValidator {
 public:
-  explicit StatementValidator(const sql::Catalog &catalog)
-      : catalog_(catalog) {}
+  // resolver 可选：提供后，"列/表/库不存在"这类错误会带上 SQL 文本里的位置
+  // （通常由 stmt::make_span_resolver(ast) 生成；不提供则 span 为"未知"）。
+  explicit StatementValidator(const sql::Catalog &catalog,
+                              SpanResolver resolver = {})
+      : catalog_(catalog), resolver_(std::move(resolver)) {}
 
   // 校验一条 Query；成功返回空 expected，失败返回带上下文的错误值
   std::expected<void, StmtError> validate(const sql::Query &stmt) const;
@@ -72,10 +76,14 @@ private:
                           const sql::TableSchema &schema) const;
   // 值是否可以写入该列（类型族 + 范围 + 长度 + NULL 约束）
   std::expected<void, StmtError> check_value(const sql::ColumnDef &column,
-                                             const sql::Value &value) const;
-  static StmtError make_error(StmtErrorCode code, std::string message);
+                                             const sql::Value &value,
+                                             SSpan value_span) const;
+  // target 非空时用 resolver_ 查它的位置
+  StmtError make_error(StmtErrorCode code, std::string message,
+                       const sql::Identifier &target = {}) const;
 
   const sql::Catalog &catalog_;
+  SpanResolver resolver_;
 };
 
 } // namespace stmt

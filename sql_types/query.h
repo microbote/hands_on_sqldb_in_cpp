@@ -6,6 +6,7 @@
 #include <variant>
 #include <vector>
 
+#include "common/source_span.h"
 #include "condition.h"
 #include "identifier.h"
 #include "query_clause.h"
@@ -173,6 +174,19 @@ struct InsertQuery {
   // values[i][j] = 第 i 行第 j 列的值
   std::vector<std::vector<Value>> values;
 
+  // 值的源位置（诊断用，可为空）：value_spans[i][j] 对应 values[i][j]。
+  // 只用于报错定位，不参与任何语义/比较。
+  std::vector<std::vector<SSpan>> value_spans;
+
+  // 安全访问：没有对应位置时返回 nullptr
+  const SSpan *value_span(size_t row, size_t column) const {
+    if (row >= value_spans.size() || column >= value_spans[row].size()) {
+      return nullptr;
+    }
+    return sspan_valid(value_spans[row][column]) ? &value_spans[row][column]
+                                                 : nullptr;
+  }
+
   size_t row_count() const { return values.size(); }
   size_t column_count() const {
     if (values.empty()) {
@@ -220,6 +234,8 @@ struct UpdateQuery {
   struct Assignment {
     Identifier column;
     Value value;
+    // 右侧值的源位置（诊断用，可为空）
+    SSpan value_span = sspan_unknown();
   };
   std::vector<Assignment> assignments;
 
@@ -305,14 +321,18 @@ struct DropTableQuery {
 struct CreateDatabaseQuery {
   Identifier database;
 
-  std::string to_string() const { return "CREATE DATABASE " + database.display_name(); }
+  std::string to_string() const {
+    return "CREATE DATABASE " + database.display_name();
+  }
 };
 
 // DROP DATABASE
 struct DropDatabaseQuery {
   Identifier database;
 
-  std::string to_string() const { return "DROP DATABASE " + database.display_name(); }
+  std::string to_string() const {
+    return "DROP DATABASE " + database.display_name();
+  }
 };
 
 // USE DATABASE
@@ -339,14 +359,14 @@ public:
   Query() = delete;
 
   // 移动构造（编译器自动生成，但可以显式声明）
-  Query(Query&& other) noexcept = default;
-  Query& operator=(Query&& other) noexcept = default;
-  
+  Query(Query &&other) noexcept = default;
+  Query &operator=(Query &&other) noexcept = default;
+
   // 删除拷贝（明确表达意图）
   // 因为 std::unique_ptr 不可拷贝，所以包含 ConditionPtr的 struct 也不可拷贝。
   // Select, Update, Delete
-  Query(const Query&) = delete;
-  Query& operator=(const Query&) = delete;
+  Query(const Query &) = delete;
+  Query &operator=(const Query &) = delete;
 
   template <typename T>
   explicit Query(T stmt) : type_(stmt_type<T>()), stmt_(std::move(stmt)) {}
@@ -484,18 +504,17 @@ public:
 
   // ---- 调试 ----
   std::string to_string() const {
-  auto current_type = type_; 
-  return std::visit(
-      [current_type](const auto& stmt) {
+    auto current_type = type_;
+    return std::visit(
+        [current_type](const auto &stmt) {
           if constexpr (requires { stmt.to_string(); }) {
-              return stmt.to_string();
+            return stmt.to_string();
           } else {
-              return query_type_to_string(current_type);
+            return query_type_to_string(current_type);
           }
-      }, 
-      stmt_
-  );
-}
+        },
+        stmt_);
+  }
 
 private:
   QueryType type_ = QueryType::UNKNOWN;
@@ -505,10 +524,9 @@ private:
 // ============================================================
 // 便捷构造函数（工厂函数）
 // ============================================================
-//用可变参数模板做完美转发
-template <typename T>
-inline Query make_query(T&& q) {
-    return Query(std::forward<T>(q));
+// 用可变参数模板做完美转发
+template <typename T> inline Query make_query(T &&q) {
+  return Query(std::forward<T>(q));
 }
 
 } // namespace sql

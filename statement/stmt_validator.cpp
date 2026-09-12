@@ -73,8 +73,13 @@ inline std::expected<void, StmtError> failed(StmtError error) {
 } // namespace
 
 StmtError StatementValidator::make_error(StmtErrorCode code,
-                                         std::string message) {
-  return StmtError(code, std::move(message));
+                                         std::string message,
+                                         const sql::Identifier &target) const {
+  StmtError error(code, std::move(message));
+  if (resolver_ && !target.empty()) {
+    error.span = resolver_(target);
+  }
+  return error;
 }
 
 // ============================================================
@@ -168,7 +173,7 @@ StatementValidator::require_database(const sql::Identifier &db) const {
   }
   if (!catalog_.database_exists(db)) {
     return failed(make_error(StmtErrorCode::DATABASE_NOT_FOUND,
-                             "database not found: " + db.str()));
+                             "database not found: " + db.str(), db));
   }
   return ok();
 }
@@ -187,7 +192,7 @@ StatementValidator::load_table(const sql::Identifier &db,
   if (!schema.has_value()) {
     return std::unexpected(
         make_error(StmtErrorCode::TABLE_NOT_FOUND,
-                   "table not found: " + db.str() + "." + table.str()));
+                   "table not found: " + db.str() + "." + table.str(), table));
   }
   return std::move(*schema);
 }
@@ -197,7 +202,7 @@ StatementValidator::require_column(const sql::TableSchema &schema,
                                    const sql::Identifier &column) const {
   if (schema.column(column) == nullptr) {
     return failed(make_error(StmtErrorCode::COLUMN_NOT_FOUND,
-                             "column not found: " + column.str()));
+                             "column not found: " + column.str(), column));
   }
   return ok();
 }
@@ -216,15 +221,23 @@ std::expected<void, StmtError> StatementValidator::check_condition_columns(
 
 std::expected<void, StmtError>
 StatementValidator::check_value(const sql::ColumnDef &column,
-                                const sql::Value &value) const {
+                                const sql::Value &value,
+                                SSpan value_span) const {
   // 直接复用 sql_types 的列值校验（类型族 + 范围 + 长度 + NOT NULL），
   // 这里不需要 schema 的其它信息，所以用一个空 schema 调用即可。
   static const sql::TableSchema empty_schema;
   const auto err = empty_schema.validate_value(column, value);
   if (err != sql::SchemaError::OK) {
-    return failed(make_error(map_schema_error(err),
-                             std::string(sql::TableSchema::error_message(err)) +
-                                 " @ " + column.name.str()));
+    StmtError error(map_schema_error(err),
+                    std::string(sql::TableSchema::error_message(err)) + " @ " +
+                        column.name.str());
+    // 定位优先级：值自身的位置 > 列名在 SQL 里的位置 > 未知
+    if (sspan_valid(value_span)) {
+      error.span = value_span;
+    } else if (resolver_ && !column.name.empty()) {
+      error.span = resolver_(column.name);
+    }
+    return failed(std::move(error));
   }
   return ok();
 }
@@ -240,9 +253,9 @@ StatementValidator::validate_create_database(const sql::Query &stmt) const {
                              "invalid CREATE DATABASE query"));
   }
   if (catalog_.database_exists(query->database)) {
-    return failed(
-        make_error(StmtErrorCode::DATABASE_ALREADY_EXISTS,
-                   "database already exists: " + query->database.str()));
+    return failed(make_error(
+        StmtErrorCode::DATABASE_ALREADY_EXISTS,
+        "database already exists: " + query->database.str(), query->database));
   }
   return ok();
 }
@@ -270,7 +283,8 @@ StatementValidator::validate_create_table(const sql::Query &stmt) const {
   }
   if (catalog_.table_exists(db, query->table)) {
     return failed(make_error(StmtErrorCode::TABLE_ALREADY_EXISTS,
-                             "table already exists: " + query->table.str()));
+                             "table already exists: " + query->table.str(),
+                             query->table));
   }
 
   // 复用 sql_types 的 schema 校验（列名重复/主键唯一/长度声明...）
@@ -370,19 +384,22 @@ StatementValidator::validate_insert(const sql::Query &stmt) const {
       const auto *column = schema.column(name);
       if (column == nullptr) {
         return failed(make_error(StmtErrorCode::COLUMN_NOT_FOUND,
-                                 "column not found: " + name.str()));
+                                 "column not found: " + name.str(), name));
       }
       target_columns.push_back(column);
     }
   }
 
-  for (const auto &row : query->values) {
+  for (size_t row_index = 0; row_index < query->values.size(); ++row_index) {
+    const auto &row = query->values[row_index];
     if (row.size() != target_columns.size()) {
       return failed(make_error(StmtErrorCode::COLUMN_COUNT_MISMATCH,
                                "value count does not match column count"));
     }
     for (size_t i = 0; i < row.size(); ++i) {
-      if (auto err = check_value(*target_columns[i], row[i]);
+      const SSpan *span = query->value_span(row_index, i);
+      if (auto err = check_value(*target_columns[i], row[i],
+                                 span != nullptr ? *span : sspan_unknown());
           !err.has_value()) {
         return err;
       }
@@ -399,7 +416,8 @@ StatementValidator::validate_insert(const sql::Query &stmt) const {
       if (!mentioned && !column.nullable) {
         return failed(make_error(StmtErrorCode::COLUMN_ATTR_NULL_MISMATCH,
                                  "missing value for NOT NULL column: " +
-                                     column.name.str()));
+                                     column.name.str(),
+                                 column.name));
       }
     }
   }
@@ -429,16 +447,20 @@ StatementValidator::validate_update(const sql::Query &stmt) const {
     const auto *column = schema.column(assignment.column);
     if (column == nullptr) {
       return failed(make_error(StmtErrorCode::COLUMN_NOT_FOUND,
-                               "column not found: " + assignment.column.str()));
+                               "column not found: " + assignment.column.str(),
+                               assignment.column));
     }
-    if (auto err = check_value(*column, assignment.value); !err.has_value()) {
+    if (auto err =
+            check_value(*column, assignment.value, assignment.value_span);
+        !err.has_value()) {
       return err;
     }
     // 主键不允许被更新（避免行迁移；如需支持再放开）
     if (column->primary_key) {
       return failed(make_error(StmtErrorCode::INVALID_SCHEMA,
                                "primary key column cannot be updated: " +
-                                   column->name.str()));
+                                   column->name.str(),
+                               column->name));
     }
   }
 
@@ -472,7 +494,8 @@ StatementValidator::validate_use(const sql::Query &stmt) const {
   }
   if (!catalog_.database_exists(query->database)) {
     return failed(make_error(StmtErrorCode::DATABASE_NOT_FOUND,
-                             "database not found: " + query->database.str()));
+                             "database not found: " + query->database.str(),
+                             query->database));
   }
   return ok();
 }

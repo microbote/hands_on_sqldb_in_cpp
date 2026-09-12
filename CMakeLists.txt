@@ -99,6 +99,8 @@ target_compile_features(sql_types PUBLIC cxx_std_23)
 #                     语义校验（StatementValidator）
 # ============================================================
 add_library(sql_statement STATIC
+    statement/source_span.cpp
+    statement/sql_highlight.cpp
     statement/stmt_builder.cpp
     statement/stmt_validator.cpp
 )

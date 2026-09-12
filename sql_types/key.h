@@ -38,7 +38,7 @@ namespace sql {
 //      [min_key_for_type, upper_key_for_type) 覆盖，不会串到别的族。
 // ============================================================
 class KeyCodecs {
- public:
+public:
   static constexpr uint8_t kTagNull = 0x00;
   static constexpr uint8_t kTagInt64 = 0x01;
   static constexpr uint8_t kTagString = 0x02;
@@ -66,7 +66,7 @@ class KeyCodecs {
   // ---- 编码 ----
 
   // 不带列类型：NULL 用 kTagNull 编码（KeySet 排序等逻辑层用途）
-  static Key to_key(const Value& val) {
+  static Key to_key(const Value &val) {
     if (val.is_null()) {
       return make_null_key(kTagNull);
     }
@@ -74,7 +74,7 @@ class KeyCodecs {
   }
 
   // 带列类型：存储层用这个（NULL 会用本族的 tag 编码）
-  static Key to_key(const Value& val, DataType column_type) {
+  static Key to_key(const Value &val, DataType column_type) {
     if (val.is_null()) {
       return make_null_key(tag_of(column_type));
     }
@@ -85,7 +85,7 @@ class KeyCodecs {
   // ---- 解码 ----
 
   // 解析失败返回 Value()（NULL）；可用 is_valid_key 先判定
-  static Value from_key(const Key& key, DataType type) {
+  static Value from_key(const Key &key, DataType type) {
     if (key.empty()) {
       return Value();
     }
@@ -99,7 +99,7 @@ class KeyCodecs {
       return Value();
     }
     if (static_cast<uint8_t>(key[1]) == kNullFlag) {
-      return Value();        // 本族的 NULL
+      return Value(); // 本族的 NULL
     }
     if (static_cast<uint8_t>(key[1]) != kValueFlag) {
       return Value();
@@ -107,20 +107,20 @@ class KeyCodecs {
     return decode_value(key, tag, type);
   }
 
-  static bool is_valid_key(const Key& key, DataType type) {
+  static bool is_valid_key(const Key &key, DataType type) {
     if (key.empty()) {
       return false;
     }
     const uint8_t tag = static_cast<uint8_t>(key[0]);
     if (tag == kTagNull) {
-      return key.size() == 2;               // 无类型 NULL
+      return key.size() == 2; // 无类型 NULL
     }
     if (tag != tag_of(type) || key.size() < 2) {
       return false;
     }
     const uint8_t flag = static_cast<uint8_t>(key[1]);
     if (flag == kNullFlag) {
-      return key.size() == 2;               // 本族 NULL
+      return key.size() == 2; // 本族 NULL
     }
     if (flag != kValueFlag) {
       return false;
@@ -129,8 +129,7 @@ class KeyCodecs {
     case kTagInt64:
       return key.size() == 2 + 8;
     case kTagBool:
-      return key.size() == 2 + 1 &&
-             (key[2] == 0x00 || key[2] == 0x01);
+      return key.size() == 2 + 1 && (key[2] == 0x00 || key[2] == 0x01);
     case kTagString: {
       std::string ignored;
       return decode_string(key, 2, ignored);
@@ -141,7 +140,7 @@ class KeyCodecs {
   }
 
   // 包含式上界：k 之后紧随的字节串（用于单点/闭区间的上界）。
-  static Key inclusive_upper_bound(const Key& k) {
+  static Key inclusive_upper_bound(const Key &k) {
     Key out = k;
     out.push_back('\0');
     return out;
@@ -165,42 +164,53 @@ class KeyCodecs {
   }
 
   // 本族的 NULL key（= 族下界）
-  static Key null_key_for_type(DataType type) {
-    return min_key_for_type(type);
+  static Key null_key_for_type(DataType type) { return min_key_for_type(type); }
+
+  // 非 NULL 值的"前缀 key"：[tag][VALUE_FLAG]
+  //
+  // 它不是任何值产生的完整 key（值 key 至少 3 字节），但它是**所有非 NULL 值
+  // key 的前缀**，可以当作"第一个非 NULL 值"的包含式下界，
+  // 用来把 NULL 排除在扫描范围之外（见 KeyRange::non_null()）。
+  static Key first_value_key(DataType type) {
+    const uint8_t tag = tag_of(type);
+    Key k;
+    k.push_back(static_cast<char>(tag));
+    k.push_back(static_cast<char>(kValueFlag));
+    return k;
   }
 
   // ---- 全序比较（存储层语义）----
   // NULL 最小；其余按编码后 key 的字节序。
 
-  static int compare(const Key& a, const Key& b) {
+  static int compare(const Key &a, const Key &b) {
     if (a == b) {
       return 0;
     }
     return a < b ? -1 : 1;
   }
 
-  static int compare(const Value& a, const Value& b) {
+  static int compare(const Value &a, const Value &b) {
     return compare(a.to_key(), b.to_key());
   }
 
-  static bool less(const Value& a, const Value& b) {
+  static bool less(const Value &a, const Value &b) {
     return a.to_key() < b.to_key();
   }
 
   // 字符串 key 的最小后继（用于需要"严格大于前缀"的场景）
-  static Key successor(const Key& k) {
+  static Key successor(const Key &k) {
     Key out = k;
     while (!out.empty() && static_cast<uint8_t>(out.back()) == 0xFF) {
       out.pop_back();
     }
     if (out.empty()) {
-      return Key();   // 没有后继（视为 +∞）
+      return Key(); // 没有后继（视为 +∞）
     }
     out.back() = static_cast<char>(static_cast<uint8_t>(out.back()) + 1);
     return out;
   }
 
- private:
+private:
   // [tag][0x00]：本族的 NULL key，也是本族的最小 key
   static Key make_null_key(uint8_t tag) {
     Key k;
@@ -209,7 +219,7 @@ class KeyCodecs {
     return k;
   }
 
-  static Key encode_value(const Value& val, uint8_t tag) {
+  static Key encode_value(const Value &val, uint8_t tag) {
     Key k;
     k.reserve(16);
     k.push_back(static_cast<char>(tag));
@@ -226,12 +236,12 @@ class KeyCodecs {
       encode_string(val.as_str(), k);
       break;
     default:
-      return Key();   // 不可编码的类型
+      return Key(); // 不可编码的类型
     }
     return k;
   }
 
-  static Value decode_value(const Key& key, uint8_t tag, DataType type) {
+  static Value decode_value(const Key &key, uint8_t tag, DataType type) {
     switch (tag) {
     case kTagBool: {
       if (key.size() != 3) {
@@ -260,17 +270,16 @@ class KeyCodecs {
   }
 
   // --- 大端序 ---
-  static void encode_be64(uint64_t v, Key& out) {
+  static void encode_be64(uint64_t v, Key &out) {
     for (size_t i = 0; i < 8; ++i) {
       out.push_back(static_cast<char>((v >> (56 - 8 * i)) & 0xFF));
     }
   }
 
-  static uint64_t decode_be64(const char* p) {
+  static uint64_t decode_be64(const char *p) {
     uint64_t v = 0;
     for (size_t i = 0; i < 8; ++i) {
-      v |= static_cast<uint64_t>(static_cast<uint8_t>(p[i]))
-           << (56 - 8 * i);
+      v |= static_cast<uint64_t>(static_cast<uint8_t>(p[i])) << (56 - 8 * i);
     }
     return v;
   }
@@ -285,7 +294,7 @@ class KeyCodecs {
   }
 
   // --- 字符串：0x00 -> 0x00 0xFF，结尾 0x00 ---
-  static void encode_string(std::string_view s, Key& out) {
+  static void encode_string(std::string_view s, Key &out) {
     out.reserve(out.size() + s.size() + 1);
     for (char c : s) {
       if (c == '\0') {
@@ -295,10 +304,10 @@ class KeyCodecs {
         out.push_back(c);
       }
     }
-    out.push_back('\0');  // 终止符
+    out.push_back('\0'); // 终止符
   }
 
-  static bool decode_string(const Key& key, size_t pos, std::string& out) {
+  static bool decode_string(const Key &key, size_t pos, std::string &out) {
     out.clear();
     while (pos < key.size()) {
       const unsigned char c = static_cast<unsigned char>(key[pos]);
@@ -313,10 +322,10 @@ class KeyCodecs {
         pos += 2;
         continue;
       }
-      return pos + 1 == key.size();   // 终止符必须正好在结尾
+      return pos + 1 == key.size(); // 终止符必须正好在结尾
     }
     return false;
   }
 };
 
-}  // namespace sql
+} // namespace sql
