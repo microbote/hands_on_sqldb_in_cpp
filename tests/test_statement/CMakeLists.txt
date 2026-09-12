@@ -10,15 +10,11 @@ add_executable(test_statement
     test_highlight.cpp
 )
 
-target_include_directories(test_statement PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}   # memory_catalog.h
-)
-
 target_link_libraries(test_statement PRIVATE
     sql_statement
     sql_parser_lib
     sql_types
-    test_fwk
+    test_fwk        # test_framework.h + memory_catalog.h（共享测试辅助）
 )
 
 add_test(NAME test_statement COMMAND test_statement)

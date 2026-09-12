@@ -74,7 +74,8 @@ RELATION_SRCS  = $(RELATION_DIR)/value.cpp \
 # Tests
 # parser 测试在 tests/test_parser/、statement 测试在 tests/test_statement/、
 # sql_types 测试在 tests/test_sql_types/，三者都走 CMake/ctest
-# （见下面的 sql-types-test / parser-test / statement-test / cmake-test 目标）。
+# （见下面的 sql-types-test / parser-test / statement-test / planner-test /
+#   relation-test / executor-test / cmake-test 目标）。
 TESTS_SRCS     = $(TESTS_DIR)/test_condition.cpp \
                  $(TESTS_DIR)/test_optimizer.cpp \
                  $(TESTS_DIR)/test_executor.cpp \
@@ -285,7 +286,8 @@ $(foreach t,$(TEST_TARGETS),$(eval $(call TEST_RULE,$(t))))
 # ============================================================
 # sql_types 模块（新构建系统走 CMake，与上面的 legacy 目标解耦）
 # ============================================================
-.PHONY: sql-types sql-types-test parser-test statement-test cmake-test
+.PHONY: sql-types sql-types-test parser-test statement-test planner-test \
+        relation-test executor-test cmake-test
 
 sql-types:
 	cmake --build $(BUILD_DIR) --target sql_types
@@ -302,7 +304,19 @@ statement-test:
 	cmake --build $(BUILD_DIR) -j4
 	./$(BUILD_DIR)/run_tests/test_statement
 
-# 跑 CMake/ctest 里的全部测试（sql_types + parser）
+planner-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_planner
+
+relation-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_relation
+
+executor-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_executor
+
+# 跑 CMake/ctest 里的全部测试（sql_types + parser + statement + planner + relation）
 cmake-test:
 	cmake --build $(BUILD_DIR) -j4
 	ctest --test-dir $(BUILD_DIR) --output-on-failure

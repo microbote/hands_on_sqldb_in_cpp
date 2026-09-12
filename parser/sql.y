@@ -445,7 +445,7 @@ opt_limit:
             yyerror("LIMIT out of range");
             YYERROR;
         }
-        $$ = make_limit_node(limit_value, 0);
+        $$ = make_limit_node(limit_value, 1, 0, 0);
     }
     | TOK_LIMIT TOK_NUMBER TOK_OFFSET TOK_NUMBER {
         int limit_value = 0;
@@ -455,7 +455,7 @@ opt_limit:
             yyerror("LIMIT/OFFSET out of range");
             YYERROR;
         }
-        $$ = make_limit_node(limit_value, offset_value);
+        $$ = make_limit_node(limit_value, 1, offset_value, 1);
     }
     | TOK_LIMIT TOK_NUMBER ',' TOK_NUMBER {  /* MySQL 风格: LIMIT offset, count */
         int limit_value = 0;
@@ -465,7 +465,7 @@ opt_limit:
             yyerror("LIMIT out of range");
             YYERROR;
         }
-        $$ = make_limit_node(limit_value, offset_value);
+        $$ = make_limit_node(limit_value, 1, offset_value, 1);
     }
     ;
 

@@ -780,7 +780,7 @@ void free_order_node(ASTNode *node) {
 /* ============================================================
    NODE_LIMIT
    ============================================================ */
-ASTNode *make_limit_node(int limit, int offset) {
+ASTNode *make_limit_node(int limit, int has_limit, int offset, int has_offset) {
   ASTNode *node = ast_alloc_node(NODE_LIMIT, sizeof(LimitNode));
   USE_DATA(data, node, LimitNode);
   if (data == nullptr) {
@@ -789,6 +789,8 @@ ASTNode *make_limit_node(int limit, int offset) {
   }
   data->limit = limit;
   data->offset = offset;
+  data->has_limit = has_limit;
+  data->has_offset = has_offset;
   return node;
 }
 
@@ -796,9 +798,15 @@ int print_limit_node(ASTNode *node, int indent, int offset, char *buffer,
                      size_t buffer_size) {
   LimitNode *data = (LimitNode *)node->data;
   offset = append_indent(buffer, buffer_size, offset, indent);
-  offset =
-      safe_append(buffer, buffer_size, offset, "LIMIT(limit=%d, offset=%d)\n",
-                  data->limit, data->offset);
+  // 显式写出才打印数值：`LIMIT 0` 与"没写 LIMIT"必须能区分
+  char limit_text[32];
+  char offset_text[32];
+  snprintf(limit_text, sizeof(limit_text), data->has_limit ? "%d" : "-",
+           data->limit);
+  snprintf(offset_text, sizeof(offset_text), data->has_offset ? "%d" : "-",
+           data->offset);
+  offset = safe_append(buffer, buffer_size, offset, "LIMIT(limit=%s, offset=%s)\n",
+                       limit_text, offset_text);
   return offset;
 }
 

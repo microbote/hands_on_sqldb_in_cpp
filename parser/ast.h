@@ -318,11 +318,13 @@ void free_order_node(ASTNode *node);
 
 // NODE_LIMIT
 typedef struct LimitNode {
-  int limit;  // 限制数量
-  int offset; // 偏移量
+  int limit;      // 限制数量
+  int offset;     // 偏移量
+  int has_limit;  // LIMIT 是否显式写出（`LIMIT 0` 与"没写 LIMIT"不同！）
+  int has_offset; // OFFSET 是否显式写出
 } LimitNode;
 
-ASTNode *make_limit_node(int limit, int offset);
+ASTNode *make_limit_node(int limit, int has_limit, int offset, int has_offset);
 int print_limit_node(ASTNode *node, int indent, int offset, char *buffer,
                      size_t buffer_size);
 void free_limit_node(ASTNode *node);

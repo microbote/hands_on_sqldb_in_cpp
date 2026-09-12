@@ -11,8 +11,8 @@ namespace kv {
 // ============================================================
 // MockIterator 实现
 // ============================================================
-MockIterator::MockIterator(const std::map<Key, ByteValue>* data,
-                           const KeyRange& range)
+MockIterator::MockIterator(const std::map<Key, ByteValue> *data,
+                           const KeyRange &range)
     : data_(data), range_(range), pos_(data_->end()), status_(Status::OK) {
   if (!data_) {
     status_ = Status::InternalError;
@@ -24,7 +24,7 @@ MockIterator::MockIterator(const std::map<Key, ByteValue>* data,
   seek_to_first();
 }
 
-void MockIterator::seek(const Key& key) {
+void MockIterator::seek(const Key &key) {
   if (!data_) {
     status_ = Status::InternalError;
     error_msg_ = "Data pointer is null";
@@ -32,15 +32,27 @@ void MockIterator::seek(const Key& key) {
   }
 
   if (range_.direction == ScanDirection::kForward) {
-    pos_ = data_->lower_bound(key); //first of >= key
+    // 正向：第一个 >= key 的 key；不能跑到 range.start 之前
+    Key target = key;
+    if (range_.start && target < *range_.start) {
+      target = *range_.start;
+    }
+    pos_ = data_->lower_bound(target); // first of >= key
   } else {
-    // 反向扫描：找 <= key 的最后一个
-    auto it = data_->upper_bound(key); //first of > key
+    // 反向扫描：找 <= key 的最后一个；排他上界 range.end 本身不能返回
+    auto it = data_->upper_bound(key); // first of > key
     if (it == data_->begin()) {
       pos_ = data_->end();
     } else {
       --it;
       pos_ = it;
+    }
+    if (pos_ != data_->end() && range_.end && pos_->first >= *range_.end) {
+      if (pos_ == data_->begin()) {
+        pos_ = data_->end();
+      } else {
+        --pos_;
+      }
     }
   }
 
@@ -54,9 +66,20 @@ void MockIterator::seek_to_first() {
     return;
   }
 
+  // 必须尊重 range 边界：有界区间不能从整库的第一条/最后一条开始，
+  // 否则 seek_to_first() 之后 valid() 立刻为 false，整个扫描扫不到东西。
+  // （LevelDBIterator::seek_to_first 是这么做的，这里对齐它的行为）
   if (range_.direction == ScanDirection::kForward) {
+    if (range_.start) {
+      seek(*range_.start);
+      return;
+    }
     pos_ = data_->begin();
   } else {
+    if (range_.end) {
+      seek(*range_.end); // seek() 会把 == end 的那条排掉
+      return;
+    }
     if (data_->empty()) {
       pos_ = data_->end();
     } else {
@@ -77,7 +100,19 @@ void MockIterator::seek_to_last() {
   }
 
   if (range_.direction == ScanDirection::kForward) {
-    if (data_->empty()) {
+    // 区间内最后一个 key（注意排他上界）
+    if (range_.end) {
+      auto it = data_->lower_bound(*range_.end);
+      if (it == data_->begin()) {
+        pos_ = data_->end();
+      } else {
+        --it;
+        pos_ = it;
+      }
+      if (pos_ != data_->end() && range_.start && pos_->first < *range_.start) {
+        pos_ = data_->end();
+      }
+    } else if (data_->empty()) {
       pos_ = data_->end();
     } else {
       auto it = data_->end();
@@ -85,14 +120,23 @@ void MockIterator::seek_to_last() {
       pos_ = it;
     }
   } else {
-    pos_ = data_->begin();
+    // 反向迭代器的"最后"= 区间内第一个 key
+    if (range_.start) {
+      pos_ = data_->lower_bound(*range_.start);
+    } else {
+      pos_ = data_->begin();
+    }
+    if (pos_ != data_->end() && range_.end && pos_->first >= *range_.end) {
+      pos_ = data_->end();
+    }
   }
 
   update_status();
 }
 
 void MockIterator::next() {
-  if (!valid()) return;
+  if (!valid())
+    return;
 
   if (range_.direction == ScanDirection::kForward) {
     ++pos_;
@@ -108,7 +152,8 @@ void MockIterator::next() {
 }
 
 void MockIterator::prev() {
-  if (!valid()) return;
+  if (!valid())
+    return;
 
   if (range_.direction == ScanDirection::kForward) {
     if (pos_ == data_->begin()) {
@@ -124,30 +169,38 @@ void MockIterator::prev() {
 }
 
 bool MockIterator::valid() const {
-  if (!data_) return false;
-  if (status_ != Status::OK) return false;
-  if (pos_ == data_->end()) return false;
+  if (!data_)
+    return false;
+  if (status_ != Status::OK)
+    return false;
+  if (pos_ == data_->end())
+    return false;
 
   // 检查范围
-  const Key& key = pos_->first;
-  if (range_.start && key < *range_.start) return false;
-  if (range_.end && key >= *range_.end) return false;
+  const Key &key = pos_->first;
+  if (range_.start && key < *range_.start)
+    return false;
+  if (range_.end && key >= *range_.end)
+    return false;
 
   return true;
 }
 
 Key MockIterator::key() const {
-  if (!valid()) return "";
+  if (!valid())
+    return "";
   return pos_->first;
 }
 
 ByteValue MockIterator::value() const {
-  if (!valid()) return "";
+  if (!valid())
+    return "";
   return pos_->second;
 }
 
 KVPair MockIterator::kvpair() const {
-  if (!valid()) return {"", std::nullopt};
+  if (!valid())
+    return {"", std::nullopt};
   return {pos_->first, pos_->second};
 }
 
@@ -178,11 +231,14 @@ void MockIterator::update_status() {
 }
 
 bool MockIterator::in_range() const {
-  if (pos_ == data_->end()) return false;
+  if (pos_ == data_->end())
+    return false;
 
-  const Key& key = pos_->first;
-  if (range_.start && key < *range_.start) return false;
-  if (range_.end && key >= *range_.end) return false;
+  const Key &key = pos_->first;
+  if (range_.start && key < *range_.start)
+    return false;
+  if (range_.end && key >= *range_.end)
+    return false;
 
   return true;
 }
@@ -222,7 +278,7 @@ Status MockEngine::close_database() {
 bool MockEngine::is_open() const { return is_open_.load(); }
 
 // ----- 单条操作 -----
-Status MockEngine::get(const Key& key, ByteValue* value) {
+Status MockEngine::get(const Key &key, ByteValue *value) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -241,7 +297,7 @@ Status MockEngine::get(const Key& key, ByteValue* value) {
   return Status::OK;
 }
 
-Status MockEngine::put(const Key& key, const ByteValue& value) {
+Status MockEngine::put(const Key &key, const ByteValue &value) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -252,7 +308,7 @@ Status MockEngine::put(const Key& key, const ByteValue& value) {
   return Status::OK;
 }
 
-Status MockEngine::remove(const Key& key) {
+Status MockEngine::remove(const Key &key) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -268,7 +324,7 @@ Status MockEngine::remove(const Key& key) {
   return Status::OK;
 }
 
-bool MockEngine::exists(const Key& key) {
+bool MockEngine::exists(const Key &key) {
   if (!is_open_) {
     return false;
   }
@@ -278,9 +334,9 @@ bool MockEngine::exists(const Key& key) {
 }
 
 // ----- 批量操作 -----
-Status MockEngine::get_batch(const std::vector<Key>& keys,
+Status MockEngine::get_batch(const std::vector<Key> &keys,
                              MissingKeyPolicy policy,
-                             std::vector<std::optional<ByteValue>>* values) {
+                             std::vector<std::optional<ByteValue>> *values) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -294,7 +350,7 @@ Status MockEngine::get_batch(const std::vector<Key>& keys,
   values->clear();
   values->reserve(keys.size());
 
-  for (const auto& key : keys) {
+  for (const auto &key : keys) {
     auto it = data_.find(key);
     if (it == data_.end()) {
       if (policy == MissingKeyPolicy::kReturnError) {
@@ -309,23 +365,23 @@ Status MockEngine::get_batch(const std::vector<Key>& keys,
   return Status::OK;
 }
 
-Status MockEngine::write_batch(const WriteBatch& batch) {
+Status MockEngine::write_batch(const WriteBatch &batch) {
   if (!is_open_) {
     return Status::InternalError;
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
 
-  for (const auto& op : batch.ops()) {
+  for (const auto &op : batch.ops()) {
     if (op.type == WriteBatch::OpType::kPut) {
       if (op.data.value.has_value()) {
         data_[op.data.key] = op.data.value.value();
       } else {
         // 如果 value 为空，视为删除
-        //data_.erase(op.data.key);
+        // data_.erase(op.data.key);
         fprintf(stderr, "key:[%s]'s value is empty\n", op.data.key.c_str());
       }
-    } else {  // kRemove
+    } else { // kRemove
       data_.erase(op.data.key);
     }
   }
@@ -334,7 +390,7 @@ Status MockEngine::write_batch(const WriteBatch& batch) {
 }
 
 // ----- 迭代器 -----
-std::unique_ptr<Iterator> MockEngine::new_iterator(const KeyRange& range) {
+std::unique_ptr<Iterator> MockEngine::new_iterator(const KeyRange &range) {
   if (!is_open_) {
     return nullptr;
   }
@@ -372,9 +428,9 @@ size_t MockEngine::size() const {
 void MockEngine::dump() const {
   std::lock_guard<std::mutex> lock(mutex_);
   std::cout << "MockEngine dump (" << data_.size() << " entries):\n";
-  for (const auto& [key, value] : data_) {
+  for (const auto &[key, value] : data_) {
     std::cout << "  " << key << " -> " << value << "\n";
   }
 }
 
-}  // namespace kv
+} // namespace kv

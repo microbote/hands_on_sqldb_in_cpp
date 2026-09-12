@@ -216,10 +216,12 @@ StatementBuilder::build_limit(const ASTNode *ast) {
         make_error(StmtErrorCode::INVALID_AST_NODE, "limit node is malformed"));
   }
   const auto *limit = reinterpret_cast<const LimitNode *>(ast->data);
-  if (limit->limit > 0) {
+  // 注意：`LIMIT 0` 是"返回零行"，不是"没有 LIMIT" —— 必须看显式标志位。
+  // （之前用 `> 0` 判断，LIMIT 0 会被当成没有限制，返回全部行。）
+  if (limit->has_limit) {
     clause.row_count = static_cast<size_t>(limit->limit);
   }
-  if (limit->offset > 0) {
+  if (limit->has_offset) {
     clause.offset = static_cast<size_t>(limit->offset);
   }
   return clause;

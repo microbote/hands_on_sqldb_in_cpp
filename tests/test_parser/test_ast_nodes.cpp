@@ -135,7 +135,7 @@ TEST(AstNodes, SelectNodeConstruction) {
     free_ast(select);
 
     // 带 LIMIT
-    ASTNode* limit = make_limit_node(10, 0);
+    ASTNode* limit = make_limit_node(10, 1, 0, 0);
     select = make_select_node("users", nullptr, nullptr, nullptr, limit);
     auto* limit_data = (LimitNode*)limit->data;
     CHECK_EQ(limit_data->limit, 10);
@@ -315,7 +315,7 @@ TEST(AstNodes, OrderAndLimitNodes) {
     CHECK(((OrderNode*)order_desc->data)->direction == OP_DESC);
     free_ast(order_desc);
 
-    ASTNode* limit = make_limit_node(10, 20);
+    ASTNode* limit = make_limit_node(10, 1, 20, 1);
     auto* limit_data = (LimitNode*)limit->data;
     CHECK_EQ(limit_data->limit, 10);
     CHECK_EQ(limit_data->offset, 20);
@@ -350,7 +350,7 @@ TEST(AstNodes, ComplexAstBuildsAndFreesRecursively) {
                                        make_string_node("active"));
     ASTNode* condition = make_binary_node(cond1, OP_AND, cond2);
     ASTNode* order = make_order_node("id", OP_DESC);
-    ASTNode* limit = make_limit_node(10, 5);
+    ASTNode* limit = make_limit_node(10, 1, 5, 1);
 
     ASTNode* select = make_select_node("users", columns, condition, order, limit);
     CHECK(select != nullptr);

@@ -118,6 +118,86 @@ target_link_libraries(sql_statement PUBLIC
 
 target_compile_features(sql_statement PUBLIC cxx_std_23)
 
+# ============================================================
+# planner 静态库：Query -> 重写 -> 优化（OptimizedQuery）-> Plan 树
+# ============================================================
+add_library(sql_planner STATIC
+    planner/plan.cpp
+    planner/planner.cpp
+    planner/optimizer.cpp
+    planner/rewriter.cpp
+)
+
+target_include_directories(sql_planner PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}            # "planner/optimizer.h" / "sql_types/query.h"
+    ${CMAKE_CURRENT_SOURCE_DIR}/sql_types  # "catalog.h" / "schema.h"
+    ${CMAKE_CURRENT_SOURCE_DIR}/planner    # "planner_defs.h" / "rewriter.h"
+)
+
+target_link_libraries(sql_planner PUBLIC
+    sql_types
+)
+
+target_compile_features(sql_planner PUBLIC cxx_std_23)
+
+# ============================================================
+# KV 存储层（mock 引擎；leveldb 仍走 legacy Makefile，
+# 需要时把 leveldb_engine.cpp + ../Debug 的头/库接进来即可）
+# ============================================================
+add_library(sql_kv STATIC
+    storage/mock_engine/mock_engine.cpp
+)
+
+target_include_directories(sql_kv PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_features(sql_kv PUBLIC cxx_std_23)
+
+# ============================================================
+# relation 关系层：sql::Catalog 的 KV 实现 + Table/Cursor 视图
+# ============================================================
+add_library(sql_relation STATIC
+    relation/cursor.cpp
+    relation/kv_catalog.cpp
+    relation/table.cpp
+)
+
+target_include_directories(sql_relation PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}            # "storage/kv_engine/kv_engine.h"
+    ${CMAKE_CURRENT_SOURCE_DIR}/relation   # "key_prefix.h" / "table.h"
+    ${CMAKE_CURRENT_SOURCE_DIR}/sql_types  # "catalog.h" / "schema.h"
+)
+
+target_link_libraries(sql_relation PUBLIC
+    sql_types
+    sql_kv
+)
+
+target_compile_features(sql_relation PUBLIC cxx_std_23)
+
+# ============================================================
+# executor 执行层：计划树 -> Volcano 算子树 -> 客户端游标
+# ============================================================
+add_library(sql_executor STATIC
+    executor/executor.cpp
+)
+
+target_include_directories(sql_executor PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/executor
+    ${CMAKE_CURRENT_SOURCE_DIR}/planner
+    ${CMAKE_CURRENT_SOURCE_DIR}/relation
+    ${CMAKE_CURRENT_SOURCE_DIR}/sql_types
+)
+
+target_link_libraries(sql_executor PUBLIC
+    sql_planner
+    sql_relation
+)
+
+target_compile_features(sql_executor PUBLIC cxx_std_23)
+
 # 添加测试子目录
 enable_testing()
 add_subdirectory(tests)
