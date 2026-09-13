@@ -1,6 +1,8 @@
 // parser.cpp
 #include "parser.h"
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -17,9 +19,30 @@ void lex_reset_location(void);
 }
 
 // ast.cpp 里的调试开关（C++ 链接）
-extern int ast_debug;
+extern std::atomic<int> ast_debug;
 
 namespace parser {
+
+// ============================================================
+// 解析串行化（P0：服务端多线程安全）
+//
+// 词法/语法层用的是**进程级全局状态**：
+//   - flex 的扫描缓冲/yytext/yyleng/yylloc/yylineno（sql.l 非重入）；
+//   - ast.cpp 的 `g_parsed_ast`（语法动作 set_parsed_ast 写它）；
+//   - 本文件的 `g_parser_state`（yyerror 的错误接收方）。
+// 所以同一时刻只能有一次解析在跑：整个 parse 操作（登记错误接收方 ->
+// yyparse -> 取走 AST -> 摘掉接收方）都在这把锁里。
+//
+// 代价与后续：解析一条语句是微秒级，而我们的引擎是"单写者 + 同步执行"，
+// 这把锁远不是瓶颈；等 M3 需要真并行解析时，再按 `parser/README.md`
+// 的"可重入化清单"把 bison 改成纯解析器（%define api.pure）+ flex
+// %option reentrant，然后把这把锁删掉（那时 `lex_collect_tokens` 也一并
+// 变成每次调用自己的扫描器）。
+// ============================================================
+std::mutex &parse_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
 
 // ============================================================
 // 解析器全局状态（用于错误回调）
@@ -74,28 +97,26 @@ void yyerror(const char *s) {
 // ============================================================
 // Parser 实现
 // ============================================================
-Parser::Parser() {
-  // 注册当前实例到全局状态
-  g_parser_state.instance = this;
-  g_parser_state.error_buffer.clear();
-  g_parser_state.has_error = false;
-
-  log("[Parser] Created");
-}
+Parser::Parser() { log("[Parser] Created"); }
 
 Parser::~Parser() {
   log("[Parser] Destroyed (parses: " + std::to_string(parse_count_) +
       ", errors: " + std::to_string(error_count_) + ")");
-
-  // 清理全局状态
-  g_parser_state.instance = nullptr;
 }
 
 ParseResult Parser::parse(const std::string &sql) {
-  // 重置状态
-  last_error_.clear();
-  g_parser_state.error_buffer.clear();
-  g_parser_state.has_error = false;
+  // 全局词法/语法状态：整个解析串行化（见文件头的说明）
+  std::lock_guard<std::mutex> lock(parse_mutex());
+
+  // 只在本条语句的解析期间登记错误接收方：解析结束立刻摘掉，
+  // 免得把另一个 Parser 的 (this) 留在全局状态里。
+  g_parser_state.instance = this;
+  struct Unregister {
+    ~Unregister() { g_parser_state.instance = nullptr; }
+  } unregister;
+
+  // 重置状态（已持锁，用不加锁的版本）
+  clear_error_state();
 
   ASTNode *raw_ast = nullptr;
   bool success = do_parse(sql, &raw_ast);
@@ -222,7 +243,7 @@ std::string Parser::error_detail() const {
   return last_error_;
 }
 
-void Parser::reset() {
+void Parser::clear_error_state() {
   last_error_.clear();
   g_parser_state.error_buffer.clear();
   g_parser_state.has_error = false;
@@ -230,6 +251,12 @@ void Parser::reset() {
   g_parser_state.error_column = 0;
   g_parser_state.error_end_line = 0;
   g_parser_state.error_end_column = 0;
+}
+
+void Parser::reset() {
+  // 全局状态：和 parse() 共用同一把锁（本函数可能在别的线程调用）
+  std::lock_guard<std::mutex> lock(parse_mutex());
+  clear_error_state();
 }
 
 // ============================================================

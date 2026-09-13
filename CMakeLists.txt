@@ -240,6 +240,39 @@ target_compile_features(sql_session PUBLIC cxx_std_23)
 # ============================================================
 # 命令行客户端 sqldb：SQL 文本 -> session -> 表格输出
 # ============================================================
+# ============================================================
+# 服务器（协程框架）：server/ —— 依赖 sql_session + sql_kv
+#
+#   一个进程 = 一份 KVStore + N 条连接协程 + parse 服务线程 + 写线程。
+#   本地 CLI（sqldb）不依赖它，也不会因为服务器而改变行为。
+# ============================================================
+add_library(sql_server STATIC
+    server/config.cpp
+    server/loop.cpp
+    server/protocol.cpp
+    server/service.cpp
+    server/server.cpp
+)
+
+target_include_directories(sql_server PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/server
+)
+
+target_link_libraries(sql_server PUBLIC
+    sql_session
+    sql_kv
+    fmt::fmt
+)
+
+target_compile_features(sql_server PUBLIC cxx_std_23)
+
+find_package(Threads REQUIRED)
+target_link_libraries(sql_server PUBLIC Threads::Threads)
+
+add_executable(sqldb-server server/main_server.cpp)
+target_link_libraries(sqldb-server PRIVATE sql_server)
+
 add_executable(sqldb cmdline/main.cpp)
 
 target_link_libraries(sqldb PRIVATE sql_session)

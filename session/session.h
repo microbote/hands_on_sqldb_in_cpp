@@ -30,6 +30,7 @@
 
 #include "common/source_span.h"
 #include "executor/executor.h"
+#include "parser/parser.h"
 #include "relation/kv_catalog.h"
 #include "sql_types/cursor.h"
 #include "sql_types/identifier.h"
@@ -138,6 +139,34 @@ struct SessionError {
 };
 
 // ============================================================
+// 解析产物（parse 与 execute 两段的接口）
+//
+//   parsed = session.parse(sql)          // 纯解析：可以在**别的线程**（parser
+//                                        // 服务线程）上做，产物 move 回来
+//   cursor = session.execute_parsed(parsed)   // 建 Query + 校验 + 执行
+//
+// 拆两段是为了服务器：解析有进程级全局状态，只允许一个线程做；建 Query /
+// 校验 / 执行没有全局状态，留在会话自己的线程上。本地调用者继续用
+// `execute(sql)`（内部就是这两步）。
+// ============================================================
+struct ParsedStatement {
+  parser::ASTNodePtr ast; // 整棵 AST（含 EXPLAIN 前缀节点，如果有）
+  bool explain = false;   // 带 EXPLAIN 前缀
+  bool analyze = false;   // EXPLAIN ANALYZE
+  // 只读语句（SELECT，或 EXPLAIN ... SELECT）：服务器据此路由 ——
+  // 只读且不在事务里 -> 读线程就地执行；其余 -> 写线程排队。
+  // 由 AST 根节点类型推出（不看 SQL 文本，避免字符串启发式）。
+  bool read_only = false;
+  std::string sql; // 原文（诊断用）
+
+  ParsedStatement() = default;
+  ParsedStatement(parser::ASTNodePtr tree, bool with_explain, bool with_analyze,
+                  bool is_read_only, std::string text)
+      : ast(std::move(tree)), explain(with_explain), analyze(with_analyze),
+        read_only(is_read_only), sql(std::move(text)) {}
+};
+
+// ============================================================
 // Session
 // ============================================================
 class Session {
@@ -165,6 +194,16 @@ public:
   // NOT_SUPPORTED；ANALYZE 只允许 SELECT（写语句会真的改数据）。
   std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
   execute(const std::string &sql);
+
+  // 只解析（不建 Query、不校验）：服务器把它丢到 parser 服务线程上跑
+  std::expected<ParsedStatement, SessionError> parse(const std::string &sql);
+  // 执行一个已经解析好的语句（建 Query + 校验 + 执行）
+  std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+  execute_parsed(const ParsedStatement &parsed);
+  // 解析失败的统一收尾：中止的事务里优先报"事务已中止"
+  // （服务器把 parse 放到别的线程上跑，所以这个收尾要能单独调用）
+  SessionError
+  parse_error_to_session_error(const SessionError &parse_error) const;
 
   // 显式事务：BEGIN / COMMIT / ROLLBACK（语法层认出来的语句，
   // 见 parser/sql.y 的 transaction_stmt；执行与会话状态在这里）。
@@ -198,7 +237,7 @@ private:
     bool explain = false; // EXPLAIN 前缀
     bool analyze = false; // EXPLAIN ANALYZE
   };
-  std::expected<Prepared, SessionError> prepare(const std::string &statement);
+  std::expected<Prepared, SessionError> prepare(const ParsedStatement &parsed);
 
   // pipeline 后半段：重写 -> 优化 -> 生成计划树（execute/explain 共用）
   std::expected<std::unique_ptr<plan::PlanNode>, SessionError>

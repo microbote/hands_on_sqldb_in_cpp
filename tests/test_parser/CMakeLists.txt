@@ -13,13 +13,17 @@ add_executable(test_parser
     test_error_reporting.cpp
     test_transaction.cpp
     test_explain.cpp
+    test_thread_safety.cpp
 )
+
+find_package(Threads REQUIRED)
 
 # 链接 parser（自带 flex/bison 生成步骤）与 sql_types（用于别名一致性测试）
 target_link_libraries(test_parser PRIVATE
     sql_parser_lib
     sql_types
     test_fwk
+    Threads::Threads
 )
 
 add_test(NAME test_parser COMMAND test_parser)

@@ -208,17 +208,38 @@ plan::StatsProvider Session::stats_provider() const {
   };
 }
 
-// pipeline 前半段：解析 + 建 Query + 语义校验（execute/explain 共用）
-std::expected<Session::Prepared, SessionError>
-Session::prepare(const std::string &statement) {
-  // ---- 1) 解析 ----
+// 解析失败的统一收尾：中止的事务里，任何非事务语句都只报"事务已中止"
+// （否则用户会以为"改一下语法就能继续"，实际上必须 ROLLBACK）。
+// execute() 与服务器（parse 在别的线程上做）都走这里，行为一致。
+SessionError
+Session::parse_error_to_session_error(const SessionError &parse_error) const {
+  if (!tx_failed_) {
+    return parse_error;
+  }
+  return SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                      "current transaction is aborted; issue ROLLBACK",
+                      parse_error.sql);
+}
+
+// pipeline 第一段：**纯解析**（唯一有进程级全局状态的一步；
+// 服务器把它放到 parser 服务线程上跑，见 tests/test_server/）
+std::expected<ParsedStatement, SessionError>
+Session::parse(const std::string &statement) {
+  // 去掉尾部空白 + 补分号（parser 要求语句以 ';' 结束）：normalize 后的文本
+  // 存进 ParsedStatement，execute_parsed()/错误信息都用它。
+  const std::string normalized = normalize_sql(statement);
+  if (normalized.empty() || normalized == ";") {
+    return std::unexpected(SessionError(SessionErrorCode::EMPTY_SQL,
+                                        "empty statement", statement));
+  }
+
   parser::Parser parser;
-  auto parsed = parser.parse(statement);
+  auto parsed = parser.parse(normalized);
   if (!parsed.success || parsed.ast == nullptr) {
     SessionError error(SessionErrorCode::PARSE_ERROR,
                        parsed.error.has_value() ? parsed.error->message
                                                 : "parse failed",
-                       statement);
+                       normalized);
     if (parsed.error.has_value()) {
       const size_t length =
           parsed.error->token.empty() ? 1 : parsed.error->token.size();
@@ -231,8 +252,7 @@ Session::prepare(const std::string &statement) {
     return std::unexpected(std::move(error));
   }
 
-  // ---- 2) 拆掉 EXPLAIN 前缀（语法层给的 NODE_EXPLAIN）----
-  // 被解释的还是原来那条语句：位置、错误的处理都跟平时一样
+  // 拆掉 EXPLAIN 前缀（语法层给的 NODE_EXPLAIN）：被解释的还是原来那条语句
   const ASTNode *root = parsed.ast.get();
   bool explain = false;
   bool analyze = false;
@@ -244,11 +264,32 @@ Session::prepare(const std::string &statement) {
     if (root == nullptr) {
       return std::unexpected(SessionError(SessionErrorCode::BUILD_ERROR,
                                           "EXPLAIN has no statement",
-                                          statement));
+                                          normalized));
     }
   }
+  // 只读判定：SELECT（含 EXPLAIN ... SELECT）才是只读；其余（DML/DDL/事务）
+  // 都要走写线程。用 AST 根节点类型判断，不用文本前缀匹配。
+  const bool read_only = root != nullptr && root->type == NODE_SELECT;
+  return ParsedStatement(std::move(parsed.ast), explain, analyze, read_only,
+                         normalized);
+}
 
-  // ---- 3) AST -> Query ----
+// pipeline 第二段：AST -> Query -> 校验 -> 执行（execute/explain 共用）
+std::expected<Session::Prepared, SessionError>
+Session::prepare(const ParsedStatement &parsed) {
+  // ---- 1) AST -> Query ----
+  const ASTNode *root = parsed.ast.get();
+  if (root != nullptr && root->type == NODE_EXPLAIN) {
+    const auto *node = reinterpret_cast<const ExplainNode *>(root->data);
+    root = node->statement;
+  }
+  const std::string &statement = parsed.sql;
+  if (root == nullptr) {
+    return std::unexpected(
+        SessionError(SessionErrorCode::BUILD_ERROR, "no statement", statement));
+  }
+
+  // ---- 2) AST -> Query ----
   stmt::StatementBuilder builder;
   auto query = builder.build(root);
   if (!query.has_value()) {
@@ -256,14 +297,14 @@ Session::prepare(const std::string &statement) {
                                            query.error(), statement));
   }
 
-  // ---- 4) 语义校验（带"名字 -> 位置"解析器，错误能定位到 SQL 片段）----
+  // ---- 3) 语义校验（带"名字 -> 位置"解析器，错误能定位到 SQL 片段）----
   stmt::StatementValidator validator(catalog_, stmt::make_span_resolver(root));
   auto valid = validator.validate(*query);
   if (!valid.has_value()) {
     return std::unexpected(from_stmt_error(SessionErrorCode::VALIDATE_ERROR,
                                            valid.error(), statement));
   }
-  return Prepared{std::move(*query), explain, analyze};
+  return Prepared{std::move(*query), parsed.explain, parsed.analyze};
 }
 
 // pipeline 后半段：重写 -> 优化 -> 生成计划树（execute/explain 共用）
@@ -297,6 +338,8 @@ Session::build_plan(const sql::Query &query, const std::string &statement) {
 
 std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
 Session::execute(const std::string &sql) {
+  // 便宜的**前置检查先做**（和旧行为一致）：空语句、存储没打开 —— 这两条
+  // 不该因为"语句本身有语法错"而变成 PARSE_ERROR。
   const std::string statement = normalize_sql(sql);
   if (statement.empty() || statement == ";") {
     return std::unexpected(
@@ -308,7 +351,31 @@ Session::execute(const std::string &sql) {
                                         statement));
   }
 
-  auto prepared = prepare(statement);
+  auto parsed = parse(statement);
+  if (!parsed.has_value()) {
+    // 解析失败的**统一收尾**：中止的事务里优先报"事务已中止"
+    // （Postgres 风格：非事务语句连语法错误也被它盖住）
+    return std::unexpected(parse_error_to_session_error(parsed.error()));
+  }
+  return execute_parsed(*parsed);
+}
+
+std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+Session::execute_parsed(const ParsedStatement &parsed_stmt) {
+  // parsed.sql 是 normalize_sql() 之后的文本（parse 里做的），
+  // 所以这里直接用；空语句/未打开存储的检查与 execute() 完全一致。
+  const std::string &statement = parsed_stmt.sql;
+  if (statement.empty() || statement == ";") {
+    return std::unexpected(SessionError(SessionErrorCode::EMPTY_SQL,
+                                        "empty statement", statement));
+  }
+  if (!catalog_.is_open()) {
+    return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
+                                        "storage engine is not open",
+                                        statement));
+  }
+
+  auto prepared = prepare(parsed_stmt);
   // ---- 事务控制：BEGIN / COMMIT / ROLLBACK（语法层认出来，这里执行）----
   // 放在"事务已中止"检查之前：中止状态下唯一还能跑的就是 ROLLBACK。
   // `EXPLAIN BEGIN` 不走这条（下面单独处理）：被解释的事务语句不会执行。

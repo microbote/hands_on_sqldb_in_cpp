@@ -4,6 +4,7 @@
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
 
 #include "ast.h"
+#include <atomic>
 #include <cassert>
 #include <stdarg.h>
 #include <stddef.h>
@@ -19,9 +20,11 @@ size_t ast_max_buf_size = 4 * 4096;
 int ast_indent_step = 1;
 #define STEP ast_indent_step
 
-int ast_debug = 0;
+// 调试开关：会被**别的线程**在 free_ast（此处）里读，同时被解析线程写，
+// 所以用原子量 —— 这是 TSan 抓到的第二处竞争（第一处是 flex/bison 的全局态）。
+std::atomic<int> ast_debug{0};
 
-#define DEBUG_PRINT ast_debug
+#define DEBUG_PRINT ast_debug.load(std::memory_order_relaxed)
 
 static void DEBUG(const char *fmt, ...) {
   if (DEBUG_PRINT) {

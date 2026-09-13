@@ -1,18 +1,17 @@
 #ifndef PARSER_PARSER_H
 #define PARSER_PARSER_H
 
-
-#include <memory>
-#include <string>
-#include <optional>
 #include <functional>
+#include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "ast.h"
 
-#ifdef  __cplusplus
+#ifdef __cplusplus
 extern "C" {
-#endif 
+#endif
 
 void yyerror(const char *s);
 
@@ -26,10 +25,11 @@ namespace parser {
 // ASTNode 智能指针（unique_ptr + 自定义删除器）
 // ============================================================
 struct ASTNodeDeleter {
-    void operator()(ASTNode* node) const {
-        if (node != nullptr) { free_ast(node);
-}
+  void operator()(ASTNode *node) const {
+    if (node != nullptr) {
+      free_ast(node);
     }
+  }
 };
 
 using ASTNodePtr = std::unique_ptr<ASTNode, ASTNodeDeleter>;
@@ -38,70 +38,73 @@ using ASTNodePtr = std::unique_ptr<ASTNode, ASTNodeDeleter>;
 // 解析错误
 // ============================================================
 struct ParseError {
-    int line = 0;
-    int column = 0;
-    std::string message;
-    std::string token;
-    
-    ParseError() = default;
-    explicit ParseError(const std::string& msg) : message(msg) {}
-    ParseError(int l, int c, const std::string& msg, const std::string& tok = "")
-        : line(l), column(c), message(msg), token(tok) {}
-    
-    std::string to_string() const {
-        if (line > 0) {
-            return "Parse error at line " + std::to_string(line) + 
-                   ", column " + std::to_string(column) + ": " + message;
-        }
-        return "Parse error: " + message;
+  int line = 0;
+  int column = 0;
+  std::string message;
+  std::string token;
+
+  ParseError() = default;
+  explicit ParseError(const std::string &msg) : message(msg) {}
+  ParseError(int l, int c, const std::string &msg, const std::string &tok = "")
+      : line(l), column(c), message(msg), token(tok) {}
+
+  std::string to_string() const {
+    if (line > 0) {
+      return "Parse error at line " + std::to_string(line) + ", column " +
+             std::to_string(column) + ": " + message;
     }
+    return "Parse error: " + message;
+  }
 };
 
 // ============================================================
 // 解析结果
 // ============================================================
 struct ParseResult {
-    std::string sql;
-    bool success;
-    ASTNodePtr ast;
-    std::optional<ParseError> error;
-    
-    ParseResult() : success(false) {}
-    explicit ParseResult(const std::string& stmt, ASTNode* node) : sql(stmt), success(true), ast(node) {}
-    explicit ParseResult(const std::string& stmt, const ParseError& err) : sql(stmt), success(false), error(err) {}
-    
-    // 移动语义
-    ParseResult(ParseResult&& other) noexcept
-        : sql(other.sql), success(other.success), ast(std::move(other.ast)), error(std::move(other.error)) {}
-    
-    ParseResult& operator=(ParseResult&& other) noexcept {
-        if (this != &other) {
-            sql = std::move(other.sql);
-            success = other.success;
-            ast = std::move(other.ast);
-            error = std::move(other.error);
-        }
-        return *this;
+  std::string sql;
+  bool success;
+  ASTNodePtr ast;
+  std::optional<ParseError> error;
+
+  ParseResult() : success(false) {}
+  explicit ParseResult(const std::string &stmt, ASTNode *node)
+      : sql(stmt), success(true), ast(node) {}
+  explicit ParseResult(const std::string &stmt, const ParseError &err)
+      : sql(stmt), success(false), error(err) {}
+
+  // 移动语义
+  ParseResult(ParseResult &&other) noexcept
+      : sql(other.sql), success(other.success), ast(std::move(other.ast)),
+        error(std::move(other.error)) {}
+
+  ParseResult &operator=(ParseResult &&other) noexcept {
+    if (this != &other) {
+      sql = std::move(other.sql);
+      success = other.success;
+      ast = std::move(other.ast);
+      error = std::move(other.error);
     }
-    
-    // 禁止拷贝
-    ParseResult(const ParseResult&) = delete;
-    ParseResult& operator=(const ParseResult&) = delete;
-    
-    // 访问
-    const char * c_sql() const { return sql.c_str(); }
-    const std::string& s_sql() const { return sql; }
-    const ASTNode* get() const { return ast.get(); }
-    ASTNode* get() { return ast.get(); }
-    ASTNode* operator->() { return ast.get(); }
-    const ASTNode* operator->() const { return ast.get(); }
-    ASTNode& operator*() { return *ast; }
-    const ASTNode& operator*() const { return *ast; }
-    
-    explicit operator bool() const { return success; }
-    
-    // 释放所有权（谨慎使用）
-    ASTNode* release() { return ast.release(); }
+    return *this;
+  }
+
+  // 禁止拷贝
+  ParseResult(const ParseResult &) = delete;
+  ParseResult &operator=(const ParseResult &) = delete;
+
+  // 访问
+  const char *c_sql() const { return sql.c_str(); }
+  const std::string &s_sql() const { return sql; }
+  const ASTNode *get() const { return ast.get(); }
+  ASTNode *get() { return ast.get(); }
+  ASTNode *operator->() { return ast.get(); }
+  const ASTNode *operator->() const { return ast.get(); }
+  ASTNode &operator*() { return *ast; }
+  const ASTNode &operator*() const { return *ast; }
+
+  explicit operator bool() const { return success; }
+
+  // 释放所有权（谨慎使用）
+  ASTNode *release() { return ast.release(); }
 };
 
 // ============================================================
@@ -109,65 +112,66 @@ struct ParseResult {
 // ============================================================
 class Parser {
 public:
-    Parser();
-    ~Parser();
-    
-    // 解析单条 SQL 语句
-    ParseResult parse(const std::string& sql);
-    
-    // 解析多条 SQL 语句（用分号分隔）
-    std::vector<ParseResult> parse_multi(const std::string& sql);
-    
-    // 设置调试模式
-    void set_debug(bool enable) { debug_ = enable; }
-    bool debug_enabled() const { return debug_; }
+  Parser();
+  ~Parser();
 
-    // 日志回调：库本身不打印任何东西，需要输出的调用方自己注册。
-    // 例如 CLI(main.cpp) 注册一个打到 stdout 的回调来保留交互体验。
-    using LogCallback = std::function<void(const std::string&)>;
-    void set_log_callback(LogCallback callback) {
-        log_ = std::move(callback);
-    }
-    // 供 C 侧的 yyerror 等回调使用
-    void log_message(const std::string& message) const { log(message); }
-    
-    // 获取最后错误信息
-    std::string last_error() const { return last_error_; }
-    void set_last_error(const std::string& err) { last_error_ = err; }
-    
-    // 获取统计信息
-    size_t parse_count() const { return parse_count_; }
-    size_t error_count() const { return error_count_; }
-    
-    // 重置状态
-    void reset();
+  // 解析单条 SQL 语句
+  ParseResult parse(const std::string &sql);
+
+  // 解析多条 SQL 语句（用分号分隔）
+  std::vector<ParseResult> parse_multi(const std::string &sql);
+
+  // 设置调试模式
+  void set_debug(bool enable) { debug_ = enable; }
+  bool debug_enabled() const { return debug_; }
+
+  // 日志回调：库本身不打印任何东西，需要输出的调用方自己注册。
+  // 例如 CLI(main.cpp) 注册一个打到 stdout 的回调来保留交互体验。
+  using LogCallback = std::function<void(const std::string &)>;
+  void set_log_callback(LogCallback callback) { log_ = std::move(callback); }
+  // 供 C 侧的 yyerror 等回调使用
+  void log_message(const std::string &message) const { log(message); }
+
+  // 获取最后错误信息
+  std::string last_error() const { return last_error_; }
+  void set_last_error(const std::string &err) { last_error_ = err; }
+
+  // 获取统计信息
+  size_t parse_count() const { return parse_count_; }
+  size_t error_count() const { return error_count_; }
+
+  // 重置状态
+  // 清空错误状态（内部会加解析锁，可安全地跨线程调用）
+  void reset();
 
 private:
-    bool do_parse(const std::string& sql, ASTNode** result);
-    std::string error_detail() const;
-    void log(const std::string& message) const {
-        if (log_) {
-            log_(message);
-        }
+  // 清空错误状态但**不加锁**（调用方已持有解析锁：parse()/reset() 用）
+  void clear_error_state();
+  bool do_parse(const std::string &sql, ASTNode **result);
+  std::string error_detail() const;
+  void log(const std::string &message) const {
+    if (log_) {
+      log_(message);
     }
-    
-    std::string last_error_;
-    LogCallback log_;
-    bool debug_ = false;
-    size_t parse_count_ = 0;
-    size_t error_count_ = 0;
+  }
+
+  std::string last_error_;
+  LogCallback log_;
+  bool debug_ = false;
+  size_t parse_count_ = 0;
+  size_t error_count_ = 0;
 };
 
 // ============================================================
 // 便捷函数
 // ============================================================
 // 解析 SQL，返回裸指针（调用者负责释放）
-ASTNode* parse_sql(const std::string& sql, std::string* error = nullptr);
+ASTNode *parse_sql(const std::string &sql, std::string *error = nullptr);
 
 // 解析 SQL，返回智能指针（自动管理）
-ASTNodePtr parse_sql_smart(const std::string& sql, std::string* error = nullptr);
+ASTNodePtr parse_sql_smart(const std::string &sql,
+                           std::string *error = nullptr);
 
 } // namespace parser
-
 
 #endif // PARSER_PARSER_H

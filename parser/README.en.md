@@ -100,6 +100,34 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
   (`-5` parses as a negative number instead of `5`; `"t"` is a syntax error
   instead of being treated as `t`).
 
+## Multithreading / server use (P0: thread-safety boundaries)
+
+`parser::Parser::parse()` is **thread-safe** (serialized process-wide), but the
+exact boundary matters:
+
+| Global state | Who touches it | What we do now |
+|---|---|---|
+| flex scanner buffer, `yytext/yyleng/yylloc/yylineno` (`sql.l` is not reentrant) | every parse | one **process-wide mutex** in `parse()` wraps the whole parse |
+| `g_parsed_ast` in `parser/ast.cpp` (written by the grammar action `set_parsed_ast`) | every parse | same lock |
+| `g_parser_state` in `parser/parser.cpp` (the `yyerror` error sink) | every parse | same lock, and the sink is registered **only for the duration of the parse** (RAII clears `instance`), so no other `Parser` is left behind |
+| `ast_debug` in `parser/ast.cpp` | written by the parsing thread, **read by other threads** in `free_ast` | now `std::atomic<int>` |
+| `lex_collect_tokens()` (syntax highlighting / tools) | every call | **still not reentrant**: the server must not call it — return the span to the client and let the client (CLI) highlight |
+
+- Cost: parsing is serialized. A statement parses in microseconds while the
+  engine is "single writer + synchronous execution", so this is not the
+  bottleneck; when parallel parsing is actually needed, follow the checklist
+  below.
+- **Reentrancy checklist (M3)**: bison `%define api.pure full` + `%parse-param`
+  (pass the error sink and result pointer per parse) + `%lex-param`; flex
+  `%option reentrant` (`yyscan_t` + `yylex_init_extra`); turn the
+  `set_parsed_ast` global into `ctx->result`; give `lex_collect_tokens()` its
+  own scanner per call; then delete the mutex.
+
+Evidence: `tests/test_parser/test_thread_safety.cpp` (8 threads x 300
+iterations x 2 cases). Before the lock it **always crashed**
+(`fatal flex scanner internal error--end of buffer missed`); after the lock it
+is stable, and ThreadSanitizer reports 0 races.
+
 ## Implementation notes
 
 - Declarations of generated code inside `parser.cpp` must use C linkage

@@ -91,6 +91,29 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
 - 未知字符不再被吞掉：交给语法层报错（例如 `-5` 会解析成负数而不是 `5`，
   `"t"` 会报语法错误而不是被当成 `t`）。
 
+## 多线程 / 服务端使用（P0：线程安全边界）
+
+`parser::Parser::parse()` **线程安全**（进程内串行化），但要知道边界在哪：
+
+| 全局状态 | 谁在动 | 现在怎么办 |
+|---|---|---|
+| flex 的扫描缓冲、`yytext/yyleng/yylloc/yylineno`（`sql.l` 非重入） | 每次解析 | `parse()` 里一把**进程级锁**把整段解析串起来 |
+| `parser/ast.cpp` 的 `g_parsed_ast`（语法动作 `set_parsed_ast` 写） | 每次解析 | 同上（锁内） |
+| `parser/parser.cpp` 的 `g_parser_state`（`yyerror` 的错误接收方） | 每次解析 | 同上；而且**只在解析期间登记**（RAII 把 `instance` 摘掉），不会把别的 `Parser` 留在全局 |
+| `parser/ast.cpp` 的 `ast_debug` | 解析线程写、**别的线程**在 `free_ast` 里读 | 改成 `std::atomic<int>` |
+| `lex_collect_tokens()`（语法高亮/工具用） | 每次调用 | **仍然非重入**：服务端不要调用它 —— 错误位置以 span 回给客户端，客户端（CLI）自己高亮 |
+
+- 代价：解析被串行化。解析一条语句是微秒级，而引擎是"单写者 + 同步执行"，
+  所以这不是瓶颈；等真要并行解析时按下面的清单做可重入化。
+- **可重入化清单（M3）**：bison `%define api.pure full` + `%parse-param`
+  （错误接收方与结果指针按解析传参）+ `%lex-param`；flex `%option reentrant`
+  （`yyscan_t` + `yylex_init_extra`）；`set_parsed_ast` 的全局改成
+  `ctx->result`；`lex_collect_tokens()` 每次调用自建扫描器；届时删掉那把锁。
+
+证据：`tests/test_parser/test_thread_safety.cpp`（8 线程 × 300 次 × 2 个用例）。
+加锁前**必崩**（`fatal flex scanner internal error--end of buffer missed`），
+加锁后稳定；ThreadSanitizer 下 0 竞态。
+
 ## 实现注意
 
 - `parser.cpp` 里对生成代码的声明必须使用 C 链接（`extern "C"`），
