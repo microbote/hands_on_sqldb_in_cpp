@@ -11,10 +11,14 @@ add_executable(test_server
     test_protocol.cpp
     test_service.cpp
     test_e2e.cpp
+    test_client.cpp
+    test_lifecycle.cpp
+    test_remote_client_fake_server.cpp
 )
 
 target_link_libraries(test_server PRIVATE
     sql_server
+    sql_client   # client::RemoteConnection + 共用 REPL
     test_fwk
     Threads::Threads
 )

@@ -1,6 +1,28 @@
-# sqldb: the command-line client
+# client layer: two command-line clients (local / remote)
 
-中文版：[readme.md](readme.md)
+中文版：[README.md](README.md)
+
+Layout (**the shared code exists once; the front ends are thin shells**):
+
+```
+client/
+  connection.{h,cpp}   SqlConnection: execute + metadata + current db/tx state
+                         ├─ LocalConnection  -- wraps session::Session in-process
+                         └─ RemoteConnection -- the custom protocol (sqldb-server)
+  repl.{h,cpp}         shared REPL: statement splitting / meta commands / tables / error caret
+  local/main.cpp       -> build/sqldb         local client (the behaviour below)
+  remote/main.cpp      -> build/sqldb-client  remote client (same REPL, adds --host/--port)
+```
+
+```bash
+./build/sqldb                                        # local: in-process engine
+./build/sqldb-client --host=127.0.0.1 --port=5433    # remote: talks to sqldb-server
+```
+
+The remote client is **remote-only** (no `--engine/--path`). Everything described
+below — output format, meta commands, EXPLAIN — is identical in both front ends
+(same code); over the wire `\l` / `\dt` / `\d` use META frames (the server reads
+the Catalog and sends the metadata back), and `\c` is just `USE`.
 
 The CLI does exactly three things: **read SQL -> hand it to
 `session::Session` -> print the result**. It knows nothing about

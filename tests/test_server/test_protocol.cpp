@@ -76,11 +76,16 @@ TEST(Protocol, ColumnsAndOkAndErrorRoundTrip) {
   CHECK(server::decode_columns(decoded.payload, &back_columns));
   CHECK_EQ(back_columns, columns);
 
-  CHECK(server::try_decode_frame(server::encode_ok(42), &decoded, &consumed,
-                                 &error));
+  CHECK(server::try_decode_frame(server::encode_ok(42, true, true, "shop"),
+                                 &decoded, &consumed, &error));
   uint64_t affected = 0;
-  CHECK(server::decode_ok(decoded.payload, &affected));
+  uint8_t flags = 0;
+  std::string current_db;
+  CHECK(server::decode_ok(decoded.payload, &affected, &flags, &current_db));
   CHECK_EQ(affected, uint64_t{42});
+  CHECK_EQ(int{flags & 1}, 1);
+  CHECK_EQ(int{(flags >> 1) & 1}, 1); // is_write
+  CHECK_EQ(current_db, std::string("shop"));
 
   server::ErrorFrame error_frame;
   error_frame.code = 12;
@@ -123,6 +128,74 @@ TEST(Protocol, PartialAndPipelinedFrames) {
   CHECK(server::try_decode_frame(stream.substr(offset), &decoded, &consumed,
                                  &error));
   CHECK(decoded.type == server::FrameType::kPing);
+}
+
+TEST(Protocol, MetaFramesRoundTrip) {
+  // 请求帧：kind + 两个参数
+  server::DecodedFrame decoded;
+  size_t consumed = 0;
+  std::string error;
+  CHECK(server::try_decode_frame(
+      server::encode_meta(server::MetaKind::kSchema, "shop", "users"), &decoded,
+      &consumed, &error));
+  CHECK(decoded.type == server::FrameType::kMeta);
+  uint8_t kind = 0;
+  std::string arg1;
+  std::string arg2;
+  CHECK(server::decode_meta(decoded.payload, &kind, &arg1, &arg2));
+  CHECK_EQ(int{kind}, static_cast<int>(server::MetaKind::kSchema));
+  CHECK_EQ(arg1, std::string("shop"));
+  CHECK_EQ(arg2, std::string("users"));
+
+  // 回复帧：库列表
+  std::vector<server::MetaDatabase> databases(2);
+  databases[0].name = "shop";
+  databases[0].created_at = 1700000000;
+  databases[0].table_count = 2;
+  databases[0].is_current = true;
+  databases[1].name = "other";
+  const std::string payload = server::encode_meta_databases(databases);
+  CHECK(server::try_decode_frame(server::encode_meta_reply(payload), &decoded,
+                                 &consumed, &error));
+  CHECK(decoded.type == server::FrameType::kMetaReply);
+  std::string back_payload;
+  CHECK(server::decode_meta_reply(decoded.payload, &back_payload));
+  std::vector<server::MetaDatabase> back;
+  CHECK(server::decode_meta_databases(back_payload, &back));
+  CHECK_EQ(back.size(), size_t{2});
+  if (back.size() == 2) {
+    CHECK_EQ(back[0].name, std::string("shop"));
+    CHECK_EQ(back[0].created_at, int64_t{1700000000});
+    CHECK_EQ(back[0].table_count, uint32_t{2});
+    CHECK(back[0].is_current);
+    CHECK_EQ(back[1].name, std::string("other"));
+  }
+
+  // 回复帧：表列表（含 NULL 主键用空串表示）
+  std::vector<server::MetaTable> tables(1);
+  tables[0].name = "logs";
+  tables[0].column_count = 2;
+  tables[0].row_count = 7;
+  const std::string tables_payload = server::encode_meta_tables(tables);
+  std::vector<server::MetaTable> tables_back;
+  CHECK(server::decode_meta_tables(tables_payload, &tables_back));
+  CHECK_EQ(tables_back.size(), size_t{1});
+  if (tables_back.size() == 1) {
+    CHECK_EQ(tables_back[0].name, std::string("logs"));
+    CHECK_EQ(tables_back[0].column_count, uint32_t{2});
+    CHECK_EQ(tables_back[0].row_count, uint64_t{7});
+    CHECK(tables_back[0].primary_key.empty());
+  }
+
+  // 回复帧：schema（复用 TableSchema v1 序列化）
+  sql::TableSchema schema(sql::Identifier("users"));
+  schema.add_column(sql::Identifier("id"), sql::DataType::INT, true, false);
+  const std::string schema_payload = server::encode_meta_schema(schema);
+  sql::TableSchema schema_back;
+  CHECK(server::decode_meta_schema(schema_payload, &schema_back));
+  CHECK(schema_back.table_name() == sql::Identifier("users"));
+  CHECK_EQ(schema_back.column_count(), size_t{1});
+  CHECK(schema_back.has_primary_key());
 }
 
 TEST(Protocol, OversizedAndUnknownFramesAreRejected) {

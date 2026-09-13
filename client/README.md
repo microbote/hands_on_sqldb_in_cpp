@@ -1,6 +1,27 @@
-# sqldb：命令行客户端
+# client 层：两个命令行客户端（本地 / 远程）
 
-English version: [readme.en.md](readme.en.md)
+English version: [README.en.md](README.en.md)
+
+目录结构（**共享代码只有一份，前端只是薄壳**）：
+
+```
+client/
+  connection.{h,cpp}   SqlConnection：execute + 元信息 + 当前库/事务状态
+                         ├─ LocalConnection  —— 进程内直接包 session::Session
+                         └─ RemoteConnection —— 自定义协议（连 sqldb-server）
+  repl.{h,cpp}         共用 REPL：语句切分 / 元命令 / 表格 / 错误 caret
+  local/main.cpp       → build/sqldb         本地客户端（这条 README 描述的行为）
+  remote/main.cpp      → build/sqldb-client  远程客户端（同一套 REPL，加 --host/--port）
+```
+
+```bash
+./build/sqldb                                        # 本地：进程内引擎
+./build/sqldb-client --host=127.0.0.1 --port=5433    # 远程：连 sqldb-server
+```
+
+**远程客户端目前只支持远程**（没有 `--engine/--path`）。下面描述的输出格式、
+元命令、EXPLAIN 行为**两个前端一致**（同一份代码）；`\l` / `\dt` / `\d` 在远程
+下走 META 帧（服务端读 Catalog 后回元信息），`\c` 就是 `USE`。
 
 CLI 只做三件事：**读入 SQL → 交给 `session::Session` → 打印结果**。
 它不碰 parser/planner/executor 的细节，错误也原样来自 `SessionError`

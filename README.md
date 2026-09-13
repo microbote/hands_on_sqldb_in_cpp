@@ -63,7 +63,14 @@ id  name
 支持：`CREATE/DROP DATABASE`、`CREATE/DROP TABLE`、`SELECT`（`WHERE`/`ORDER BY`/
 `LIMIT`/`OFFSET`）、`INSERT`（多行 VALUES）、`UPDATE`、`DELETE`、`USE`、
 `EXPLAIN [ANALYZE]`、事务 `BEGIN/COMMIT/ROLLBACK`（含 `START TRANSACTION`/
-`END`/`ABORT`）。细节见 `cmdline/readme.md` 与各模块 README。
+`END`/`ABORT`）。细节见 `client/README.md` 与各模块 README。
+
+两个前端（共用同一套 REPL 与协议，只是 transport 不同）：
+
+```bash
+./build/sqldb                # 本地：进程内引擎（脚本/嵌入/离线）
+./build/sqldb-client --host=127.0.0.1 --port=5433   # 远程：连 sqldb-server
+```
 
 ## 文档
 
@@ -81,7 +88,7 @@ id  name
 | `planner/readme.md` | 重写 / 优化 / 计划树 / 成本模型 |
 | `executor/readme.md` | Volcano 算子、结果游标、EXPLAIN 统计 |
 | `storage/kv_engine/readme.md` | KVStore/KVEngine、事务缓冲、两引擎一致性 |
-| `cmdline/readme.md` | CLI 用法、元命令、EXPLAIN 输出 |
+| `client/README.md` | 两个客户端（本地 `sqldb` / 远程 `sqldb-client`）的用法、元命令、EXPLAIN 输出 |
 
 各模块的改动记录（含设计取舍与踩坑）在各测试目录的
 `tests/test_<模块>/codex_check_issues.md`。

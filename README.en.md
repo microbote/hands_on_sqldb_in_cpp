@@ -67,7 +67,14 @@ Supported: `CREATE/DROP DATABASE`, `CREATE/DROP TABLE`, `SELECT`
 (`WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`), `INSERT` (multi-row `VALUES`),
 `UPDATE`, `DELETE`, `USE`, `EXPLAIN [ANALYZE]`, and transactions
 `BEGIN/COMMIT/ROLLBACK` (aliases `START TRANSACTION` / `END` / `ABORT`).
-See `cmdline/readme.en.md` and the per-module READMEs for details.
+See `client/README.en.md` and the per-module READMEs for details.
+
+Two front ends (same REPL and protocol, different transports):
+
+```bash
+./build/sqldb                # local: in-process engine (scripts / embedded / offline)
+./build/sqldb-client --host=127.0.0.1 --port=5433   # remote: talks to sqldb-server
+```
 
 ## Documentation
 
@@ -84,7 +91,7 @@ when behavior changes.
 | `planner/readme.md` | rewrite / optimize / plan tree / cost model |
 | `executor/readme.md` | Volcano operators, result cursor, EXPLAIN stats |
 | `storage/kv_engine/readme.md` | KVStore/KVEngine, transaction buffer, engine parity |
-| `cmdline/readme.md` | CLI usage, meta commands, EXPLAIN output |
+| `client/README.md` | both clients (local `sqldb` / remote `sqldb-client`): usage, meta commands, EXPLAIN output |
 
 Per-module change logs (design trade-offs and pitfalls) live in
 `tests/test_<module>/codex_check_issues.md`.

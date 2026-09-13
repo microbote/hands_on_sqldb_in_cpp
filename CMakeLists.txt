@@ -273,9 +273,44 @@ target_link_libraries(sql_server PUBLIC Threads::Threads)
 add_executable(sqldb-server server/main_server.cpp)
 target_link_libraries(sqldb-server PRIVATE sql_server)
 
-add_executable(sqldb cmdline/main.cpp)
+# ============================================================
+# 客户端层：client/ —— REPL 与 transport 解耦
+#
+#   client/           共享库（无 main）：connection（本地/远程两个 transport）
+#                     + repl（共用交互层）
+#   client/local/     本地客户端 main -> build/sqldb
+#   client/remote/    远程客户端 main -> build/sqldb-client
+# ============================================================
+add_library(sql_client STATIC
+    client/connection.cpp
+    client/repl.cpp
+)
 
-target_link_libraries(sqldb PRIVATE sql_session)
+target_include_directories(sql_client PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/client
+)
+
+target_link_libraries(sql_client PUBLIC
+    sql_session
+    sql_server   # 复用协议编解码
+    fmt::fmt
+)
+
+target_compile_features(sql_client PUBLIC cxx_std_23)
+
+add_executable(sqldb client/local/main.cpp)
+
+target_link_libraries(sqldb PRIVATE sql_client)
+
+add_executable(sqldb-client client/remote/main.cpp)
+target_link_libraries(sqldb-client PRIVATE sql_client)
+
+if(READLINE_INCLUDE_DIR AND READLINE_LIBRARY)
+    target_include_directories(sqldb-client PRIVATE ${READLINE_INCLUDE_DIR})
+    target_link_libraries(sqldb-client PRIVATE ${READLINE_LIBRARY})
+    target_compile_definitions(sqldb-client PRIVATE SQLDB_HAVE_READLINE=1)
+endif()
 
 # readline：有就用（交互历史/行编辑），没有就退回 std::getline
 find_path(READLINE_INCLUDE_DIR NAMES readline/readline.h

@@ -20,7 +20,8 @@ server::Server *g_server = nullptr;
 
 void on_signal(int) {
   if (g_server != nullptr) {
-    g_server->stop();
+    // 只 write 一根管道：异步信号安全；真正的收尾在事件循环里做
+    g_server->request_shutdown();
   }
 }
 
@@ -83,6 +84,13 @@ int main(int argc, char **argv) {
   fmt::print(stderr, "sqldb-server 正在监听 {} (engine={}, path={})\n",
              config->listen, config->engine, config->path);
   server.run();
+
+  // 收尾：连接都退出了才能关存储（还有活跃快照时 close() 会返回 Busy）
+  const kv::Status closed = store->close();
+  if (closed != kv::Status::OK) {
+    fmt::print(stderr, "关闭存储未完成: {}\n", kv::status_to_string(closed));
+    return 1;
+  }
   fmt::print(stderr, "sqldb-server 已退出\n");
   return 0;
 }

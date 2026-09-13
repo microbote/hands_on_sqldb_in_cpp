@@ -119,9 +119,19 @@ std::string encode_row(const std::vector<ProtocolValue> &values) {
   return encode_frame(FrameType::kRow, payload);
 }
 
-std::string encode_ok(uint64_t affected_rows) {
+std::string encode_ok(uint64_t affected_rows, bool in_transaction,
+                      bool is_write, const std::string &current_database) {
   std::string payload;
   put_u64(&payload, affected_rows);
+  uint8_t flags = 0;
+  if (in_transaction) {
+    flags |= 0x1;
+  }
+  if (is_write) {
+    flags |= 0x2;
+  }
+  payload.push_back(static_cast<char>(flags));
+  put_bytes(&payload, current_database);
   return encode_frame(FrameType::kOk, payload);
 }
 
@@ -145,6 +155,126 @@ std::string encode_simple(FrameType type) {
   return encode_frame(type, std::string());
 }
 
+// ---- 元信息 ----
+std::string encode_meta(MetaKind kind, const std::string &arg1,
+                        const std::string &arg2) {
+  std::string payload;
+  payload.push_back(static_cast<char>(kind));
+  put_bytes(&payload, arg1);
+  put_bytes(&payload, arg2);
+  return encode_frame(FrameType::kMeta, payload);
+}
+
+bool decode_meta(const std::string &payload, uint8_t *kind, std::string *arg1,
+                 std::string *arg2) {
+  size_t pos = 0;
+  if (pos + 1 > payload.size()) {
+    return false;
+  }
+  *kind = static_cast<uint8_t>(payload[pos]);
+  ++pos;
+  return get_bytes(payload, &pos, arg1) && get_bytes(payload, &pos, arg2);
+}
+
+std::string encode_meta_reply(const std::string &payload) {
+  return encode_frame(FrameType::kMetaReply, payload);
+}
+
+bool decode_meta_reply(const std::string &payload, std::string *out) {
+  *out = payload;
+  return true;
+}
+
+std::string encode_meta_databases(const std::vector<MetaDatabase> &databases) {
+  std::string payload;
+  put_u16(&payload, static_cast<uint16_t>(databases.size()));
+  for (const auto &db : databases) {
+    put_bytes(&payload, db.name);
+    put_u64(&payload, static_cast<uint64_t>(db.created_at));
+    put_u32(&payload, db.table_count);
+    payload.push_back(db.is_current ? 1 : 0);
+  }
+  return payload;
+}
+
+bool decode_meta_databases(const std::string &payload,
+                           std::vector<MetaDatabase> *databases) {
+  size_t pos = 0;
+  uint16_t count = 0;
+  if (!get_u16(payload, &pos, &count)) {
+    return false;
+  }
+  databases->clear();
+  for (uint16_t i = 0; i < count; ++i) {
+    MetaDatabase db;
+    uint64_t created = 0;
+    if (!get_bytes(payload, &pos, &db.name) ||
+        !get_u64(payload, &pos, &created) ||
+        !get_u32(payload, &pos, &db.table_count) || pos + 1 > payload.size()) {
+      return false;
+    }
+    db.created_at = static_cast<int64_t>(created);
+    db.is_current = payload[pos] != 0;
+    ++pos;
+    databases->push_back(std::move(db));
+  }
+  return true;
+}
+
+std::string encode_meta_tables(const std::vector<MetaTable> &tables) {
+  std::string payload;
+  put_u16(&payload, static_cast<uint16_t>(tables.size()));
+  for (const auto &table : tables) {
+    put_bytes(&payload, table.name);
+    put_u32(&payload, table.column_count);
+    put_bytes(&payload, table.primary_key);
+    put_u64(&payload, static_cast<uint64_t>(table.created_at));
+    put_u64(&payload, static_cast<uint64_t>(table.last_write_at));
+    put_u64(&payload, table.row_count);
+  }
+  return payload;
+}
+
+bool decode_meta_tables(const std::string &payload,
+                        std::vector<MetaTable> *tables) {
+  size_t pos = 0;
+  uint16_t count = 0;
+  if (!get_u16(payload, &pos, &count)) {
+    return false;
+  }
+  tables->clear();
+  for (uint16_t i = 0; i < count; ++i) {
+    MetaTable table;
+    uint64_t created = 0;
+    uint64_t last_write = 0;
+    if (!get_bytes(payload, &pos, &table.name) ||
+        !get_u32(payload, &pos, &table.column_count) ||
+        !get_bytes(payload, &pos, &table.primary_key) ||
+        !get_u64(payload, &pos, &created) ||
+        !get_u64(payload, &pos, &last_write) ||
+        !get_u64(payload, &pos, &table.row_count)) {
+      return false;
+    }
+    table.created_at = static_cast<int64_t>(created);
+    table.last_write_at = static_cast<int64_t>(last_write);
+    tables->push_back(std::move(table));
+  }
+  return true;
+}
+
+std::string encode_meta_schema(const sql::TableSchema &schema) {
+  return schema.serialize();
+}
+
+bool decode_meta_schema(const std::string &payload, sql::TableSchema *schema) {
+  auto decoded = sql::TableSchema::deserialize(payload);
+  if (!decoded.has_value()) {
+    return false;
+  }
+  *schema = std::move(*decoded);
+  return true;
+}
+
 bool try_decode_frame(const std::string &buffer, DecodedFrame *frame,
                       size_t *consumed, std::string *error) {
   *consumed = 0;
@@ -166,7 +296,7 @@ bool try_decode_frame(const std::string &buffer, DecodedFrame *frame,
     return false; // 体还没收全
   }
   if (type < static_cast<uint8_t>(FrameType::kHello) ||
-      type > static_cast<uint8_t>(FrameType::kBye)) {
+      type > static_cast<uint8_t>(FrameType::kMetaReply)) {
     *error = "unknown frame type: " + std::to_string(type);
     return false;
   }
@@ -230,9 +360,18 @@ bool decode_row(const std::string &payload,
   return true;
 }
 
-bool decode_ok(const std::string &payload, uint64_t *affected_rows) {
+bool decode_ok(const std::string &payload, uint64_t *affected_rows,
+               uint8_t *flags, std::string *current_database) {
   size_t pos = 0;
-  return get_u64(payload, &pos, affected_rows);
+  if (!get_u64(payload, &pos, affected_rows)) {
+    return false;
+  }
+  if (pos + 1 > payload.size()) {
+    return false;
+  }
+  *flags = static_cast<uint8_t>(payload[pos]);
+  ++pos;
+  return get_bytes(payload, &pos, current_database);
 }
 
 bool decode_error(const std::string &payload, ErrorFrame *error) {

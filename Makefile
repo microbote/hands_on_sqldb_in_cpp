@@ -14,7 +14,7 @@
 BUILD_DIR = build
 JOBS      ?= 4
 
-.PHONY: all configure build sqldb cli server test storage-test server-test tx-test session-test \
+.PHONY: all configure build sqldb cli client server test storage-test server-test tx-test session-test \
         executor-test relation-test planner-test statement-test parser-test \
         sql-types-test cmake-test clean distclean help
 
@@ -41,6 +41,11 @@ server: configure
 server-test: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS)
 	./$(BUILD_DIR)/run_tests/test_server
+
+# 远程客户端（连 sqldb-server）
+client: configure
+	cmake --build $(BUILD_DIR) -j$(JOBS) --target sqldb-client
+	@echo "✅ $(BUILD_DIR)/sqldb-client 可用（--host=... --port=...）"
 
 # ---- 单个模块的测试 ----
 sql-types-test: configure

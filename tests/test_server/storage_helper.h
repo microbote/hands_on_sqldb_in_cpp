@@ -139,6 +139,8 @@ public:
   // 一条语句的完整响应（读到 OK/ERROR 为止）
   struct Response {
     bool ok = false;
+    bool in_transaction = false;
+    std::string current_database;
     std::vector<std::string> columns;
     std::vector<std::vector<server::ProtocolValue>> rows;
     uint64_t affected_rows = 0;
@@ -161,7 +163,12 @@ public:
         CHECK(server::decode_row(frame->payload, &row));
         response.rows.push_back(std::move(row));
       } else if (frame->type == server::FrameType::kOk) {
-        CHECK(server::decode_ok(frame->payload, &response.affected_rows));
+        uint8_t flags = 0;
+        std::string current_db;
+        CHECK(server::decode_ok(frame->payload, &response.affected_rows, &flags,
+                                &current_db));
+        response.in_transaction = (flags & 1) != 0;
+        response.current_database = current_db;
         response.ok = true;
         break;
       } else if (frame->type == server::FrameType::kError) {
