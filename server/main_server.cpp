@@ -50,25 +50,24 @@ int main(int argc, char **argv) {
   // 命令行覆盖（方便测试/临时起服务）
   const std::string listen = arg_value(argc, argv, "--listen", "");
   if (!listen.empty()) {
-    config->listen = listen;
-    const size_t colon = listen.rfind(':');
-    if (colon == std::string::npos) {
-      fmt::print(stderr, "配置错误: --listen 需要 host:port\n");
-      return 2;
-    }
-    config->host = listen.substr(0, colon);
-    config->port = listen.substr(colon + 1);
+    config->set("server.listen", listen);
+  }
+  // 语法之后再看字段：拼错的 key/类型不符/超范围都在这一步拦下
+  if (auto ok = config->validate(); !ok.has_value()) {
+    fmt::print(stderr, "配置错误: {}\n", ok.error());
+    return 2;
   }
 
+  const std::string engine = config->engine();
   kv::DatabaseOptions options;
-  options.set_path(config->path)
-      .set_create_if_missing(config->create_if_missing)
+  options.set_path(config->path())
+      .set_create_if_missing(config->create_if_missing())
       .set_error_if_exists(false);
   const kv::EngineType type =
-      config->engine == "mock" ? kv::EngineType::MOCK : kv::EngineType::LEVELDB;
+      engine == "mock" ? kv::EngineType::MOCK : kv::EngineType::LEVELDB;
   auto store = kv::open_store(type, options);
   if (store == nullptr) {
-    fmt::print(stderr, "打开存储失败: {} ({})\n", config->path, config->engine);
+    fmt::print(stderr, "打开存储失败: {} ({})\n", config->path(), engine);
     return 1;
   }
 
@@ -82,7 +81,7 @@ int main(int argc, char **argv) {
   std::signal(SIGTERM, on_signal);
 
   fmt::print(stderr, "sqldb-server 正在监听 {} (engine={}, path={})\n",
-             config->listen, config->engine, config->path);
+             config->listen(), engine, config->path());
   server.run();
 
   // 收尾：连接都退出了才能关存储（还有活跃快照时 close() 会返回 Busy）

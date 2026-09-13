@@ -1,16 +1,16 @@
 // server/server.h
 //
 // sqldb 服务器：一个进程 = 一份 KVStore + N 条连接协程 + 1 条 parse 服务线程
-// + 1 条写线程。
+// + 1 条写线程 + execution.read_threads 条读线程。
 //
-//   Loop(主线程/poll)                 ParseService          WriteService
-//     ├─ acceptor 协程                  解析（全局态）         写语句 /
-//     事务里的语句 └─ connection 协程 ── SQL ──►  co_await 提交 ──► ...
-//            ▲                                              │
-//            └──────────── Loop::post(resume) ◄─────────────┘
+//   Loop(主线程)        ParseService      WriteService     ReadPool[N]
+//     ├─ acceptor 协程    解析（全局态）    写语句/          纯读语句
+//     │                                    事务里的语句      （真并发）
+//     └─ connection 协程 ── SQL ──►  co_await 提交 ──► ...
+//            ▲                                       │
+//            └──────────── Loop::post(resume) ◄──────┘
 //
-// 路由规则（与设计一致）：`SELECT` 且不在事务里 → 就地执行（读池 = Loop
-// 线程）；
+// 路由规则（与设计一致）：`SELECT` 且不在事务里 → 读线程池（轮询挑选）；
 // **其余一切（含事务里的 SELECT）→ WriteService**。执行 SQL 是同步的，
 // 协程只在网络 I/O、提交服务、定时器三处让出。
 #pragma once
@@ -40,11 +40,12 @@ struct Metrics {
   std::atomic<uint64_t> idle_timeouts{0};     // 因空闲/事务空闲被断开的连接数
   std::atomic<uint64_t> write_queue_rejected{0}; // 写队列满被拒的次数
   std::atomic<uint64_t> parse_queue_rejected{0}; // 解析队列满被拒的次数
+  std::atomic<uint64_t> read_queue_rejected{0};  // 读队列满被拒的次数
 };
 
 class Server {
 public:
-  Server(Config config, std::shared_ptr<kv::KVStore> store);
+  Server(ServerConfig config, std::shared_ptr<kv::KVStore> store);
   ~Server();
 
   Server(const Server &) = delete;
@@ -73,10 +74,11 @@ public:
   // 供测试：等所有连接结束（不是必须的，event loop 停掉即可）
   int port() const { return port_; }
   kv::KVStore &store() { return *store_; }
-  const Config &config() const { return config_; }
+  const ServerConfig &config() const { return config_; }
   Loop &loop() { return loop_; }
   ServiceThread &parse_service() { return parse_service_; }
   ServiceThread &write_service() { return write_service_; }
+  size_t read_pool_size() const { return read_pool_.size(); }
   size_t connection_count() const { return connections_.load(); }
 
 private:
@@ -101,11 +103,13 @@ private:
   // 空闲看门狗：到点就把读方向关掉（协程会醒来 -> 发 ERROR -> 收尾）
   void arm_idle_watchdog(const std::shared_ptr<ConnState> &state, bool in_tx);
 
-  Config config_;
+  ServerConfig config_;
   std::shared_ptr<kv::KVStore> store_;
   Loop loop_;
   ServiceThread parse_service_;
   ServiceThread write_service_;
+  std::vector<std::unique_ptr<ServiceThread>> read_pool_;
+  std::atomic<uint64_t> read_next_{0}; // 读池轮询计数（无锁取模）
   int listen_fd_ = -1;
   int port_ = 0;
   std::atomic<size_t> connections_{0};

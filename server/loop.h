@@ -1,23 +1,24 @@
 // server/loop.h
 //
-// 每线程一个事件循环：`poll()` + 定时器最小堆 + 跨线程唤醒管道。
+// 每线程一个事件循环：`Poller`（平台相关的 kqueue/epoll/poll，见
+// poller.h）+ 定时器最小堆 + 跨线程唤醒管道。
 //
 //   - 一个 Loop 归一条线程独占：`watch/unwatch/add_timer` 只能在 Loop
 //   线程调用；
-//   - `post()` 线程安全：把"继续执行"投进 Loop，并唤醒它的 poll；
-//   - M1 用 poll 是为了零依赖 + 可移植（macOS/Linux 都能跑）；
-//     M3 需要更多 fd 时再换 kqueue/epoll，接口不变。
+//   - `post()` 线程安全：把"继续执行"投进 Loop，并唤醒它的等待。
 #pragma once
 
 #include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "poller.h"
 #include "task.h"
 
 namespace server {
@@ -64,6 +65,7 @@ private:
   std::string name_;
   std::atomic<bool> stop_{false};
 
+  std::unique_ptr<Poller> poller_; // 平台后端：kqueue / epoll / poll
   std::mutex mutex_;                          // 保护 pending_
   std::deque<std::function<void()>> pending_; // 跨线程投递的动作
   int wakeup_read_ = -1;

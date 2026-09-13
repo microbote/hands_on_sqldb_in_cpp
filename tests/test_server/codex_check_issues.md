@@ -4,7 +4,10 @@
 服务器相关的**设计决策、P0 发现与踩坑**；M1 的测试用例落地后，用例清单也追加
 在这里（测试代码本身进 `tests/test_server/`，跑法见 `Makefile` 的 `server-test`）。
 
-现状：**代码还没开始写**，先做了上服务器前的 P0 体检（第一节）。
+现状（2026-09-13）：M1 的服务器骨架 + 客户端层 + 元信息 + 连接生命周期都已
+落地（第四 ~ 八节），本轮又补了通用配置包、读线程池与 Poller 抽象（第九节）。
+`test_server` 39 用例 / `ctest` 12/12 全绿，干净重建 0 告警，TSan 0 竞态。
+第一节是动工前的 P0 体检（parser 线程安全），当时"代码还没开始写"。
 
 ---
 
@@ -82,7 +85,7 @@ fatal flex scanner internal error--end of buffer missed      ← 每次必崩
 
 | # | 决策 |
 |---|------|
-| 1 | 协程自研：C++20 `<coroutine>` + `poll`（M3 换 kqueue/epoll）+ 跨线程唤醒 pipe；**不用 ucontext**（arm64 macOS 不可用） |
+| 1 | 协程自研：C++20 `<coroutine>` + `poll`（~~M3 换~~ kqueue/epoll 已提前落地，见第九节 Poller 抽象）+ 跨线程唤醒 pipe；**不用 ucontext**（arm64 macOS 不可用） |
 | 2 | **协议：自定义**（帧 = `[u8 type][u32 len][payload]`；`HELLO/QUERY/COLUMNS/ROW/OK/ERROR/PING/BYE`；**NULL 带标志位**；错误回 `span` 不回高亮；`HELLO` 带协议版本）。**不用 protobuf**：消息集小且稳定，协议的难点在流式/关联/取消（protobuf 帮不上），而可读性（nc/tcpdump）在主流程更重要；编解码收在 `protocol` 接口后面，将来换 payload 编解码（含 protobuf）不动 framing 与 server 核心。（环境里 `protoc 29.3` + protobuf 头/库可用，所以这是选择而非限制。）MySQL 协议复杂（握手/capability 协商/认证插件/length-encoded 编码/错误号映射，且 span 没地方放），做成以后可加的适配层 |
 | 3 | 事务路由：`SELECT` 且不在事务 → 读池；**事务里的所有语句 + 所有写语句 → 写线程队列**（协程挂起等待，完成后回原线程 resume） |
 | 4 | 读线程数可配（`read_threads`，默认 1） |
@@ -161,9 +164,10 @@ NULL 列与错误 span 正确；并发压测下 `ctest` 全绿。
 
 1. ~~`client/` 抽取~~ 见第五节（REPL + `SqlConnection` + `sqldb-client` 已落地）。
 2. ~~远程的 `\l` / `\dt` / `\d`~~ 见第六节（META 帧已落地）。
-3. 连接超时（idle / idle-in-transaction）、`statement_timeout`（要等 M3 的协作
-   检查点才能真正打断）、优雅退出（现在 SIGINT 只停 loop）。
-4. 日志与 metrics（连接数/语句数/队列深度）；`read_threads > 1`（现在读池就是 I/O 线程）。
+3. ~~连接超时（idle / idle-in-transaction）、优雅退出~~ 见第七节（已落地并有
+   用例钉住）；`statement_timeout` 还没做（要等 M3 的协作检查点才能真正打断）。
+4. ~~日志与 metrics~~ 见第七节（已落地）；~~`read_threads > 1`~~ 见第九节
+   （读线程池已落地，纯读语句在 N 条读线程上真并发）。
 
 ---
 
@@ -240,7 +244,7 @@ ERROR/META），另一端是真正的 `client::RemoteConnection` + 共用 REPL�
 
 ---
 
-## 七、【进行中】连接生命周期：空闲超时 / 优雅退出 / metrics
+## 七、连接生命周期：空闲超时 / 优雅退出 / metrics（已落地）
 
 ### 1. 已写进代码（`server/server.*`、`server/main_server.cpp`）
 
@@ -251,30 +255,197 @@ ERROR/META），另一端是真正的 `client::RemoteConnection` + 共用 REPL�
 | metrics | `connections_total / statements / errors / rows_sent / idle_timeouts / write_queue_rejected / parse_queue_rejected`，退出时打一行汇总 |
 | 日志 | `server.log_level`（error/warn/info/debug）控制；连接 accept/close（debug）、超时与退出步骤（info/warn） |
 
-### 2. 调试中抓到 + 已修的真 bug
+### 2. 调试中抓到 + 已修的三个真 bug（用例现在全都开着）
 
-`Server::attach_connection()`（accept 之外的入口，测试/嵌入用）**没把 fd 设成
-非阻塞** —— 一次 `read` 就把整条事件循环线程堵死（定时器、其它连接全都不转了）。
-现在它和 accept 路径一样先 `fcntl(O_NONBLOCK)`。
+`tests/test_server/test_lifecycle.cpp` 用 `socketpair + attach_connection()`
+造连接（不占端口，受限沙箱里也能跑）。之前这里挂着的"写服务不回复 /
+看门狗不触发"，根子是下面这些和写服务、看门狗本身都无关的 bug：
 
-### 3. **仍未解决（这三个用例先跳过，文件头有详细说明）**
+| # | Bug | 现象 | 修法 |
+|---|-----|------|------|
+| 1 | `attach_connection()` **没把 fd 设成非阻塞** | 一次 `read` 把事件循环线程堵死（定时器/别的连接全停） | 和 accept 路径一样先 `fcntl(O_NONBLOCK)` |
+| 2 | 只 attach、没 `listen()` 时 `listen_fd_ == -1`，`accept_loop` 的 `WaitFd{fd<0}` 立刻 ready → 协程在 `while` 里**忙等不让出** | 整条事件循环被饿死：连 `SELECT` 都拿不到回复，**定时器也不走**（于是 `idle_timeouts` 一直是 0）——"写服务没回复"和"看门狗没触发"是同一个原因 | `run()` 里只在 `listen_fd_ >= 0` 时才 spawn accept 协程 |
+| 3 | 往"对端已经消失"的 socket 上 `write()` 会送 **SIGPIPE**，默认处置直接杀掉进程 | 测试进程 `exit=141`（= SIGPIPE）；真实场景就是"客户端跑掉把服务器打死" | 新增 `common/socket_util.h`：写走 `send(MSG_NOSIGNAL)`，建连时再设 `SO_NOSIGPIPE` 兜底 |
 
-`tests/test_server/test_lifecycle.cpp` 的 3 个用例（空闲超时 / 事务空闲超时 /
-优雅退出）用 socketpair + `attach_connection` 造连接，目前：
+第 3 条的两个细节（都实测过，免得以后怀疑）：
 
-1. **路由到写服务线程的语句拿不到回复**（`BEGIN` / `INSERT` 让客户端 1s 读超时
-   → connection lost），而同一套写服务在**真实监听路径**（ServerE2E）下是可用的；
-2. **空闲看门狗没按预期触发**（`idle_timeouts` 一直是 0）。
+- 本机 macOS SDK **定义了 `MSG_NOSIGNAL` 且 `send()` 认它** —— 这条是
+  socketpair 用例里真正生效的那条路；
+- **`SO_NOSIGPIPE` 对 AF_UNIX socketpair 无效**（`setsockopt` 直接 `EINVAL`），
+  只有 TCP 连接才吃这条 —— 所以真实 `sqldb-server`（TCP）两条都生效，而
+  socketpair 用例只能靠 `MSG_NOSIGNAL`。
 
-下一步排查方向（记下来免得重来）：
+钉住这些行为的用例：空闲超时（含"服务器自己回 ERROR 帧"那条）/ 事务空闲超时 /
+优雅退出 3 个原有用例 + `PeerAlreadyGoneDoesNotKillTheServer`
+（服务器侧：对端先跑掉 → 服务器要活下来并收尾）；客户端侧另有
+`FakeServer.WriteAfterServerIsGoneReportsConnectionLost`（对端没了要报
+"connection to server lost"，而不是被信号带走）。把 `socket_write` 换回裸
+`write()` 时，这两个用例立刻 `exit=141`，所以是真钉住了而不是"顺便通过"。
 
-- 看门狗别再用 `shutdown(SHUT_RD)` 去"叫醒"读：把连接的 `coroutine_handle` 存进
-  `ConnState`，到点直接 `loop_.post(resume)`，协程醒来检查 `timed_out` 再决定
-  回 ERROR/收尾 —— 不依赖 `shutdown` 能否唤醒 `poll`（AF_UNIX 上行为可疑）。
-- 写服务那条：在 `SubmitToService` 的完成回调和 `Loop::post` 上加临时日志，
-  对照 ServerE2E 路径看是哪一步没回来；也要确认 `listen_fd_ == -1`（夹具里没调
-  `listen()`）时 accept 协程不会占住循环。
+原来"下一步排查方向"里那两条猜测**都不成立**，不用再试：
 
-这三个用例现在是 `[todo]`（打印提示后返回，不算失败）；真实的端到端仍由
-ServerE2E（6 条，真 socket）/ RemoteClient（3 条）/ FakeServer（2 条）覆盖。
-`test_server` 27 → **30 用例**，`ctest` 12/12。
+- 看门狗不触发**不是**"`shutdown(SHUT_RD)` 叫不醒 `poll`"——AF_UNIX socketpair
+  上实测能叫醒（`IdleTimeoutSendsErrorFrameOnItsOwn`：客户端一个字都不发，
+  服务器自己回 ERROR 帧）；它和"写服务不回复"都是上面第 2 条（accept 协程忙等）
+  造成的；
+- 写服务路径本身没问题（同一套 `ServiceThread` 在真实监听路径下一直可用）。
+
+夹具本身还修了一个隐藏 bug：`~Fixture` 与 `~RemoteConnection` 会关**同一个
+fd**（双关），fd 号码被回收后可能关掉事件循环刚拿到的 fd（症状是"莫名其妙
+的连接断开"）。现在所有权分清楚了：attach 之后归 `Server`，造出 connection
+之后归 connection。
+
+### 3. 验证
+
+- `test_server` 30 → **33 用例**（ServerLifecycle +2、FakeServer +1），
+  连跑 30 次稳定；`ctest` 12/12；
+- `--clean-first` 干净重建 0 告警；
+- **ThreadSanitizer（`-fsanitize=thread` 单独 build，5 次）0 竞态** —— 这批
+  用例同时跑事件循环线程 + parse 线程 + 写线程 + 测试线程，是 TSan 最能出活的
+  地方。空闲看门狗确实按预期触发（`idle_timeouts == 1`，事务里那条还会回滚）。
+
+---
+
+## 八、本轮改动记录（2026-09-13）：解封生命周期用例 + SIGPIPE 防护
+
+第七节那三个用例原本是 `[todo]` 跳过的（打印提示后 return）。本轮把它们全部
+打开、调通，并把第七节从"【进行中】/仍未解决"改写成"已落地"。这一节只记
+**这一轮动了什么**，方便以后回溯；"为什么这么设计"看第七节。
+
+### 1. 代码改动（1 个新文件 + 4 个文件）
+
+| 文件 | 改动 |
+|---|---|
+| `common/socket_util.h`（新） | `socket_suppress_sigpipe(fd)`（建连时设 `SO_NOSIGPIPE`）+ `socket_write(fd, buf, n)`（`send(..., MSG_NOSIGNAL)`）。把"SIGPIPE 会按默认处置杀进程"这条平台差异收在一个地方，头文件注释里写清了两个平台的差别 |
+| `server/server.cpp` | ① `run()` 只在 `listen_fd_ >= 0` 时才 `spawn(accept_loop())`；② `write_all()` 改走 `common::socket_write`；③ `attach_connection()` 与 accept 路径拿到 fd 后调 `common::socket_suppress_sigpipe(fd)` |
+| `client/connection.cpp` | `RemoteConnection::send_all()` 改走 `common::socket_write`；`make_remote()` / `make_remote_from_fd()` 对 fd 设 `SO_NOSIGPIPE`（客户端的 socket 也是自己建的，同样不能被打死） |
+| `tests/test_server/test_lifecycle.cpp` | 3 个用例去掉 `[todo]`；夹具拆成 `prepare()` / `attach_and_run()` / `connect_client()`（顺带修掉与 `~RemoteConnection` 的**双关**：现在 attach 后归 `Server`、握手后归 connection）；新增 `PeerAlreadyGoneDoesNotKillTheServer` 与 `IdleTimeoutSendsErrorFrameOnItsOwn` |
+| `tests/test_server/test_remote_client_fake_server.cpp` | 新增 `WriteAfterServerIsGoneReportsConnectionLost` |
+
+### 2. 三个 bug 的因果链（下次别再从错误方向查）
+
+| # | Bug | 谁的症状 | 本轮状态 |
+|---|---|---|---|
+| 1 | `attach_connection()` 没设非阻塞 -> 一次 `read` 堵死事件循环线程 | 定时器/别的连接全停 | 上一轮已修，本轮有用例守着 |
+| 2 | 只 attach、没 `listen()` 时 `listen_fd_ == -1`，`accept_loop` 的 `WaitFd{fd<0}` 立刻 ready -> 协程 `while` 里**忙等不让出** | **既是**"写服务语句拿不到回复"，**也是**"`idle_timeouts` 一直是 0"（定时器根本没机会跑） | 本轮修（`run()` 里加 `if (listen_fd_ >= 0)`） |
+| 3 | 往"对端已经消失"的 socket 上 `write()` 送 SIGPIPE，默认处置杀进程 | 测试进程 `exit=141`；真实场景 = 一个跑掉的客户端把服务器打死 | 本轮修（`common/socket_util.h`） |
+
+顺带修掉的夹具 bug：`~Fixture` 和 `~RemoteConnection` 会关**同一个 fd**。
+fd 号码被回收后这一刀可能落在事件循环刚拿到的 fd 上，症状是"莫名其妙的连接
+断开"——典型的"测试自己造的假故障"，很难查，所以写进这里。
+
+### 3. 实测记录（都在这台机器上跑过，免得以后怀疑）
+
+| 实验 | 结果 |
+|---|---|
+| 裸 `write()` 往"对端已关"的 AF_UNIX socketpair 写 | 进程被 SIGPIPE 杀掉（`exit=141`） |
+| 同样场景改 `send(fd, buf, n, MSG_NOSIGNAL)` | 不杀进程，返回 `-1` + `EPIPE`；本机 macOS SDK **定义了 `MSG_NOSIGNAL` 且 `send()` 认它** |
+| 同样场景只靠 `setsockopt(SO_NOSIGPIPE)` | **无效**：AF_UNIX socketpair 上 `setsockopt` 直接 `-1` + `errno=EINVAL`。所以这条只有 TCP 连接才吃得到，socketpair 用例只能靠 `MSG_NOSIGNAL` |
+| 把 `socket_write` 换回裸 `write()` 再跑两个新用例 | 两个用例立刻 `exit=141` -> 说明用例**真钉住**了行为，不是"顺便通过" |
+| 客户端一个字都不发，只看超时后收到什么 | 服务器自己回 `ERROR`（message 含 `idle`）-> `shutdown(SHUT_RD)` 确实能叫醒 `poll`，原猜测不成立 |
+
+### 4. 验证
+
+- `./build/run_tests/test_server`：**33 用例 / 191 断言 / 0 失败**，连跑 30 次稳定；
+- `ctest --test-dir build`：**12/12**；
+- 增量与 `--clean-first` 重建：0 告警；
+- ThreadSanitizer（`-fsanitize=thread` 单独 build）重复跑：**0 竞态**；
+- 空闲超时用例除 `idle_timeouts == 1` 外，事务里那条还确认**回滚生效**
+  （另开会话读表 0 行），并确认收到的是**主动** ERROR 帧（客户端没有发任何东西）。
+
+### 5. 环境限制（仍然存在，不影响上面的结论）
+
+受限沙箱里 `bind()` 被拒，`ServerE2E`（6 条）与 `RemoteClient`（3 条真 TCP）
+仍然打印 `[skip]`。要覆盖真实监听路径（TCP + `SO_NOSIGPIPE` 那条），
+请在普通终端跑 `make server-test`。
+
+---
+
+## 九、本轮改动记录（2026-09-13）：通用配置包 + 读线程池 + Poller 抽象
+
+三个相互独立、同一轮落地的改动。代码都已调通，这一节补上记录。
+
+### 1. 通用配置包（`server/config.{h,cpp}` 重写）
+
+`struct Config`（硬编码字段、解析时认字段）→ `class Config`（通用键值包）：
+
+| 方面 | 做法 |
+|---|---|
+| 存储 | `map<section, map<key, sql::Value>>`（`std::less<>` 透明比较，`find(string_view)` 不造 string）；解析器**不认识任何具体字段**，只做语法 + 类型嗅探 |
+| 三层防线 | ① 语法错（缺 `]`/`=`）→ `parse_config` 失败（带行号）；② 字段错（已知 section 里拼错的 key、类型不符、超范围/枚举外）→ `validate()` 失败（带字段名）——**内置默认值表同时充当 schema**（服务器认识哪些 key、各 key 什么类型）；③ 取值时类型不符 → 抛异常（validate 过了就不该发生） |
+| 取值 | `CFG_INT(config_, server.max_connections)` 宏把字段名 `#field` 字符串化（"穷人反射"），字段名以代码标识符出现、和 `.ini` 键一一对应，不用手写字符串字面量 |
+| 未知项 | 未知 **section** 合法（别的组件可以共用同一个配置文件）；已知 section 里的未知 **key** 被 `validate()` 拦下（多半是拼错了）——"拼错 key 不能静默用默认值"这条红线不变 |
+| 启动路径 | `parse_config`/`load_config` → 命令行覆盖（`set()`，比如 `--listen`）→ `validate()` → `CFG_*` 取值；`host/port` 从结构体字段改成派生方法 `listen_host()/listen_port()` |
+
+`test_config.cpp` 跟着重写（6 → 9 用例：默认值可用、分节解析、各类字段错
+必须 validate 失败等）。所有取值点（`main_server` / `server` / 测试夹具）改走
+`CFG_*`。
+
+### 2. 读线程池（`server/server.{h,cpp}`、`server/service.h`）
+
+M1 剩余项 `read_threads > 1` 落地，架构从"读池 = I/O 线程"变成真读池：
+
+- `run()` 按 `execution.read_threads`（默认 1）起 N 条 `ServiceThread`
+  （与 parse/write 服务同一套抽象），队列上限 `execution.read_queue_max`
+  （新键，默认 1024）；
+- 路由不变（`SELECT` 且不在事务 → 读），但"就地执行"改成**轮询投读池**
+  （`read_next_` 原子计数取模，无锁）；队列满回 ERROR 帧并计
+  `read_queue_rejected`（新 metric，退出汇总里多一项）；
+- `Server::~Server` 与 `run()` 收尾都会停读池；
+- `read_pool_size()` 暴露给测试。
+
+用例 `ServerE2E.ReadPoolServesConcurrentReaders`：`read_threads=4`，
+4 个线程各打 20 条纯 `SELECT`，全部要走读池且结果全对。注意这条用例里是
+**多线程客户端**，不能用 `srvtest::Client`——它的 CHECK 会碰测试框架的
+全局计数器，不是线程安全的；所以文件里新加了一组"裸"客户端助手
+（`raw_connect`/`raw_row_count`，自己编解码帧）。
+
+### 3. Poller 抽象（`server/poller.*` 新增，Loop 换后端）
+
+决策 1 里"M3 换 kqueue/epoll"提前落地，学 libco 的第一点：**上层接口固定，
+底层按平台条件编译换实现**：
+
+| 后端 | 平台 | 文件 |
+|---|---|---|
+| kqueue | `__APPLE__` | `server/poller_kqueue.cpp` |
+| epoll（LT） | `__linux__` | `server/poller_epoll.cpp` |
+| poll(2) 兜底 | 任何平台 | `server/poller_poll.cpp` |
+
+- 三个 `.cpp` **全平台都编译**（文件内 `#if defined(...)` 自己守），
+  `Poller::create()` 按平台挑实现，平台后端创建失败也退回 poll；
+- 语义统一成 poll(2) 的词汇：**水平触发** + 事件位
+  `POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL`，上层（Loop/WaitFd）只看到
+  这一套。epoll 特意**不开 EPOLLET**：边缘触发会改变"协程恢复后重试
+  系统调用"的上层约定；
+- `Loop` 的改动：wakeup 管道**常驻注册**、不随 `watches_` 摘挂；
+  `watch/unwatch` 同步进 poller；事件派发仍是"先摘出回调再调用"（回调里
+  可能重新 watch/关 fd）；`POLLNVAL` 的 fd 顺手摘掉，别反复报。
+
+用例 `test_poller.cpp` 2 条（跑在当前平台后端上）：读就绪/水平触发语义/
+unwatch 后不再报；写就绪/对端关闭要报（`POLLIN|POLLHUP` 任一，各后端词汇
+略有差异）。
+
+### 4. 顺带的夹具/构建改动
+
+| 文件 | 改动 |
+|---|---|
+| `tests/test_server/storage_helper.h` | `RunningServer` 加 `ConfigTweak`（构造期调配置，比如把 `read_threads` 调大）与 `running()` 访问器；配置写入改走 `set()` |
+| `CMakeLists.txt` | `poller_poll/kqueue/epoll.cpp` 进 `sql_server` |
+
+### 5. 验证
+
+- `./build/run_tests/test_server`：33 → **39 用例 / 231 断言 / 0 失败**
+  （Config 6→9 重写、Poller +2、ServerE2E +1），连跑 30 次稳定；
+- `ctest --test-dir build`：**12/12**；
+- `--clean-first` 干净重建：**0 告警**；
+- **ThreadSanitizer 0 竞态**（`-fsanitize=thread` 单独 build，5 次）——读池
+  给 TSan 新增了"事件循环线程 × N 条读线程"的交叉面，正是该它出活的地方。
+
+### 6. 环境限制（新踩到一条）
+
+- `bind()` 沙箱限制仍在：`ReadPoolServesConcurrentReaders` 是真 TCP 用例，
+  沙箱里同样 `[skip]`；普通终端跑 `make server-test` 才是全量；
+- TSan 构建要用 **MacPorts clang-23 工具链**（跟 `CMakePresets.json` 的
+  `llvm-debug` 同一套，加 `-fsanitize=thread` 即可）；直接 `cmake -B
+  build-tsan` 会用 Apple Clang，它的 libc++ 太旧，连 C++23 的
+  `construct_at` 都编不过。

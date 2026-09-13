@@ -153,6 +153,29 @@ void serve_fake(int fd) {
 
 } // namespace
 
+// 回归：对端（服务器）已经没了以后客户端再发语句 —— `write()` 会送 SIGPIPE，
+// 默认处置直接杀掉客户端进程（这里就是测试进程）。正确行为是**报连接断开**。
+// 这跟"服务器被跑掉的客户端打死"是同一个坑的两面，见 common/socket_util.h。
+TEST(FakeServer, WriteAfterServerIsGoneReportsConnectionLost) {
+  int fds[2] = {-1, -1};
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  // 握手要读到 HELLO，所以先替"服务器"把它写进管道，再让服务器那端消失
+  CHECK(write_all(fds[0], server::encode_hello(server::kProtocolVersion, 0)));
+  std::string error;
+  std::unique_ptr<client::SqlConnection> connection =
+      client::make_remote_from_fd(fds[1], &error);
+  ::close(fds[0]); // 服务器那端没了
+  CHECK(connection != nullptr); // 握手（HELLO）成功
+  if (connection == nullptr) {
+    CHECK_EQ(error, std::string()); // 失败信息：为什么握手没过
+    return;
+  }
+
+  const client::Outcome outcome = connection->execute("SELECT 1");
+  CHECK(!outcome.ok);
+  CHECK_EQ(outcome.error_message, std::string("connection to server lost"));
+}
+
 TEST(FakeServer, RemoteClientConsumesHelloAndParsesFrames) {
   int fds[2] = {-1, -1};
   CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);

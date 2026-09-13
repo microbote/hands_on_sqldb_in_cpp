@@ -98,6 +98,10 @@ Loop::Loop(std::string name) : name_(std::move(name)) {
     make_nonblocking(wakeup_read_);
     make_nonblocking(wakeup_write_);
   }
+  poller_ = Poller::create();
+  if (poller_ != nullptr && wakeup_read_ >= 0) {
+    poller_->watch(wakeup_read_, POLLIN); // 常驻，不随 watches_ 摘挂
+  }
 }
 
 Loop::~Loop() {
@@ -135,9 +139,17 @@ void Loop::stop() {
 
 void Loop::watch(int fd, short events, std::function<void(short)> on_events) {
   watches_[fd] = Watch{events, std::move(on_events)};
+  if (poller_ != nullptr) {
+    (void)poller_->watch(fd, events);
+  }
 }
 
-void Loop::unwatch(int fd) { watches_.erase(fd); }
+void Loop::unwatch(int fd) {
+  watches_.erase(fd);
+  if (poller_ != nullptr) {
+    poller_->unwatch(fd);
+  }
+}
 
 void Loop::add_timer(int64_t delay_ms, std::function<void()> action) {
   timers_.emplace_back(now_us() + delay_ms * 1000, std::move(action));
@@ -194,24 +206,7 @@ void Loop::run() {
       break;
     }
 
-    // 2) 组装 pollfd（wakeup 管道常驻）
-    std::vector<pollfd> fds;
-    std::vector<int> indexes;
-    if (wakeup_read_ >= 0) {
-      pollfd wake{};
-      wake.fd = wakeup_read_;
-      wake.events = POLLIN;
-      fds.push_back(wake);
-    }
-    for (const auto &[fd, watch] : watches_) {
-      pollfd entry{};
-      entry.fd = fd;
-      entry.events = watch.events;
-      fds.push_back(entry);
-      indexes.push_back(fd);
-    }
-
-    // 3) 超时 = 最近一个定时器（没有就 1s，兜底唤醒）
+    // 2) 超时 = 最近一个定时器（没有就 1s，兜底唤醒）
     int timeout_ms = 1000;
     int64_t earliest = 0;
     bool has_timer = false;
@@ -229,33 +224,37 @@ void Loop::run() {
               : static_cast<int>(std::min<int64_t>(delta_us / 1000 + 1, 1000));
     }
 
+    // 3) 等事件：后端是平台相关的 kqueue/epoll/poll，事件词汇统一成 poll 的
+    Poller::Event fired[64];
     const int ready =
-        ::poll(fds.data(), static_cast<nfds_t>(fds.size()), timeout_ms);
+        poller_ != nullptr ? poller_->wait(timeout_ms, fired, 64) : -1;
     if (ready < 0) {
       if (errno == EINTR) {
         continue;
       }
       break;
     }
-    if (ready == 0) {
-      continue;
-    }
-    if (!fds.empty() && (fds[0].revents & POLLIN) != 0) {
-      drain_wakeup();
-    }
     // 4) 派发 fd 事件：**先摘出回调再调用**（回调里可能重新 watch/关 fd）
-    for (size_t i = 1; i < fds.size(); ++i) {
-      if (fds[i].revents == 0) {
+    for (int i = 0; i < ready; ++i) {
+      const int fd = fired[i].fd;
+      const short revents = fired[i].revents;
+      if (fd == wakeup_read_) {
+        if ((revents & POLLIN) != 0) {
+          drain_wakeup();
+        }
+        continue; // 唤醒管道常驻注册，不摘
+      }
+      if ((revents & POLLNVAL) != 0) {
+        unwatch(fd); // fd 已被关：顺手摘掉，别反复报
         continue;
       }
-      const int fd = indexes[i - 1];
       auto it = watches_.find(fd);
       if (it == watches_.end()) {
         continue;
       }
       auto callback = std::move(it->second.on_events);
-      watches_.erase(it);
-      callback(fds[i].revents);
+      unwatch(fd);
+      callback(revents);
     }
   }
   g_loop = nullptr;

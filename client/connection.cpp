@@ -9,6 +9,7 @@
 #include <cstring>
 #include <utility>
 
+#include "common/socket_util.h"
 #include "server/protocol.h"
 #include "session/session.h"
 
@@ -325,7 +326,7 @@ private:
     size_t sent = 0;
     while (sent < data.size()) {
       const ssize_t wrote =
-          ::write(fd_, data.data() + sent, data.size() - sent);
+          common::socket_write(fd_, data.data() + sent, data.size() - sent);
       if (wrote <= 0) {
         return false;
       }
@@ -380,6 +381,7 @@ std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
     }
     return nullptr;
   }
+  common::socket_suppress_sigpipe(fd);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(static_cast<uint16_t>(std::stoi(options.port)));
@@ -404,6 +406,7 @@ std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
 
 std::unique_ptr<SqlConnection> make_remote_from_fd(int fd, std::string *error,
                                                    const std::string &label) {
+  common::socket_suppress_sigpipe(fd);
   auto connection = std::make_unique<RemoteConnection>(fd, label);
   if (!connection->handshake()) {
     if (error != nullptr) {

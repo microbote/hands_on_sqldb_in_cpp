@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 
+#include "common/socket_util.h"
 #include "protocol.h"
 
 namespace server {
@@ -62,7 +63,9 @@ Task read_some(int fd, std::string &buffer, ssize_t &nread) {
 Task write_all(int fd, std::string data, bool &ok) {
   size_t sent = 0;
   while (sent < data.size()) {
-    const ssize_t wrote = ::write(fd, data.data() + sent, data.size() - sent);
+    // 对端跑掉时不能让 SIGPIPE 杀掉整个服务器进程（见 common/socket_util.h）
+    const ssize_t wrote =
+        common::socket_write(fd, data.data() + sent, data.size() - sent);
     if (wrote > 0) {
       sent += static_cast<size_t>(wrote);
       continue;
@@ -94,7 +97,7 @@ ErrorFrame to_error_frame(const session::SessionError &error) {
 
 } // namespace
 
-Server::Server(Config config, std::shared_ptr<kv::KVStore> store)
+Server::Server(ServerConfig config, std::shared_ptr<kv::KVStore> store)
     : config_(std::move(config)), store_(std::move(store)), loop_("server-io"),
       parse_service_("parse-service"), write_service_("write-service") {
   int fds[2] = {-1, -1};
@@ -115,6 +118,9 @@ Server::Server(Config config, std::shared_ptr<kv::KVStore> store)
 Server::~Server() {
   parse_service_.stop();
   write_service_.stop();
+  for (auto &worker : read_pool_) {
+    worker->stop();
+  }
   if (listen_fd_ >= 0) {
     ::close(listen_fd_);
   }
@@ -136,7 +142,7 @@ void Server::log(const char *level, const std::string &message) const {
     }
     return name == "info" ? 2 : 3;
   };
-  if (rank(level) > rank(config_.log_level)) {
+  if (rank(level) > rank(config_.log_level())) {
     return;
   }
   fmt::print(stderr, "[{}] {}\n", level, message);
@@ -170,7 +176,8 @@ void Server::unregister_connection(int fd) {
 void Server::arm_idle_watchdog(const std::shared_ptr<ConnState> &state,
                                bool in_tx) {
   const int64_t timeout_ms =
-      in_tx ? config_.idle_in_transaction_timeout_ms : config_.idle_timeout_ms;
+      in_tx ? config_.idle_in_transaction_timeout_ms()
+            : config_.idle_timeout_ms();
   if (timeout_ms <= 0) {
     return; // 0 = 不超时
   }
@@ -238,6 +245,7 @@ void Server::attach_connection(int fd) {
     ::close(fd);
     return;
   }
+  common::socket_suppress_sigpipe(fd);
   auto state = std::make_shared<ConnState>();
   state->fd = fd;
   register_connection(state);
@@ -258,16 +266,15 @@ std::expected<void, std::string> Server::listen() {
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
   // 端口 0 = 让内核挑（测试用）
-  const int requested_port = std::stoi(config_.port);
+  const int requested_port = std::stoi(config_.listen_port());
+  const std::string host = config_.listen_host();
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(static_cast<uint16_t>(requested_port));
-  if (config_.host.empty() || config_.host == "*" ||
-      config_.host == "0.0.0.0") {
+  if (host.empty() || host == "*" || host == "0.0.0.0") {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  } else if (::inet_pton(AF_INET, config_.host.c_str(), &addr.sin_addr) != 1) {
-    return std::unexpected("listen host must be an IPv4 address: " +
-                           config_.host);
+  } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+    return std::unexpected("listen host must be an IPv4 address: " + host);
   }
   if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
       0) {
@@ -292,24 +299,47 @@ std::expected<void, std::string> Server::listen() {
 }
 
 void Server::run() {
-  parse_service_.start(config_.write_queue_max);
-  write_service_.start(config_.write_queue_max);
+  const size_t queue_max = config_.write_queue_max();
+  parse_service_.start(queue_max);
+  write_service_.start(queue_max);
+  // 读线程池：纯读语句真正并发（N = execution.read_threads）
+  {
+    const size_t read_threads = config_.read_threads();
+    const size_t read_queue_max = config_.read_queue_max();
+    read_pool_.reserve(read_threads);
+    for (size_t i = 0; i < read_threads; ++i) {
+      auto worker =
+          std::make_unique<ServiceThread>(fmt::format("read-service-{}", i));
+      worker->start(read_queue_max);
+      read_pool_.push_back(std::move(worker));
+    }
+  }
   if (signal_read_ >= 0) {
     loop_.watch(signal_read_, POLLIN,
                 [this](short) { begin_graceful_shutdown(); });
   }
-  loop_.spawn(accept_loop());
+  // 没有监听 fd（测试/嵌入用 attach_connection 挂进来的场景）时不要起 accept
+  // 协程：`WaitFd{fd<0}` 的 await_ready() 为 true，协程会在 while 里**忙等**
+  // 而不让出，把整条事件循环饿死（别的连接一条语句都回不了）。这里踩过。
+  if (listen_fd_ >= 0) {
+    loop_.spawn(accept_loop());
+  }
   loop_.run();
   log("info",
       fmt::format("stopped: connections={} statements={} errors={} rows={} "
-                  "idle_timeouts={} write_rejects={} parse_rejects={}",
+                  "idle_timeouts={} write_rejects={} parse_rejects={} "
+                  "read_rejects={}",
                   metrics_.connections_total.load(), metrics_.statements.load(),
                   metrics_.errors.load(), metrics_.rows_sent.load(),
                   metrics_.idle_timeouts.load(),
                   metrics_.write_queue_rejected.load(),
-                  metrics_.parse_queue_rejected.load()));
+                  metrics_.parse_queue_rejected.load(),
+                  metrics_.read_queue_rejected.load()));
   parse_service_.stop();
   write_service_.stop();
+  for (auto &worker : read_pool_) {
+    worker->stop();
+  }
 }
 
 Task Server::accept_loop() {
@@ -332,7 +362,7 @@ Task Server::accept_loop() {
         }
         break;
       }
-      if (connections_.load() >= config_.max_connections) {
+      if (connections_.load() >= config_.max_connections()) {
         ::close(fd); // 超限：直接关，不做半开连接
         continue;
       }
@@ -340,6 +370,7 @@ Task Server::accept_loop() {
         ::close(fd);
         continue;
       }
+      common::socket_suppress_sigpipe(fd);
       int nodelay = 1;
       ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
       auto state = std::make_shared<ConnState>();
@@ -355,8 +386,9 @@ Task Server::accept_loop() {
 
 Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
   session::Session session(store_->connect());
-  if (!config_.default_database.empty()) {
-    (void)session.execute("USE " + config_.default_database);
+  const std::string default_database = config_.default_database();
+  if (!default_database.empty()) {
+    (void)session.execute("USE " + default_database);
   }
 
   std::string in;
@@ -367,9 +399,6 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
     co_await write_all(fd, encode_hello(kServerVersion, 0), ok);
     alive = ok;
   }
-
-  const size_t read_threads = config_.read_threads; // M1：读池 = 本 Loop
-  (void)read_threads;
 
   while (alive && !loop_.stopped()) {
     // 2) 收帧（半帧/粘包都在这里处理）
@@ -536,7 +565,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
     std::expected<std::unique_ptr<exec::ResultCursor>, session::SessionError>
         result = std::unexpected(session::SessionError());
     if (parsed.has_value()) {
-      // 路由：事务里的语句 + 非只读语句 → 写服务线程；只读且不在事务 → 就地执行
+      // 路由：事务里的语句 + 非只读语句 → 写服务线程；只读且不在事务 → 读池
       const bool route_to_write =
           session.in_transaction() || !parsed->read_only;
       if (route_to_write) {
@@ -555,12 +584,33 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
           alive = ok;
           continue;
         }
+      } else if (!read_pool_.empty()) {
+        // 纯读：轮询挑一条读线程执行，读请求之间真正并发
+        ServiceThread &worker =
+            *read_pool_[read_next_.fetch_add(1, std::memory_order_relaxed) %
+                        read_pool_.size()];
+        SubmitToService submit;
+        submit.service = &worker;
+        submit.work = [&session, &parsed, &result] {
+          result = session.execute_parsed(*parsed);
+        };
+        co_await submit;
+        if (!submit.submitted) {
+          metrics_.read_queue_rejected.fetch_add(1);
+          bool ok = false;
+          ErrorFrame busy;
+          busy.message = "server busy: read queue is full";
+          co_await write_all(fd, encode_error(busy), ok);
+          alive = ok;
+          continue;
+        }
       } else {
         result = session.execute_parsed(*parsed);
       }
     }
 
     // 4) 回结果：ERROR / COLUMNS+ROW* / OK
+    const size_t max_rows = config_.max_result_rows();
     std::string out;
     bool error_response = false;
     uint64_t rows_sent = 0;
@@ -587,7 +637,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
             }
             break;
           }
-          if (++rows > config_.max_result_rows) {
+          if (++rows > max_rows) {
             truncated = true;
             break;
           }
@@ -605,7 +655,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
           error_response = true;
           ErrorFrame too_many;
           too_many.message = "result set too large (max_result_rows=" +
-                             std::to_string(config_.max_result_rows) + ")";
+                             std::to_string(max_rows) + ")";
           out = encode_error(too_many);
         } else if (!cursor.error().is_error()) {
           rows_sent = static_cast<uint64_t>(rows);

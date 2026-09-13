@@ -249,6 +249,9 @@ target_compile_features(sql_session PUBLIC cxx_std_23)
 add_library(sql_server STATIC
     server/config.cpp
     server/loop.cpp
+    server/poller_poll.cpp
+    server/poller_kqueue.cpp
+    server/poller_epoll.cpp
     server/protocol.cpp
     server/service.cpp
     server/server.cpp

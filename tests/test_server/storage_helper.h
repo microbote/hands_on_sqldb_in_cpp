@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -25,17 +26,21 @@ namespace srvtest {
 // ---- 后台 Server：mock 引擎 + 内核挑端口 ----
 class RunningServer {
 public:
-  explicit RunningServer(bool default_db = true) {
-    config_.engine = "mock";
-    config_.path = "mock://server-test";
-    config_.listen = "127.0.0.1:0";
-    config_.host = "127.0.0.1";
-    config_.port = "0";
+  // tweak：构造期调整配置（比如把 execution.read_threads 调大）
+  using ConfigTweak = std::function<void(server::ServerConfig &)>;
+
+  explicit RunningServer(bool default_db = true, ConfigTweak tweak = {}) {
+    config_.set("storage.engine", "mock");
+    config_.set("storage.path", "mock://server-test");
+    config_.set("server.listen", "127.0.0.1:0"); // 端口 0 = 内核挑
     if (default_db) {
-      config_.default_database = "shop";
+      config_.set("session.default_database", "shop");
+    }
+    if (tweak) {
+      tweak(config_);
     }
     kv::DatabaseOptions options;
-    options.set_path(config_.path);
+    options.set_path(config_.path());
     store_ = kv::open_store(kv::EngineType::MOCK, options);
     server_ = std::make_unique<server::Server>(config_, store_);
   }
@@ -67,6 +72,7 @@ public:
   }
 
   int port() const { return port_; }
+  server::Server &running() { return *server_; }
 
 private:
   // 等监听真正可用：反复尝试连接（连上就立刻关掉）
@@ -103,7 +109,7 @@ private:
         "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(16), age INT)");
   }
 
-  server::Config config_;
+  server::ServerConfig config_;
   std::shared_ptr<kv::KVStore> store_;
   std::unique_ptr<server::Server> server_;
   std::thread thread_;

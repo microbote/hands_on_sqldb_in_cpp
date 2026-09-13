@@ -2,9 +2,11 @@
 //
 // `ServiceThread`：一条"专门干某类活"的线程 + 有界队列 + 完成后回原 Loop。
 //
-// 服务器里有两个实例：
+// 服务器里有三组实例：
 //   - ParseService：解析（词法/语法层有进程级全局状态，只允许一个线程做）；
-//   - WriteService：写语句 + 事务里的所有语句（悲观单写者的排队点）。
+//   - WriteService：写语句 + 事务里的所有语句（悲观单写者的排队点）；
+//   - ReadPool：N 条读线程（execution.read_threads），纯读语句轮询投进去，
+//     读请求之间真正并发。
 //
 // 用法（在协程里）：
 //     Outcome outcome;
