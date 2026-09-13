@@ -1,5 +1,7 @@
 # executor 模块
 
+English version: [readme.en.md](readme.en.md)
+
 ## 1. 位置
 
 ```
@@ -84,8 +86,10 @@ SET 列表、VALUES）**拷成自己的成员**，运行期不再解引用计划
 
 ## 7. 已知缺口
 
-- **多行 VALUES 语法未支持**：`INSERT ... VALUES (...), (...)` 目前解析失败
-  （`statement` 层其实已经预留了多行处理，只差 `sql.y` 的一个产生式）。
+- 多行 `VALUES` 已经支持（`INSERT ... VALUES (..), (..)` 一次插多行，
+  受影响行数是行数之和）；主键冲突由 `Table::insert` 在执行期报
+  `CONSTRAINT_VIOLATION`，校验期（statement 层）会**提前**查一遍
+  （批内重复 + 与已有行冲突），见 `statement/README.md`。
 - DDL / USE 的执行不在本模块（需要 `Catalog` + 会话状态）。
 - `SortExecutor` 只有"内存 + 上限报错"，还没做外部归并排序。
 - 没有并行/批量（chunk）执行；算子一次一行，后续要上向量化时

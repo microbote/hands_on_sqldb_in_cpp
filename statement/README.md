@@ -1,5 +1,7 @@
 # statement 模块
 
+English version: [README.en.md](README.en.md)
+
 把 parser 产出的 AST 变成 **sql_types 的 `sql::Query`**，并在执行前做语义校验。
 
 ```
@@ -15,6 +17,26 @@ SQL 文本 --parser--> AST --StatementBuilder--> sql::Query --StatementValidator
 | `StatementValidator` | `const sql::Query&` + `const sql::Catalog&` | `std::expected<void, StmtError>` | 库/表/列是否存在、值类型族与取值范围、主键约束、DDL 语义（重复建库/建表、删不存在的对象） | 不修改数据；**校验通过 ≠ 已执行** |
 
 辅助：`statement/source_span.h`（位置格式化、caret 渲染、名字→位置解析）。
+
+### INSERT 的主键冲突：执行前就查
+
+`StatementValidator::validate_insert()` 除了逐列检查，还会**提前**查主键冲突
+（`check_primary_key_conflicts`），两类：
+
+1. **这一批 VALUES 内部重复** —— 纯静态检查（`sql::Key` 编码去重，和存储落
+   key 的方式一致：`Value::to_key(主键列类型)`），任何 Catalog 都能查；
+2. **与表里已有的行冲突** —— 需要 Catalog 支持数据探测：
+   `sql::Catalog::primary_key_exists(db, table, key)`（默认返回 `nullopt` =
+   不支持，`KVCatalog` 实现了它：打开表做一次点查）。
+   不支持探测时**降级**为执行期检查（`Table::insert` 本来就会报重复主键）。
+
+报的是 `StmtErrorCode::DUPLICATE_PRIMARY_KEY`，位置指向**那个具体的值**
+（`value_spans`），多行时能直接看出是哪一行。
+
+为什么值得多做这一步：写语句在 session 里是"一条语句一个事务"，执行到一半
+才发现冲突要走回滚；校验期拒掉则**事务根本不开**。在显式事务里更明显 ——
+校验期错误**不中止事务**（`statement`/`session` 的约定），用户可以接着干别的，
+而不是被迫 `ROLLBACK`。
 
 事务控制语句（`BEGIN` / `COMMIT` / `ROLLBACK`，别名在语法层已归一化）走的是
 **纯结构转换**：`NODE_TRANSACTION` → `sql::TransactionStmt{kind}`，

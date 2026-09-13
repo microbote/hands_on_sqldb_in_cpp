@@ -216,6 +216,28 @@ KVCatalog::get_table_schema(const Identifier &db_name,
   return std::optional<TableSchema>(std::move(*schema));
 }
 
+std::optional<bool>
+KVCatalog::primary_key_exists(const Identifier &db_name,
+                              const Identifier &table_name,
+                              const Value &primary_key) const {
+  if (!is_open() || db_name.empty() || table_name.empty() ||
+      primary_key.is_null()) {
+    return std::nullopt; // 探测不出结论：交给执行期
+  }
+  auto table = open_table(db_name, table_name);
+  if (!table.has_value()) {
+    return std::nullopt; // 表不存在/打不开：这里的职责不是报这个错
+  }
+  auto found = table->find(primary_key);
+  if (found.has_value()) {
+    return true;
+  }
+  if (found.error().code == RelErrorCode::NOT_FOUND) {
+    return false;
+  }
+  return std::nullopt; // 坏行之类的错误：不在这里下结论
+}
+
 // ============================================================
 // DDL
 // ============================================================

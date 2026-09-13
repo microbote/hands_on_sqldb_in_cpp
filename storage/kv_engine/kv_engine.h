@@ -252,20 +252,15 @@ public:
   virtual Status status() const = 0;
   virtual std::string error_message() const = 0;
 
-  void for_each(std::function<bool(const Key &, const ByteValue &)> callback,
-                bool break_if_error = false) {
-    {
-      while (valid()) {
-        bool ok = callback(key(), value());
-        if (!ok) {
-          fprintf(stderr, "callback error on Key: %s, Value : %s\n",
-                  key().c_str(), value().c_str());
-          if (break_if_error) {
-            break;
-          }
-        }
-        next();
+  // 遍历当前迭代器：callback 返回 false = **提前停止**（不是错误，也不打印 ——
+  // 库代码不打印）。返回 true 就继续下一条。
+  void for_each(
+      const std::function<bool(const Key &, const ByteValue &)> &callback) {
+    while (valid()) {
+      if (!callback(key(), value())) {
+        return;
       }
+      next();
     }
   }
   std::vector<KVPair> collect(size_t max_count = 0) {
@@ -324,13 +319,23 @@ struct DatabaseOptions {
   }
 };
 
+class KVStore;
+
+// ============================================================
+// KVEngine：**一条连接**（一个 session 的存储视角）
+//
+//   - 连接自带事务状态（TxBuffer），事务里的读/写只影响这条连接；
+//   - 多条连接共享同一个 KVStore（见下）：一个进程一份存储，一个客户端
+//     连接一条 KVEngine —— 搬到服务器时就是这个形状；
+//   - 连接的接口是"按连接看数据"：get/put/scan 都会先问自己的事务缓冲，
+//     再问存储。
+// ============================================================
 class KVEngine {
 public:
   virtual ~KVEngine() = default;
 
-  // ----- 生命周期 -----
-  virtual Status open_database(DatabaseOptions options) = 0;
-  virtual Status close_database() = 0;
+  // 这条连接挂在哪个存储上（开新连接用 store()->connect()）
+  virtual std::shared_ptr<KVStore> store() const = 0;
   virtual bool is_open() const = 0;
 
   // ----- 单条操作 -----
@@ -402,7 +407,11 @@ public:
   //   - begin 之后所有 put/remove/write_batch 都进缓冲，DB 不动；
   //   - commit 把缓冲合成一个 WriteBatch 一次写入（sync=true，保证落盘）；
   //   - rollback 直接丢弃缓冲 —— DB 从没被动过，"与原状态一致"是构造性的；
-  //   - 同一时刻只允许一个写事务：重复 begin 返回 Status::Busy。
+  //   - 写槽在 **Store** 上（不是连接上）：全进程同一时刻只允许一条连接
+  //     持有写事务，第二条 begin 返回 Status::Busy；
+  //   - 没有显式事务的 put/remove/write_batch 是"自动提交写"：它短暂占用
+  //     写槽（会话的写语句本来就包在事务里），所以单写者规则对引擎级调用
+  //     同样成立。
   virtual Status begin_transaction() { return Status::NotSupported; }
   virtual Status commit_transaction() { return Status::NotSupported; }
   virtual Status rollback_transaction() { return Status::NotSupported; }
@@ -412,8 +421,36 @@ public:
   virtual void flush() = 0;
   virtual std::string stats() const { return ""; }
   virtual std::string name() const = 0;
+};
 
-protected:
+// ============================================================
+// KVStore：**存储**（进程内一份）
+//
+//   - 一个 Store 可以开多条连接（connect()），每条连接 = 一个 session；
+//   - **写槽**在 Store 上：悲观单写者 —— 同一时刻只允许一条连接持有写事务
+//     （第二条 begin 返回 Status::Busy）；
+//   - 写事务的记录（工作集/行锁）以后也挂在这一层：它天然是"连接之间"的东西。
+// ============================================================
+class KVStore {
+public:
+  virtual ~KVStore() = default;
+
+  // ----- 生命周期 -----
+  // 打开存储（已打开返回 AlreadyExists）；close() 之后所有连接失效
+  virtual Status open(const DatabaseOptions &options) = 0;
+  virtual Status close() = 0;
+  virtual bool is_open() const = 0;
+
+  // 开一条新连接：每条连接有自己的事务状态
+  virtual std::shared_ptr<KVEngine> connect() = 0;
+
+  // ----- 管理 -----
+  virtual std::string name() const = 0;
+  virtual void flush() = 0;
+  virtual std::string stats() const { return ""; }
+
+  // 写槽是否被某条连接持有（测试/诊断用）
+  virtual bool write_slot_held() const = 0;
 };
 
 } // namespace kv

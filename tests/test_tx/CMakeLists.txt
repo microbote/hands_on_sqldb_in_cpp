@@ -4,6 +4,7 @@ cmake_minimum_required(VERSION 3.20)
 add_executable(test_tx
     main.cpp
     test_transaction.cpp
+    test_connection.cpp
 )
 
 target_link_libraries(test_tx PRIVATE

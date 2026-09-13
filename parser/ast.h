@@ -185,7 +185,10 @@ typedef struct InsertNode {
   char *table;      // 表名
   SSpan table_span; // 表名位置
   ASTNode *columns; // 列名列表 (ASTNodeList)
-  ASTNode *values;  // 值列表 (ASTNodeList)
+  // 值列表：**行的列表**（ASTNodeList，元素是每行的 LIST_VALUE）。
+  // 单行与多行形状一致：VALUES (1,2) 与 VALUES (1,2),(3,4) 都是"行的列表"，
+  // 只是行数不同 —— builder 因此只有一条路径。
+  ASTNode *values;
 } InsertNode;
 ASTNode *make_insert_node(const char *table, ASTNode *columns, ASTNode *values);
 int print_insert_node(ASTNode *node, int indent, int offset, char *buffer,

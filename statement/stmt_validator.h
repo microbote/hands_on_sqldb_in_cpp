@@ -54,6 +54,12 @@ private:
   // ---- DML ----
   std::expected<void, StmtError> validate_select(const sql::Query &stmt) const;
   std::expected<void, StmtError> validate_insert(const sql::Query &stmt) const;
+
+  // INSERT 的主键冲突提前检查：批内重复（静态）+ 与已有行冲突（靠 Catalog
+  // 探测）
+  std::expected<void, StmtError> check_primary_key_conflicts(
+      const sql::TableSchema &schema, const sql::InsertQuery &query,
+      const std::vector<const sql::ColumnDef *> &target_columns) const;
   std::expected<void, StmtError> validate_update(const sql::Query &stmt) const;
   std::expected<void, StmtError> validate_delete(const sql::Query &stmt) const;
 

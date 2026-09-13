@@ -20,6 +20,7 @@
 #include "sql_types/schema.h"
 #include "sql_types/value.h"
 #include "statement/stmt_builder.h"
+#include "storage/kv_engine/kv_factory.h"
 #include "storage/mock_engine/mock_engine.h"
 
 namespace exectest {
@@ -35,11 +36,10 @@ inline sql::TableSchema users_schema() {
 }
 
 inline std::shared_ptr<kv::MockEngine> open_engine() {
-  auto engine = std::make_shared<kv::MockEngine>();
   kv::DatabaseOptions options;
   options.path = "mock://executor-test";
-  engine->open_database(options);
-  return engine;
+  auto store = kv::open_store(kv::EngineType::MOCK, options);
+  return std::static_pointer_cast<kv::MockEngine>(store->connect());
 }
 
 inline sql::Row users_row(int64_t id, const std::string &name, int64_t age) {

@@ -73,6 +73,12 @@ public:
   get_table_schema(const Identifier &db_name,
                    const Identifier &table_name) const override;
 
+  // 执行前的主键冲突检查（见 sql::Catalog 的说明）：打开表做一次点查。
+  // 表打不开 / 读到坏行 -> nullopt（不在这里下结论，交给执行期报错）。
+  std::optional<bool>
+  primary_key_exists(const Identifier &db_name, const Identifier &table_name,
+                     const Value &primary_key) const override;
+
   bool create_database(const Identifier &db_name) override;
   bool drop_database(const Identifier &db_name) override;
   bool create_table(const Identifier &db_name,

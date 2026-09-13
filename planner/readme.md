@@ -1,5 +1,7 @@
 ## Planner模块
 
+English version: [readme.en.md](readme.en.md)
+
 ### 1. 流程
 
 ```

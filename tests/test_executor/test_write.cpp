@@ -191,18 +191,43 @@ TEST(Write, InsertSingleRowWithColumnList) {
   }
 }
 
-TEST(Write, InsertMultiRowValuesIsNotSupportedYet) {
+TEST(Write, InsertMultiRowValuesInsertsEveryRow) {
   Fixture env;
-  // 已知缺口：语法只能跟一行 VALUES（builder 里已经预留了多行处理），
-  // 所以这里解析失败 -> 执行层拿不到计划。等 parser 放开多行后
-  // 这条用例应该改成断言 affected_rows == 2。
+  const size_t before = env.row_count();
+
+  auto cursor = exectest::run_sql(
+      *env.catalog,
+      "INSERT INTO users (id, name, age) VALUES (100, 'a', 1), (101, 'b', 2)");
+  CHECK(cursor != nullptr);
+  if (cursor == nullptr) {
+    return;
+  }
+  CHECK_EQ(cursor->affected_rows(), size_t{2});
+  CHECK_EQ(env.row_count(), before + 2);
+  const auto first = env.row(100);
+  const auto second = env.row(101);
+  CHECK(first.has_value());
+  CHECK(second.has_value());
+  if (first.has_value()) {
+    CHECK_EQ((*first)[1].as_str(), std::string("a"));
+  }
+  if (second.has_value()) {
+    CHECK_EQ((*second)[2].as_int(), int64_t{2});
+  }
+}
+
+// 多行 VALUES 中途撞主键：执行层报错（整条语句的原子性由 session 的
+// 自动提交守卫保证 —— 执行器这一层没有事务，见 test_session 的用例）
+TEST(Write, InsertMultiRowValuesReportsConflict) {
+  Fixture env;
+
   std::string error;
   auto cursor = exectest::run_sql(
       *env.catalog,
-      "INSERT INTO users (id, name, age) VALUES (100, 'a', 1), (101, 'b', 2)",
+      "INSERT INTO users (id, name, age) VALUES (100, 'a', 1), (3, 'clash', 2)",
       &error);
   CHECK(cursor == nullptr);
-  CHECK(!error.empty());
+  CHECK(error.find("duplicate primary key") != std::string::npos);
 }
 
 TEST(Write, InsertDuplicatePrimaryKeyFailsAndKeepsOldRow) {

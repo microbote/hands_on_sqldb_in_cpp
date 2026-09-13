@@ -1,5 +1,7 @@
 # KV 层：事务（悲观单写者 + 缓冲后一次提交）
 
+English version: [readme.en.md](readme.en.md)
+
 ## 1. 为什么是这个方案
 
 LevelDB 给了两块积木，够用：
@@ -27,11 +29,48 @@ LevelDB 给了两块积木，够用：
 
 | 文件 | 职责 |
 |---|---|
+| `kv_engine.h` 里的 `KVStore` | **存储**（进程内一份）：数据 + 锁 + **写槽**；`connect()` 开一条连接 |
+| `kv_engine.h` 里的 `KVEngine` | **一条连接**（= 一个 session 的存储视角）：自己的事务缓冲；多条连接共享同一个 Store |
 | `tx_buffer.h/.cpp` | `TxBuffer`：有序 op log（提交顺序）+ 按 key 的覆盖视图（读用） |
 | `tx_buffer.h` 里的 `OverlayCursor` | 覆盖层的**有序游标**（合并迭代器用；只遍历本事务动过的 key） |
 | `merging_iterator.h/.cpp` | `MergingIterator`：DB 迭代器 + 覆盖游标归并（新插入的 key 也按序并进去） |
 | `kv_engine.h` | `begin/commit/rollback_transaction`、`WriteBatch::remove_range`、`WriteBatch::sync` |
 | `mock_engine` / `leveldb_engine` | 各自实现上述接口，**语义必须一致** |
+
+### 存储 / 连接两层（多连接）
+
+```
+kv::KVStore   一份：data_（mock）/ db_（leveldb）+ 锁 + 写槽
+   └─ connect() -> kv::KVEngine   一条连接 = 一个 session 的视角（自己的 TxBuffer）
+        ├─ connect() 再来一条（两条连接共享同一份数据与写槽）
+        └─ ...
+```
+
+用法（CLI 现在就是这么建的；搬服务器时每个客户端 `connect()` 一次）：
+
+```cpp
+auto store = kv::open_store(kv::EngineType::LEVELDB, options);  // 打开存储
+auto conn  = store->connect();                                  // 一条连接
+auto conn2 = store->connect();                                  // 第二条连接
+```
+
+为什么必须这样拆：LevelDB 的目录锁挡不住**同进程**的第二次 `DB::Open`
+（POSIX 记录锁是按进程的），两个 `leveldb::DB` 指着同一批文件写是会写坏数据的。
+所以"一个进程 = 一个 `db_` 句柄 + N 条连接"是唯一正确的形状。
+
+**写槽在 Store 上**：`begin_transaction()` 向 Store 申请；同一时刻只允许一条
+连接持有（第二条 → `Status::Busy`）。没有显式事务的 `put/remove/write_batch`
+是"自动提交写"，它**短暂**占用写槽 —— 会话的写语句本来就包在事务里，
+这条规则只是让引擎级调用也守同一个"单写者"约束。
+
+**读者的可见性**（不需要快照就有的一致性）：
+
+- 未提交的写只在写者自己的 `TxBuffer` 里 → 别的连接看不到（无脏读）；
+- 提交是一个 `WriteBatch` → 读者看到的是提交前或提交后，没有中间态；
+- **一条扫描内部一致**：LevelDB 迭代器在创建时就钉住了当时的版本；Mock
+  迭代器在创建时把区间**物化**成 vector（不持锁、也不受后续提交影响）。
+  两条引擎的行为一致，这正是 `Connections.ScanIsNotAffectedByAnotherConnectionsCommit`
+  钉住的语义。
 
 ### 为什么 TxBuffer 要有两套表示
 
@@ -79,12 +118,15 @@ struct OverlayOp {
 
 | 项 | 我们的选择 |
 |---|---|
-| 并发 | **悲观单写者**：同时只允许一个写事务，第二个 `begin` 返回 `Status::Busy` |
+| 并发 | **多连接 + 悲观单写者**：一个进程一份 Store，N 条连接（= N 个 session）；同时只允许一个写事务，第二条连接 `begin` 返回 `Status::Busy` |
 | 隔离 | 不脏读（未提交的东西不在 DB 里）；提交原子可见；单写者 => 写-写冲突不存在 |
+| 读者 | **不阻塞、不等锁**：读已提交状态；一条扫描内部一致（见上） |
+| 可重复读 | 写事务天然可重复（单写者，期间没有别人能提交）。将来的**只读**可重复读事务用"读事务持共享读锁到结束"或 `leveldb::Snapshot` 实现 —— 见第 7 节 |
 | 冲突检测 | **不做**（单写者下不需要）。将来要多写者时按"读集 + 提交时校验"补 |
+| 缺失 key 的语义 | `get`/`exists`/`remove` 在**两个引擎上一致**：`get` → `NotFound`，`remove` 一个不存在的 key → `NotFound`（leveldb 的 `Delete` 原生返回 OK，`LevelDBStore::remove` 因此先查一遍）。**事务里**的删除是幂等的（进缓冲的 op），非事务的删除是"即时"语义 |
 | 提交失败 | 缓冲**保留**，调用方可以重试或回滚（`LevelDB/mock` 行为一致） |
 | 事务上限 | `TxBuffer::kDefaultLimit` = 64MB，超了 `commit` 返回 `InvalidArgument` |
-| 显式事务 | `BEGIN / COMMIT / ROLLBACK`（含 `START TRANSACTION` / `END` / `ABORT` 别名），session 层关键字 |
+| 显式事务 | `BEGIN / COMMIT / ROLLBACK`（含 `START TRANSACTION` / `END` / `ABORT` 别名）：**语法层关键字**（`parser/sql.y` 的 `transaction_stmt`），执行与会话状态在 session（自动提交守卫在显式事务里让位） |
 | 事务里语句失败 | 事务标记为中止：后续语句报错，只能 `ROLLBACK`；此时 `COMMIT` 实际执行回滚并明确报错（Postgres 风格） |
 | 校验期错误 | 因为还没写任何东西，**不中止**事务（MySQL 风格） |
 
@@ -102,7 +144,8 @@ struct OverlayOp {
 
 ## 5. 测试
 
-`tests/test_tx`（18 条）：
+`tests/test_storage`（19 条，存储层：两引擎同一份断言）+
+`tests/test_tx`（23 条）：
 
 - 缓冲写对 DB 不可见（`size()` 绕过缓冲直接看底层）、提交后可见；
 - 回滚 = 一切照旧，且之后能正常开新事务；
@@ -117,6 +160,10 @@ struct OverlayOp {
   Mock 引擎进了测试）。
 - 合并迭代器：新插入的 key 出现在正/反向扫描里、覆盖已有 key、删掉的
   key 消失、`seek` / `seek_to_last` / `prev` 也能看到覆盖层里的 key。
+- **`Connections` 五条（同一份用例在 Mock 与 LevelDB 上各跑一遍）**：
+  连接各自的事务缓冲互不可见、提交后互相可见；第二条连接的 `begin`/写
+  返回 `Busy` 而读者照常读；扫描期间别的连接提交**不影响这条扫描**；
+  正/反扫描在两个引擎上一致；连接带着未提交事务析构 = 回滚 + 归还写槽。
 
 ## 6. 实现过程中踩到的坑（都进了测试）
 
@@ -133,6 +180,15 @@ struct OverlayOp {
 ## 7. 下一步
 
 1. 需要多写者时再加"读集 + 提交校验"（全局序号 -> 精读集 -> 每 key 版本）；
-2. 只读事务拿 `leveldb::Snapshot` 做可重复读（接口位置已留：`Isolation`）；
-3. 大事务（超过 64MB）落盘 spill；这个 leveldb 缺 `DeleteRange`，整段删在
+2. **写事务工作集（行锁）：暂不做**（2026-09-13 拍板）。理由有两条：
+   - 现在是**单一写者**，写槽给出的互斥已经比行锁更强，行锁对写者/读者都
+     没有新的可观察语义（读者本来就看不到未提交的行）；
+   - 行锁的真实用途是"缩小锁范围以支持**多写者**"，但那会引入**幻读**：
+     事务的前提可能在事务内被别人改掉（例如"读到的行数"在读取前后变化，
+     导致事务内的分支判断失效）。这个问题除非同时上**快照读**否则很难解决 ——
+     所以行锁必须和"多写者 + 快照读"作为一件事一起做，不能先做一半。
+3. 只读事务的可重复读：两种实现选一 ——"读事务持共享读锁到结束"（零 MVCC，
+   代价是提交要等读事务）或 `leveldb::Snapshot`（读者不阻塞提交，
+   代价是版本管理 + 快照生命周期）；
+4. 大事务（超过 64MB）落盘 spill；这个 leveldb 缺 `DeleteRange`，整段删在
    提交时展开成逐键删（原子性不变，内存与键数成正比）。

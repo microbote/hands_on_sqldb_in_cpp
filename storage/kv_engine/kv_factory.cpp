@@ -4,16 +4,28 @@
 
 namespace kv {
 
-std::unique_ptr<KVEngine> KVEngineFactory::create(EngineType type) {
+std::shared_ptr<KVStore> create_store(EngineType type) {
   switch (type) {
   case EngineType::MOCK:
-    return std::make_unique<MockEngine>();
+    return std::make_shared<MockStore>();
   case EngineType::LEVELDB:
-    return std::make_unique<LevelDBEngine>();
+    return std::make_shared<LevelDBStore>();
   default:
     break;
   }
   return nullptr;
+}
+
+std::shared_ptr<KVStore> open_store(EngineType type,
+                                    const DatabaseOptions &options) {
+  auto store = create_store(type);
+  if (store == nullptr) {
+    return nullptr;
+  }
+  if (store->open(options) != Status::OK) {
+    return nullptr;
+  }
+  return store;
 }
 
 } // namespace kv

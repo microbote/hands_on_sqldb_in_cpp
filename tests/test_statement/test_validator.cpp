@@ -25,6 +25,29 @@ MemoryCatalog make_catalog_with_users() {
   return catalog;
 }
 
+// 支持"数据探测"的目录：模拟"users 表里已经有 id = 1 这一行"。
+// 真实实现（KVCatalog）是打开表做一次点查；这里只要能回答就行。
+class ProbeCatalog : public MemoryCatalog {
+public:
+  std::optional<bool>
+  primary_key_exists(const sql::Identifier &db_name,
+                     const sql::Identifier &table_name,
+                     const sql::Value &primary_key) const override {
+    (void)db_name;
+    (void)table_name;
+    return primary_key.as_int() == 1;
+  }
+};
+
+ProbeCatalog make_probe_catalog() {
+  ProbeCatalog catalog;
+  catalog.set_open(true);
+  catalog.create_database(sql::Identifier("shop"));
+  catalog.use_database(sql::Identifier("shop"));
+  catalog.create_table(sql::Identifier("shop"), make_users_schema());
+  return catalog;
+}
+
 // 走完整链路：解析 -> 构建 -> 校验，返回错误值（OK 表示通过）
 stmt::StmtError validate_sql(const sql::Catalog &catalog,
                              const std::string &sql) {
@@ -256,6 +279,61 @@ TEST(Validator, DynamicCatalogChangesAreVisible) {
   catalog.drop_table(sql::Identifier("shop"), sql::Identifier("users"));
   expect_error(catalog, "SELECT * FROM users;",
                stmt::StmtErrorCode::TABLE_NOT_FOUND);
+}
+
+// ---- 多行 VALUES + 主键冲突的提前检查 ----
+
+TEST(Validator, InsertMultiRowValuesPassValidation) {
+  auto catalog = make_catalog_with_users();
+  expect_ok(
+      catalog,
+      "INSERT INTO users (id, name, age) VALUES (1, 'a', 1), (2, 'b', 2);");
+  expect_ok(
+      catalog,
+      "INSERT INTO users (id, name, age) VALUES (1, 'a', 1), (2, 'b', 2), "
+      "(3, 'c', 3);");
+}
+
+TEST(Validator, InsertDuplicatePrimaryKeyInsideTheBatchIsRejected) {
+  auto catalog = make_catalog_with_users();
+  // 批内重复：纯静态检查，不需要 Catalog 支持数据探测
+  expect_error(catalog,
+               "INSERT INTO users (id, name, age) VALUES (1, 'a', 1), "
+               "(2, 'b', 2), (1, 'again', 3);",
+               stmt::StmtErrorCode::DUPLICATE_PRIMARY_KEY);
+}
+
+TEST(Validator, InsertDuplicateWithExistingRowIsRejectedBeforeExecution) {
+  auto catalog = make_probe_catalog(); // 表里"已经有 id = 1"
+  expect_error(catalog, "INSERT INTO users (id, name, age) VALUES (1, 'a', 1);",
+               stmt::StmtErrorCode::DUPLICATE_PRIMARY_KEY);
+  // 多行里只要有一行撞上也要整条拒绝
+  expect_error(catalog,
+               "INSERT INTO users (id, name, age) VALUES (7, 'a', 1), "
+               "(1, 'b', 2);",
+               stmt::StmtErrorCode::DUPLICATE_PRIMARY_KEY);
+  // 不冲突的主键照常通过
+  expect_ok(
+      catalog,
+      "INSERT INTO users (id, name, age) VALUES (7, 'a', 1), (8, 'b', 2);");
+}
+
+TEST(Validator, ConflictCheckFallsBackWhenCatalogCannotProbe) {
+  // MemoryCatalog 不支持数据探测 -> 校验阶段不报冲突，
+  // 交给执行期（Table::insert 本来就会报）。这是有意的降级，不是漏检。
+  auto catalog = make_catalog_with_users();
+  expect_ok(catalog, "INSERT INTO users (id, name, age) VALUES (1, 'a', 1);");
+}
+
+TEST(Validator, InsertWithoutPrimaryKeyColumnIsStillAColumnError) {
+  auto catalog = make_probe_catalog();
+  // 没给主键列 -> 报的是"NOT NULL 列缺值"，不是重复主键
+  expect_error(catalog, "INSERT INTO users (name, age) VALUES ('a', 1);",
+               stmt::StmtErrorCode::COLUMN_ATTR_NULL_MISMATCH);
+  // 显式写 NULL 主键同理（留 NULL 那条检查报）
+  expect_error(catalog,
+               "INSERT INTO users (id, name, age) VALUES (NULL, 'a', 1);",
+               stmt::StmtErrorCode::COLUMN_ATTR_NULL_MISMATCH);
 }
 
 TEST(Validator, TransactionStatementsNeedNoSchema) {

@@ -1,5 +1,7 @@
 # parser 模块
 
+English version: [README.en.md](README.en.md)
+
 C 风格的词法（Flex）＋语法（Bison）分析器，产出 AST。
 
 ## 职责与边界
@@ -59,7 +61,7 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
 | 类别 | 内容 |
 |------|------|
 | DDL | `CREATE/DROP DATABASE`、`CREATE/DROP TABLE`、内联 `PRIMARY KEY`、`NOT NULL` / `NULL` |
-| DML | `SELECT`（含 `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`）、`INSERT`（多行值/列列表）、`UPDATE`、`DELETE` |
+| DML | `SELECT`（含 `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`）、`INSERT`（列清单 + **多行 VALUES**：`VALUES (..),(..)`）、`UPDATE`、`DELETE` |
 | 事务 | `BEGIN [WORK\|TRANSACTION]`、`START TRANSACTION`、`COMMIT [WORK]`、`END [WORK]`、`ROLLBACK [WORK]`、`ABORT [WORK]`（别名在语法动作里归一化成 `TXN_BEGIN/TXN_COMMIT/TXN_ROLLBACK`） |
 | 语句前缀 | `EXPLAIN [ANALYZE] <语句>` → `NODE_EXPLAIN`（包住被解释的语句；不是查询，由 session 拆掉） |
 | 条件 | `= != <> > >= < <=`、`AND/OR/NOT`、`IN/NOT IN`、`LIKE/NOT LIKE`、`IS [NOT] NULL`、括号分组 |
@@ -95,6 +97,9 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
   因为 `parser.tab.c` / `lex.yy.c` 是按 C 编译的。
 - `yyerror` 由 `sql.y` 声明、`parser.cpp` 定义（C 链接）。
 - `LIMIT/OFFSET` 的 AST 字段是 `int`，解析时做范围检查。
+- `INSERT` 的 `values` 统一是**行的列表**（每个元素是一行的 `LIST_VALUE`）：
+  单行只是行数为 1。这样 `VALUES (1,2)` 与 `VALUES (1,2),(3,4)` 在 AST 里
+  形状一致，builder 只有一条路径（左递归规则也让语法无歧义）。
 - **不要对 `sql.l` / `sql.y` 跑 clang-format**：它们不是 C/C++（`%{`、`%token`、
   `%type` 会被当成代码重排/重缩进，flex/bison 直接报 `bad character: #`）。
   这两个文件按现有风格手写；`ast.cpp` / `ast.h` 照常格式化。

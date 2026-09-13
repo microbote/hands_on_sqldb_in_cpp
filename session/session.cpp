@@ -41,7 +41,13 @@ SessionError from_stmt_error(SessionErrorCode code,
   const std::string message =
       error.message.empty() ? std::string(stmt::stmt_error_message(error.code))
                             : error.message;
-  return SessionError(code, message, sql, error.span);
+  // "主键重复"不管在**校验期**（提前查出来）还是执行期发现，都是约束冲突：
+  // 对外错误码保持一致，只是报得更早、位置更准。
+  const SessionErrorCode effective =
+      error.code == stmt::StmtErrorCode::DUPLICATE_PRIMARY_KEY
+          ? SessionErrorCode::CONSTRAINT_VIOLATION
+          : code;
+  return SessionError(effective, message, sql, error.span);
 }
 
 SessionError from_plan_error(SessionErrorCode code,

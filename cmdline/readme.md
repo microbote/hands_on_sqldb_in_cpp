@@ -1,5 +1,7 @@
 # sqldb：命令行客户端
 
+English version: [readme.en.md](readme.en.md)
+
 CLI 只做三件事：**读入 SQL → 交给 `session::Session` → 打印结果**。
 它不碰 parser/planner/executor 的细节，错误也原样来自 `SessionError`
 （信息 + 位置 + 高亮片段）。
@@ -99,12 +101,14 @@ Table "users"
 | 信息 | 来源 | 说明 |
 |------|------|------|
 | 表数量 | 元数据名单 | `@system/tables/<db>` |
-| 行数 | **现算**（全表扫） | 不维护计数器：避免写放大，也不会漂移；代价 O(n) |
-| 建库/建表时间 | `@system/dbstats/<db>`、`@system/tablestats/<db>/<table>` | 固定 17 字节记录（版本号 + 两个 int64），由 Catalog 的时间源写入（可注入假时钟做测试） |
+| 行数（`\dt`） | **现算**（全表扫） | 元命令故意不信任计数器：避免漂移；代价 O(n) |
+| 行数（成本模型） | `@system/tablestats/<db>/<table>` | **有**维护的行数：session 在写语句真的改了行之后按受影响行数增量更新（UPDATE 不改行数，只刷新时间） |
+| 建库/建表时间 | `@system/dbstats/<db>`、`@system/tablestats/<db>/<table>` | 记录 **v2 = 25 字节**（版本 + created + last_write + rows）；v1（17 字节，没有 rows）是旧数据，读得到但行数未知 |
 | 最后写入时间 | 同上 | **session 在写语句真的改了行之后**更新（SELECT、影响 0 行的写都不更新） |
 | 列数/主键/结构 | schema | `@system/schema/<db>/<table>` |
 
-老数据没有统计记录时，时间显示 `-`，不会报错。
+老数据没有统计记录时，时间显示 `-`，不会报错；planner 拿不到行数时
+`rows_known = false`，成本模型退回纯规则行为。
 
 ## EXPLAIN
 
@@ -218,5 +222,4 @@ CLI 在切分语句（按顶层 `;`，跳过引号里的分号）时记下每条
   不能当表名/列名用；
 - 保存点（`SAVEPOINT`）、`COMMIT AND CHAIN`、隔离级别语法都不支持
   （会报明确原因）。事务是**悲观单写者**：第二个连接开事务会 `busy`；
-- 表格宽度按字节算，CJK 会略微不齐（要精确得算 East Asian Width）。
 - 表格宽度按字节算，CJK 会略微不齐（要精确得算 East Asian Width）。

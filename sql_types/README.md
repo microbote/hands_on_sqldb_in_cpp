@@ -1,5 +1,7 @@
 # sql_types —— SQL 领域类型模块
 
+English version: [README.en.md](README.en.md)
+
 本模块只负责 **SQL 领域的值与类型**（类型、值、行、表结构、条件树、key 区间、
 key 编码、序列化、三值逻辑、时间类型）。它不依赖存储引擎、不包含
 Executor / Optimizer / Planner，是上层模块（relation / statement / storage

@@ -22,11 +22,10 @@
 namespace {
 
 std::shared_ptr<kv::MockEngine> open_engine() {
-  auto engine = std::make_shared<kv::MockEngine>();
   kv::DatabaseOptions options;
   options.path = "mock://tx-test";
-  engine->open_database(options);
-  return engine;
+  auto store = kv::open_store(kv::EngineType::MOCK, options);
+  return std::static_pointer_cast<kv::MockEngine>(store->connect());
 }
 
 bool has(kv::MockEngine &engine, const std::string &key) {
@@ -390,18 +389,17 @@ kv::Status run_on_leveldb(const char *name,
                           const std::function<void(kv::KVEngine &)> &body) {
   const std::string path = temp_db_path(name);
   std::remove(path.c_str());
-  auto engine = kv::KVEngineFactory::create(kv::EngineType::LEVELDB);
-  CHECK(engine != nullptr);
-  if (engine == nullptr) {
-    return kv::Status::InternalError;
-  }
   kv::DatabaseOptions options;
   options.set_path(path).set_create_if_missing(true).set_error_if_exists(false);
-  if (engine->open_database(options) != kv::Status::OK) {
+  auto store = kv::open_store(kv::EngineType::LEVELDB, options);
+  CHECK(store != nullptr);
+  if (store == nullptr) {
     return kv::Status::IOError;
   }
+  auto engine = store->connect();
   body(*engine);
-  engine->close_database();
+  engine.reset();
+  store->close();
   return kv::Status::OK;
 }
 

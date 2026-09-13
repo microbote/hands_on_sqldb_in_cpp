@@ -13,6 +13,7 @@
 #include "sql_types/row.h"
 #include "sql_types/schema.h"
 #include "sql_types/value.h"
+#include "storage/kv_engine/kv_factory.h"
 #include "storage/mock_engine/mock_engine.h"
 
 namespace reltest {
@@ -48,11 +49,10 @@ inline sql::Row users_row(int64_t id, const std::string &name, int64_t age) {
 
 // 打开一个干净的 MockEngine
 inline std::shared_ptr<kv::MockEngine> open_engine() {
-  auto engine = std::make_shared<kv::MockEngine>();
   kv::DatabaseOptions options;
   options.path = "mock://test";
-  engine->open_database(options);
-  return engine;
+  auto store = kv::open_store(kv::EngineType::MOCK, options);
+  return std::static_pointer_cast<kv::MockEngine>(store->connect());
 }
 
 } // namespace reltest

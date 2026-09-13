@@ -10,16 +10,17 @@
 #include "executor/executor.h"
 #include "session/session.h"
 #include "sql_types/row.h"
+#include "storage/kv_engine/kv_factory.h"
 #include "storage/mock_engine/mock_engine.h"
 
 namespace sess_test {
 
 inline std::shared_ptr<kv::MockEngine> open_engine() {
-  auto engine = std::make_shared<kv::MockEngine>();
   kv::DatabaseOptions options;
   options.path = "mock://session-test";
-  engine->open_database(options);
-  return engine;
+  // 一个进程一份存储；这里每个测试自己开一份，并拿一条连接（= 一个 session）
+  auto store = kv::open_store(kv::EngineType::MOCK, options);
+  return std::static_pointer_cast<kv::MockEngine>(store->connect());
 }
 
 // 跑一条 SQL；失败时把错误信息写进 error（测试里断言用）

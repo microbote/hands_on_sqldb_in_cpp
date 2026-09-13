@@ -425,8 +425,8 @@ StatementBuilder::build_stmt_insert(const ASTNode *ast) {
                                       "INSERT is missing VALUES"));
   }
 
-  // 语法目前只支持单行：VALUES 列表的元素就是值本身。
-  // 若将来支持多行（元素是 NODE_LIST），这里也能直接处理。
+  // 语法层统一给"行的列表"（每个元素是一行的 LIST_VALUE）。
+  // 扁平形式（元素直接是值）仍然接受：手工构造的 AST / 老调用方走那条路。
   if (values->head->type == NODE_LIST) {
     for (const ASTNode *row = values->head; row != nullptr; row = row->next) {
       auto row_values = build_value_list((row));

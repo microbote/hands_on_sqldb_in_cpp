@@ -1,6 +1,7 @@
 // stmt_validator.cpp
 #include "stmt_validator.h"
 
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -424,6 +425,73 @@ StatementValidator::validate_insert(const sql::Query &stmt) const {
                                      column.name.str(),
                                  column.name));
       }
+    }
+  }
+
+  // ---- 主键冲突：**执行前**就查出来（越早越好）----
+  //
+  // 两类冲突：
+  //   1) 这一批 VALUES 内部重复（纯静态检查，任何 Catalog 都能查）；
+  //   2) 与表里已有的行冲突（需要 Catalog 支持数据探测；
+  //      不支持就退回执行期 —— Table::insert 本来就会报重复主键）。
+  // 在事务里这一点尤其值钱：语句在校验期就被拒，事务不会执行到一半才失败。
+  if (auto err = check_primary_key_conflicts(schema, *query, target_columns);
+      !err.has_value()) {
+    return err;
+  }
+  return ok();
+}
+
+std::expected<void, StmtError> StatementValidator::check_primary_key_conflicts(
+    const sql::TableSchema &schema, const sql::InsertQuery &query,
+    const std::vector<const sql::ColumnDef *> &target_columns) const {
+  if (!schema.has_primary_key()) {
+    return ok();
+  }
+  const sql::ColumnDef *pk_column = schema.primary_key_column();
+  if (pk_column == nullptr) {
+    return ok();
+  }
+
+  // 主键列在这条 INSERT 的列清单里的位置。
+  // 没给主键列 -> 不在这里报错（"NOT NULL 列缺值"那条检查会报）。
+  size_t value_index = target_columns.size();
+  for (size_t i = 0; i < target_columns.size(); ++i) {
+    if (target_columns[i] == pk_column) {
+      value_index = i;
+      break;
+    }
+  }
+  if (value_index >= target_columns.size()) {
+    return ok();
+  }
+
+  const sql::Identifier &db = catalog_.current_database();
+  // "同一个主键"用**存储编码**判断（和 Table::insert 落 key 的方式一致）
+  std::set<sql::Key> seen;
+  for (size_t row_index = 0; row_index < query.values.size(); ++row_index) {
+    const sql::Value &pk = query.values[row_index][value_index];
+    if (pk.is_null()) {
+      continue; // NULL 主键：交给 NOT NULL / 执行期那条路径
+    }
+    const SSpan *span = query.value_span(row_index, value_index);
+    const SSpan where = span != nullptr ? *span : sspan_unknown();
+    const sql::Key key = pk.to_key(pk_column->type);
+
+    // 1) 这一批 VALUES 内部重复
+    if (!seen.insert(key).second) {
+      return failed(StmtError(
+          StmtErrorCode::DUPLICATE_PRIMARY_KEY,
+          "duplicate primary key in this INSERT: " + pk.to_string(), where));
+    }
+
+    // 2) 与表里已有的行冲突（Catalog 不支持探测时跳过，执行期会报）
+    auto exists = catalog_.primary_key_exists(db, query.table, pk);
+    if (exists.has_value() && *exists) {
+      return failed(StmtError(StmtErrorCode::DUPLICATE_PRIMARY_KEY,
+                              "duplicate primary key: " + pk.to_string() +
+                                  " already exists in " + query.table.str(),
+                              where));
     }
   }
   return ok();

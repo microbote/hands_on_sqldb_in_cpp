@@ -368,8 +368,14 @@ insert_columns:
     | '(' column_name_list ')'     { $$ = $2; }
     ;
 
+/* VALUES 的语法是"一个或多个行"，AST 里统一是**行的列表**：
+   insert_values 的每个元素都是一个 LIST_VALUE（那一行的值列表）。
+   这样单行与多行的形状一致，builder 不需要分两套。
+   （用左递归就是为了让单行/多行没有歧义：')' 之后看到 ',' 就继续收集行。） */
 insert_values:
-    '(' value_item_list ')'      { $$ = $2; }
+    '(' value_item_list ')'                     { $$ = create_list($2, LIST_VALUE); }
+    | insert_values ',' '(' value_item_list ')' { $$ = append_to_list($1, $4); }
+    ;
 
 in_values:
     '(' value_item_list ')'      { $$ = $2; }

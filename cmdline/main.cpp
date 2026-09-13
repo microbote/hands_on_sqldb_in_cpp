@@ -643,12 +643,11 @@ std::shared_ptr<kv::KVEngine> create_engine(const Options &options) {
       options.engine == "leveldb" || options.engine == "default";
 #if defined(SQLDB_HAVE_LEVELDB)
   if (want_leveldb) {
-    auto engine = kv::KVEngineFactory::create(kv::EngineType::LEVELDB);
     kv::DatabaseOptions db_options;
     db_options.set_path(options.path).set_create_if_missing(true);
-    if (engine != nullptr &&
-        engine->open_database(db_options) == kv::Status::OK) {
-      return engine;
+    auto store = kv::open_store(kv::EngineType::LEVELDB, db_options);
+    if (store != nullptr) {
+      return store->connect(); // CLI 一条连接；服务器上这里按客户端再连
     }
     fmt::print(stderr, "打开 leveldb({}) 失败，退回内存引擎\n", options.path);
   }
@@ -657,11 +656,10 @@ std::shared_ptr<kv::KVEngine> create_engine(const Options &options) {
     fmt::print(stderr, "这个构建没有编入 leveldb，改用内存引擎\n");
   }
 #endif
-  auto engine = std::make_shared<kv::MockEngine>();
   kv::DatabaseOptions db_options;
   db_options.set_path("mock://sqldb");
-  engine->open_database(db_options);
-  return engine;
+  auto store = kv::open_store(kv::EngineType::MOCK, db_options);
+  return store != nullptr ? store->connect() : nullptr;
 }
 
 bool is_interactive_terminal() {

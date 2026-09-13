@@ -112,6 +112,43 @@ TEST(SqlStatements, Insert) {
                  "'david@test.com');"));
 }
 
+// 多行 VALUES：AST 统一是"行的列表"（单行只是行数为 1）
+TEST(SqlStatements, InsertMultipleRows) {
+  CHECK(parse_ok("INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b');"));
+  CHECK(parse_ok("INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b'), "
+                 "(3, 'c'), (4, 'd');"));
+  // 行内的值数量可以不同（列数是否匹配交给校验层判断）
+  CHECK(parse_ok("INSERT INTO users VALUES (1, 'a'), (2, 'b', 3);"));
+  // 语法错：多一个/少一个逗号都不行
+  CHECK(!parse_ok("INSERT INTO users (id) VALUES (1),;"));
+  CHECK(!parse_ok("INSERT INTO users (id) VALUES (1) (2);"));
+  CHECK(!parse_ok("INSERT INTO users (id) VALUES (1),;"));
+}
+
+TEST(SqlStatements, InsertValuesAreAListOfRows) {
+  parser::Parser parser;
+  auto parsed =
+      parser.parse("INSERT INTO users (id, name) VALUES (1, 'a'), (2, 'b');");
+  CHECK(parsed.success);
+  if (!parsed.success) {
+    return;
+  }
+  CHECK(parsed.ast->type == NODE_INSERT);
+  const auto *insert = (const InsertNode *)parsed.ast->data;
+  CHECK(insert->values != nullptr);
+  if (insert->values == nullptr) {
+    return;
+  }
+  const auto *rows = (const ASTNodeList *)insert->values->data;
+  CHECK_EQ(rows->count, 2); // 两行
+  const auto *first = (const ASTNodeList *)rows->head->data;
+  const auto *second = (const ASTNodeList *)rows->head->next->data;
+  CHECK_EQ(first->count, 2);
+  CHECK_EQ(second->count, 2);
+  CHECK_EQ(((const NumberNode *)first->head->data)->value, int64_t{1});
+  CHECK_EQ(((const NumberNode *)second->head->data)->value, int64_t{2});
+}
+
 TEST(SqlStatements, Update) {
   CHECK(parse_ok("UPDATE users SET name = 'Jane' WHERE id = 1;"));
   CHECK(parse_ok("UPDATE users SET name = 'Jane', age = 30 WHERE id = 1;"));

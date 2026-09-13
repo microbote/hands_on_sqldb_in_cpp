@@ -15,6 +15,4 @@ add_subdirectory(test_relation)
 add_subdirectory(test_executor)
 add_subdirectory(test_session)
 add_subdirectory(test_tx)
-
-# 未来其他模块的测试
-# add_subdirectory(test_storage)
+add_subdirectory(test_storage)
