@@ -73,12 +73,13 @@ TEST(Table, InsertThenGet) {
 
 TEST(Table, FindMissingIsNotAnError) {
   Fixture f;
+  // find/get 现在是同一套语义：不存在 -> NOT_FOUND（用错误码表达状态，
+  // 不用 expected<optional<T>>）
   auto row = f.table->find(int_value(100));
-  CHECK(row.has_value());
-  if (row.has_value()) {
-    CHECK(!row->has_value());
+  CHECK(!row.has_value());
+  if (!row.has_value()) {
+    CHECK(row.error().code == sql::RelErrorCode::NOT_FOUND);
   }
-  // get() 则把"不存在"当错误
   auto missing = f.table->get(int_value(100));
   CHECK(!missing.has_value());
   if (!missing.has_value()) {
@@ -294,9 +295,9 @@ TEST(Table, RemoveAndTruncate) {
   Fixture f;
   CHECK(f.table->remove(int_value(1)).has_value());
   auto removed = f.table->find(int_value(1));
-  CHECK(removed.has_value());
-  if (removed.has_value()) {
-    CHECK(!removed->has_value());
+  CHECK(!removed.has_value());
+  if (!removed.has_value()) {
+    CHECK(removed.error().code == sql::RelErrorCode::NOT_FOUND);
   }
   CHECK_EQ(*f.table->row_count(), size_t{8});
 

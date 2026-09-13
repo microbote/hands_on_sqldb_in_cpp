@@ -288,7 +288,7 @@ $(foreach t,$(TEST_TARGETS),$(eval $(call TEST_RULE,$(t))))
 # sql_types 模块（新构建系统走 CMake，与上面的 legacy 目标解耦）
 # ============================================================
 .PHONY: sql-types sql-types-test parser-test statement-test planner-test \
-        relation-test executor-test session-test cli cmake-test
+        relation-test executor-test session-test tx-test cli cmake-test
 
 sql-types:
 	cmake --build $(BUILD_DIR) --target sql_types
@@ -320,6 +320,10 @@ executor-test:
 session-test:
 	cmake --build $(BUILD_DIR) -j4
 	./$(BUILD_DIR)/run_tests/test_session
+
+tx-test:
+	cmake --build $(BUILD_DIR) -j4
+	./$(BUILD_DIR)/run_tests/test_tx
 
 cli:
 	cmake --build $(BUILD_DIR) -j4 --target sqldb

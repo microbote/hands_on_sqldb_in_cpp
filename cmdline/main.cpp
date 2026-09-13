@@ -400,6 +400,8 @@ void print_meta_help() {
       "  \\d [表]             不带参数等于 \\dt；带参数看表结构与统计\n");
   fmt::print("  \\d [库.]表          指定库里的表\n");
   fmt::print("  \\c <库>             切换当前数据库（等价 USE <库>）\n");
+  fmt::print("  \\begin / \\commit / \\rollback   事务控制（= "
+             "BEGIN/COMMIT/ROLLBACK）\n");
   fmt::print("  \\?                  显示这份帮助\n");
   fmt::print("  exit / quit / \\q    退出\n");
   fmt::print("  EXPLAIN <语句>         只打印计划，不执行\n");
@@ -515,6 +517,23 @@ int run_meta_command(session::Session &session, const std::string &line,
     return 0;
   }
 
+  // 事务控制：给 BEGIN / COMMIT / ROLLBACK 三个语句加个元命令外壳
+  if (command == "\\begin" || command == "\\commit" ||
+      command == "\\rollback") {
+    const std::string keyword = command == "\\begin"    ? "BEGIN"
+                                : command == "\\commit" ? "COMMIT"
+                                                        : "ROLLBACK";
+    auto result = session.execute(keyword);
+    if (!result.has_value()) {
+      print_error(result.error(), options.colors);
+      return 1;
+    }
+    fmt::print("{}\n", keyword == "BEGIN"    ? "transaction started"
+                       : keyword == "COMMIT" ? "committed"
+                                             : "rolled back");
+    return 0;
+  }
+
   print_notice("未知元命令：" + command + "（用 \\? 看帮助）");
   return 1;
 }
@@ -606,8 +625,10 @@ int repl(session::Session &session, const Options &options) {
   const auto prompt = [&]() {
     const sql::Identifier db = session.current_database();
     const std::string name = db.empty() ? "(none)" : db.str();
-    return options.colors ? fmt::format("\033[1;36m{}\033[0m> ", name)
-                          : name + "> ";
+    // 事务里在库名后加 '*'（psql 习惯）：一眼看出还没提交
+    const std::string tag = name + (session.in_transaction() ? "*" : "");
+    return options.colors ? fmt::format("\033[1;36m{}\033[0m> ", tag)
+                          : tag + "> ";
   };
 
   fmt::print("sqldb 命令行（输入 exit / quit / \\q 退出）\n");

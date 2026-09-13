@@ -39,7 +39,29 @@ echo "SELECT 1" | ./build/sqldb             # 管道输入当脚本
 | `\d` | 等价 `\dt`（当前库） |
 | `\d <表>` / `\d <库>.<表>` | 看表结构（列/类型/可空/约束）+ 统计 |
 | `\c <库>` | 切换当前数据库（等价 `USE <库>`） |
+| `\begin` / `\commit` / `\rollback` | 事务控制（等价 `BEGIN` / `COMMIT` / `ROLLBACK`） |
 | `\?` | 元命令帮助 |
+
+事务也可以用 SQL 语句写（大小写不限，`START TRANSACTION` / `END` / `ABORT`
+是它们的别名），两种写法等价。事务进行中提示符会在库名后加 `*`：
+
+```
+shop> \begin
+transaction started
+shop*> INSERT INTO users (id, name, age) VALUES (1, 'a', 10);
+OK, 1 row affected
+shop*> SELECT * FROM users;          -- 事务内能看到自己未提交的插入
+id  name  age
+--  ----  ---
+1   a     10
+(1 row)
+shop*> \rollback
+rolled back
+shop> SELECT * FROM users;           -- 回滚后什么都没发生
+id  name  age
+--  ----  ---
+(0 rows)
+```
 
 ```
 shop> \l

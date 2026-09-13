@@ -8,6 +8,7 @@ add_executable(test_session
     test_explain.cpp
     test_metadata.cpp
     test_cost.cpp
+    test_transaction.cpp
 )
 
 target_link_libraries(test_session PRIVATE

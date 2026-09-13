@@ -71,8 +71,7 @@ Value Table::primary_key_of(const Row &row) const {
 // ============================================================
 // 点查
 // ============================================================
-std::expected<std::optional<Row>, RelError>
-Table::find(const Value &primary_key) const {
+std::expected<Row, RelError> Table::find(const Value &primary_key) const {
   if (primary_key.is_null()) {
     return std::unexpected(
         RelError(RelErrorCode::PRIMARY_KEY_NULL, "primary key is NULL"));
@@ -80,7 +79,9 @@ Table::find(const Value &primary_key) const {
   std::string data;
   const kv::Status status = engine_->get(encode_key(primary_key), &data);
   if (status == kv::Status::NotFound) {
-    return std::optional<Row>(std::nullopt);
+    return std::unexpected(
+        RelError(RelErrorCode::NOT_FOUND,
+                 "row not found in " + schema_.table_name().str()));
   }
   if (status != kv::Status::OK) {
     return std::unexpected(kv_error("get", status));
@@ -89,20 +90,11 @@ Table::find(const Value &primary_key) const {
   if (!decoded.has_value()) {
     return std::unexpected(decoded.error());
   }
-  return std::optional<Row>(std::move(*decoded));
+  return std::move(*decoded);
 }
 
 std::expected<Row, RelError> Table::get(const Value &primary_key) const {
-  auto found = find(primary_key);
-  if (!found.has_value()) {
-    return std::unexpected(found.error());
-  }
-  if (!found->has_value()) {
-    return std::unexpected(
-        RelError(RelErrorCode::NOT_FOUND,
-                 "row not found in " + schema_.table_name().str()));
-  }
-  return std::move(**found);
+  return find(primary_key);
 }
 
 // ============================================================
@@ -236,28 +228,13 @@ std::expected<void, RelError> Table::remove(const Value &primary_key) {
 }
 
 std::expected<void, RelError> Table::truncate() {
-  // 先把本表所有 key 收集出来再批量删（边遍历边删会动到迭代器状态）
-  std::vector<std::string> keys;
-  kv::KeyRange kv_range;
-  kv_range.start = key_prefix_;
-  kv_range.end = keys::prefix_end(key_prefix_);
-  auto it = engine_->new_iterator(kv_range);
-  while (it != nullptr && it->valid()) {
-    keys.push_back(it->key());
-    it->next();
-  }
-  if (it != nullptr && it->status() != kv::Status::OK &&
-      it->status() != kv::Status::NotFound) {
-    return std::unexpected(
-        RelError(RelErrorCode::KV_ERROR,
-                 "truncate scan failed: " + it->error_message()));
-  }
-  if (keys.empty()) {
-    return {};
-  }
-  const kv::Status status = engine_->remove_batch(keys);
+  // 整段删：在引擎侧是一个 range-delete 操作（事务里也只占一条 op），
+  // 不用先把所有 key 收集出来。
+  kv::WriteBatch batch;
+  batch.remove_range(key_prefix_, keys::prefix_end(key_prefix_));
+  const kv::Status status = engine_->write_batch(batch);
   if (status != kv::Status::OK) {
-    return std::unexpected(kv_error("remove_batch", status));
+    return std::unexpected(kv_error("remove_range", status));
   }
   return {};
 }

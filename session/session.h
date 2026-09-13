@@ -60,15 +60,16 @@ struct TableInfo {
 // ============================================================
 enum class SessionErrorCode : uint8_t {
   OK = 0,
-  EMPTY_SQL,      // 空语句
-  PARSE_ERROR,    // 词法/语法
-  BUILD_ERROR,    // AST -> Query
-  VALIDATE_ERROR, // 语义校验（库/表/列不存在、类型不匹配……）
-  REWRITE_ERROR,  // 查询重写
-  OPTIMIZE_ERROR, // 优化（主键抽取等）
-  PLAN_ERROR,     // 生成计划
-  EXECUTE_ERROR,  // 执行（含 DDL 落库失败）
-  NOT_SUPPORTED,  // 该语句类型这里不处理
+  EMPTY_SQL,         // 空语句
+  PARSE_ERROR,       // 词法/语法
+  BUILD_ERROR,       // AST -> Query
+  VALIDATE_ERROR,    // 语义校验（库/表/列不存在、类型不匹配……）
+  REWRITE_ERROR,     // 查询重写
+  OPTIMIZE_ERROR,    // 优化（主键抽取等）
+  PLAN_ERROR,        // 生成计划
+  EXECUTE_ERROR,     // 执行（含 DDL 落库失败）
+  NOT_SUPPORTED,     // 该语句类型这里不处理
+  TRANSACTION_ERROR, // 事务控制错误（重复 BEGIN / COMMIT 无事务 / 事务已中止）
 };
 
 inline const char *session_error_message(SessionErrorCode code) {
@@ -93,6 +94,8 @@ inline const char *session_error_message(SessionErrorCode code) {
     return "Execution error";
   case SessionErrorCode::NOT_SUPPORTED:
     return "Statement is not supported";
+  case SessionErrorCode::TRANSACTION_ERROR:
+    return "Transaction error";
   default:
     return "Unknown error";
   }
@@ -163,6 +166,10 @@ public:
   std::expected<std::string, SessionError> explain(const std::string &sql,
                                                    bool analyze = false);
 
+  // 显式事务：BEGIN / COMMIT / ROLLBACK（文本层关键字，语法层不认识它们）。
+  // 在事务里时，语句的自动提交让位给事务本身（由 COMMIT/ROLLBACK 收尾）。
+  bool in_transaction() const { return in_transaction_; }
+
   // ---- 元信息查询（元命令用；db 为空表示当前数据库）----
   std::vector<DatabaseInfo> databases() const;
   std::vector<TableInfo> tables(const sql::Identifier &db = {}) const;
@@ -189,12 +196,22 @@ private:
   // 把 KVCatalog 的统计（维护着的行数）喂给优化器的成本模型
   plan::StatsProvider stats_provider() const;
 
+  // 事务控制
+  std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+  begin_transaction(const std::string &statement);
+  std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+  commit_transaction(const std::string &statement);
+  std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+  rollback_transaction(const std::string &statement);
+
   // DDL / USE：不需要计划器，直接落到 Catalog
   std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
   execute_catalog_statement(const sql::Query &query, const std::string &sql);
 
   std::shared_ptr<kv::KVEngine> engine_;
   sql::KVCatalog catalog_;
+  bool in_transaction_ = false; // 显式事务是否打开
+  bool tx_failed_ = false;      // 事务里出过错：只能 ROLLBACK（Postgres 风格）
 };
 
 } // namespace session

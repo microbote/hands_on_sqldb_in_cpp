@@ -9,6 +9,8 @@
 #include <mutex>
 
 #include "storage/kv_engine/kv_engine.h"
+#include "storage/kv_engine/tx_buffer.h"
+#include "storage/kv_engine/merging_iterator.h"
 
 namespace kv {
 
@@ -16,12 +18,12 @@ namespace kv {
 // Mock 迭代器
 // ============================================================
 class MockIterator : public Iterator {
- public:
-  MockIterator(const std::map<Key, ByteValue>* data, const KeyRange& range);
+public:
+  MockIterator(const std::map<Key, ByteValue> *data, const KeyRange &range);
   ~MockIterator() override = default;
 
   // ----- 定位 -----
-  void seek(const Key& key) override;
+  void seek(const Key &key) override;
   void seek_to_first() override;
   void seek_to_last() override;
 
@@ -37,11 +39,11 @@ class MockIterator : public Iterator {
   Status status() const override;
   std::string error_message() const override;
 
- private:
+private:
   void update_status();
   bool in_range() const;
 
-  const std::map<Key, ByteValue>* data_;
+  const std::map<Key, ByteValue> *data_;
   KeyRange range_;
   std::map<Key, ByteValue>::const_iterator pos_;
   Status status_;
@@ -52,7 +54,7 @@ class MockIterator : public Iterator {
 // Mock 存储引擎
 // ============================================================
 class MockEngine : public KVEngine {
- public:
+public:
   MockEngine() = default;
   ~MockEngine() override {
     if (is_open_) {
@@ -66,20 +68,25 @@ class MockEngine : public KVEngine {
   bool is_open() const override;
 
   // ----- 单条操作 -----
-  Status get(const Key& key, ByteValue* value) override;
-  Status put(const Key& key, const ByteValue& value) override;
-  Status remove(const Key& key) override;
-  bool exists(const Key& key) override;
+  Status get(const Key &key, ByteValue *value) override;
+  Status put(const Key &key, const ByteValue &value) override;
+  Status remove(const Key &key) override;
+  bool exists(const Key &key) override;
 
   // ----- 批量操作 -----
-  Status get_batch(const std::vector<Key>& keys, MissingKeyPolicy policy,
-                   std::vector<std::optional<ByteValue>>* values) override;
+  Status get_batch(const std::vector<Key> &keys, MissingKeyPolicy policy,
+                   std::vector<std::optional<ByteValue>> *values) override;
 
-  Status write_batch(const WriteBatch& batch) override;
+  Status write_batch(const WriteBatch &batch) override;
 
   // ----- 迭代器 -----
-  std::unique_ptr<Iterator> new_iterator(const KeyRange& range) override;
+  std::unique_ptr<Iterator> new_iterator(const KeyRange &range) override;
 
+  // ----- 事务（悲观单写者：同一时刻只允许一个写事务）-----
+  Status begin_transaction() override;
+  Status commit_transaction() override;
+  Status rollback_transaction() override;
+  bool in_transaction() const override { return tx_ != nullptr; }
 
   // ----- 管理 -----
   void flush() override;
@@ -90,12 +97,20 @@ class MockEngine : public KVEngine {
   void clear();
   size_t size() const;
   void dump() const;
+  // 故障注入：置 true 后所有批量写入都失败（用来测"提交失败不留痕"）
+  // 也用于确认"批量写入是原子的"：失败时一条 op 都不落。
+  void set_fail_writes(bool fail) { fail_writes_ = fail; }
 
- private:
+private:
+  // 直接落到 data_（不经过事务缓冲）；调用方必须已持有 mutex_
+  Status apply_batch_locked(const WriteBatch &batch);
+
   std::map<Key, ByteValue> data_;
+  std::unique_ptr<TxBuffer> tx_; // 非空 = 事务进行中（写都进它）
+  bool fail_writes_ = false;     // 测试用：模拟写入失败
   mutable std::mutex mutex_;
   std::atomic<bool> is_open_{false};
   DatabaseOptions options_;
 };
 
-}  // namespace kv
+} // namespace kv

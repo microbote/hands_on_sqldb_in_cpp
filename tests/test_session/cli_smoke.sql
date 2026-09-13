@@ -12,4 +12,11 @@ EXPLAIN ANALYZE SELECT id FROM t WHERE v >= 10;
 \dt
 \d t
 \dt smoke
+\begin
+INSERT INTO t (id, name, v) VALUES (3, 'c', 30);
+\dt
+\rollback
+BEGIN;
+INSERT INTO t (id, name, v) VALUES (4, 'd', 40);
+COMMIT;
 SELECT id, name, v FROM t ORDER BY id;

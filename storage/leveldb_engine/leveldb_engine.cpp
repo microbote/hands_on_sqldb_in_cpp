@@ -13,9 +13,8 @@ namespace kv {
 // LevelDBIterator 实现
 // ============================================================
 
-LevelDBIterator::LevelDBIterator(
-  LevelDBEngine* engine,
-  leveldb::Iterator* it, const KeyRange& range)
+LevelDBIterator::LevelDBIterator(LevelDBEngine *engine, leveldb::Iterator *it,
+                                 const KeyRange &range)
     : engine_(engine), it_(it), range_(range), status_(Status::OK) {
   if (!it_) {
     status_ = Status::InternalError;
@@ -23,7 +22,6 @@ LevelDBIterator::LevelDBIterator(
     return;
   }
   seek_to_first();
-
 }
 
 LevelDBIterator::~LevelDBIterator() {
@@ -32,7 +30,7 @@ LevelDBIterator::~LevelDBIterator() {
   }
 }
 
-void LevelDBIterator::seek(const Key& key) {
+void LevelDBIterator::seek(const Key &key) {
   if (!it_) {
     status_ = Status::InternalError;
     error_msg_ = "Iterator is null";
@@ -66,7 +64,6 @@ void LevelDBIterator::seek_to_first() {
     return;
   }
 
-
   // ✅ 考虑 range 边界
   if (range_.direction == ScanDirection::kForward) {
     if (range_.start) {
@@ -89,8 +86,6 @@ void LevelDBIterator::seek_to_first() {
       it_->SeekToLast();
     }
   }
-
-
 
   update_status();
 }
@@ -132,7 +127,8 @@ void LevelDBIterator::seek_to_last() {
 }
 
 void LevelDBIterator::next() {
-  if (!valid()) return;
+  if (!valid())
+    return;
 
   if (range_.direction == ScanDirection::kForward) {
     it_->Next();
@@ -144,7 +140,8 @@ void LevelDBIterator::next() {
 }
 
 void LevelDBIterator::prev() {
-  if (!valid()) return;
+  if (!valid())
+    return;
 
   if (range_.direction == ScanDirection::kForward) {
     it_->Prev();
@@ -157,26 +154,32 @@ void LevelDBIterator::prev() {
 
 bool LevelDBIterator::valid() const {
 
-  if (!it_) return false;
-  if (status_ != Status::OK) return false;
-  if (!it_->Valid()) return false;
+  if (!it_)
+    return false;
+  if (status_ != Status::OK)
+    return false;
+  if (!it_->Valid())
+    return false;
 
   // 检查范围
   return in_range();
 }
 
 Key LevelDBIterator::key() const {
-  if (!valid()) return "";
+  if (!valid())
+    return "";
   return it_->key().ToString();
 }
 
 ByteValue LevelDBIterator::value() const {
-  if (!valid()) return "";
+  if (!valid())
+    return "";
   return it_->value().ToString();
 }
 
 KVPair LevelDBIterator::kvpair() const {
-  if (!valid()) return {"", std::nullopt};
+  if (!valid())
+    return {"", std::nullopt};
   return {it_->key().ToString(), it_->value().ToString()};
 }
 
@@ -217,11 +220,14 @@ void LevelDBIterator::update_status() {
 }
 
 bool LevelDBIterator::in_range() const {
-  if (!it_ || !it_->Valid()) return false;
+  if (!it_ || !it_->Valid())
+    return false;
 
   const std::string key = it_->key().ToString();
-  if (range_.start && key < *range_.start) return false;
-  if (range_.end && key >= *range_.end) return false;
+  if (range_.start && key < *range_.start)
+    return false;
+  if (range_.end && key >= *range_.end)
+    return false;
 
   return true;
 }
@@ -258,7 +264,7 @@ Status LevelDBEngine::open_database(DatabaseOptions options) {
   // 设置过滤器（加速查询）
   db_options.filter_policy = leveldb::NewBloomFilterPolicy(10);
 
-  leveldb::DB* db_ptr = nullptr;
+  leveldb::DB *db_ptr = nullptr;
   leveldb::Status status =
       leveldb::DB::Open(db_options, options_.path, &db_ptr);
 
@@ -284,7 +290,7 @@ Status LevelDBEngine::close_database() {
     if (!active_iterators_.empty()) {
       std::cerr << "⚠️  ERROR: Cannot close DB, " << active_iterators_.size()
                 << " iterators still active!" << std::endl;
-      return Status::Busy;  // ✅ 返回错误，让调用者处理
+      return Status::Busy; // ✅ 返回错误，让调用者处理
     }
   }
 
@@ -293,7 +299,6 @@ Status LevelDBEngine::close_database() {
   if (db_) {
     db_.reset();
   }
-
 
   return Status::OK;
 }
@@ -313,7 +318,7 @@ LevelDBEngine::~LevelDBEngine() {
 }
 
 // ----- 单条操作 -----
-Status LevelDBEngine::get(const Key& key, ByteValue* value) {
+Status LevelDBEngine::get(const Key &key, ByteValue *value) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -322,6 +327,20 @@ Status LevelDBEngine::get(const Key& key, ByteValue* value) {
 
   if (!db_) {
     return Status::InternalError;
+  }
+
+  // 事务读穿：本事务写过就返回自己的值，删过就是不存在
+  if (tx_ != nullptr) {
+    const OverlayOp op = tx_->lookup(key);
+    if (op.is_tombstone()) {
+      return Status::NotFound;
+    }
+    if (op.has_value()) {
+      if (value) {
+        *value = op.value;
+      }
+      return Status::OK;
+    }
   }
 
   leveldb::ReadOptions options;
@@ -345,7 +364,7 @@ Status LevelDBEngine::get(const Key& key, ByteValue* value) {
   return Status::OK;
 }
 
-Status LevelDBEngine::put(const Key& key, const ByteValue& value) {
+Status LevelDBEngine::put(const Key &key, const ByteValue &value) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -356,8 +375,13 @@ Status LevelDBEngine::put(const Key& key, const ByteValue& value) {
     return Status::InternalError;
   }
 
+  if (tx_ != nullptr) {
+    tx_->put(key, value);
+    return Status::OK;
+  }
+
   leveldb::WriteOptions options;
-  options.sync = false;  // 性能优先
+  options.sync = false; // 性能优先
 
   leveldb::Status status = db_->Put(options, key, value);
 
@@ -368,7 +392,7 @@ Status LevelDBEngine::put(const Key& key, const ByteValue& value) {
   return Status::OK;
 }
 
-Status LevelDBEngine::remove(const Key& key) {
+Status LevelDBEngine::remove(const Key &key) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -377,6 +401,11 @@ Status LevelDBEngine::remove(const Key& key) {
 
   if (!db_) {
     return Status::InternalError;
+  }
+
+  if (tx_ != nullptr) {
+    tx_->remove(key);
+    return Status::OK;
   }
 
   leveldb::WriteOptions options;
@@ -395,7 +424,7 @@ Status LevelDBEngine::remove(const Key& key) {
   return Status::OK;
 }
 
-bool LevelDBEngine::exists(const Key& key) {
+bool LevelDBEngine::exists(const Key &key) {
   if (!is_open_) {
     return false;
   }
@@ -406,6 +435,13 @@ bool LevelDBEngine::exists(const Key& key) {
     return false;
   }
 
+  if (tx_ != nullptr) {
+    const OverlayOp op = tx_->lookup(key);
+    if (op.covered()) {
+      return op.has_value();
+    }
+  }
+
   leveldb::ReadOptions options;
   std::string value;
   leveldb::Status status = db_->Get(options, key, &value);
@@ -414,9 +450,9 @@ bool LevelDBEngine::exists(const Key& key) {
 }
 
 // ----- 批量操作 -----
-Status LevelDBEngine::get_batch(const std::vector<Key>& keys,
+Status LevelDBEngine::get_batch(const std::vector<Key> &keys,
                                 MissingKeyPolicy policy,
-                                std::vector<std::optional<ByteValue>>* values) {
+                                std::vector<std::optional<ByteValue>> *values) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -437,7 +473,7 @@ Status LevelDBEngine::get_batch(const std::vector<Key>& keys,
   leveldb::ReadOptions options;
   options.verify_checksums = true;
 
-  for (const auto& key : keys) {
+  for (const auto &key : keys) {
     std::string val;
     leveldb::Status status = db_->Get(options, key, &val);
 
@@ -456,7 +492,7 @@ Status LevelDBEngine::get_batch(const std::vector<Key>& keys,
   return Status::OK;
 }
 
-Status LevelDBEngine::write_batch(const WriteBatch& batch) {
+Status LevelDBEngine::write_batch(const WriteBatch &batch) {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -471,23 +507,63 @@ Status LevelDBEngine::write_batch(const WriteBatch& batch) {
     return Status::InternalError;
   }
 
+  // 事务里再写批量：路由进缓冲（事务内保持顺序与原子性）
+  if (tx_ != nullptr) {
+    for (const auto &op : batch.ops()) {
+      switch (op.type) {
+      case WriteBatch::OpType::kPut:
+        if (op.data.value.has_value()) {
+          tx_->put(op.data.key, op.data.value.value());
+        }
+        break;
+      case WriteBatch::OpType::kRemove:
+        tx_->remove(op.data.key);
+        break;
+      case WriteBatch::OpType::kRemoveRange:
+        tx_->remove_range(op.data.key, op.range_end);
+        break;
+      }
+    }
+    return Status::OK;
+  }
+
+  return apply_batch_locked(batch);
+}
+
+// 直接落到 leveldb（不经过事务缓冲）。调用方必须已持有 mutex_ ——
+// 注意别在持锁的情况下再调 write_batch()，那是同锁重入（死锁）。
+Status LevelDBEngine::apply_batch_locked(const WriteBatch &batch) {
+  if (!db_) {
+    return Status::InternalError;
+  }
+
   leveldb::WriteBatch leveldb_batch;
 
-  for (const auto& op : batch.ops()) {
+  for (const auto &op : batch.ops()) {
     if (op.type == WriteBatch::OpType::kPut) {
       if (op.data.value.has_value()) {
         leveldb_batch.Put(op.data.key, op.data.value.value());
       } else {
-        // value 为空，视为删除
-        leveldb_batch.Delete(op.data.key);
+        // value 为空：无效的 put，拒绝而不是静默
+        return Status::InvalidArgument;
       }
-    } else {  // kRemove
+    } else if (op.type == WriteBatch::OpType::kRemoveRange) {
+      // [begin, end) 整段删除。当前 leveldb 版本没有 DeleteRange，
+      // 这里展开成逐键删除 —— 仍然在**同一个 batch** 里，所以原子性不变；
+      // 代价是内存与键数成正比（和不用事务时逐键删是一样的）。
+      leveldb::ReadOptions read_options;
+      std::unique_ptr<leveldb::Iterator> it(db_->NewIterator(read_options));
+      for (it->Seek(op.data.key);
+           it->Valid() && it->key().ToString() < op.range_end; it->Next()) {
+        leveldb_batch.Delete(it->key());
+      }
+    } else { // kRemove
       leveldb_batch.Delete(op.data.key);
     }
   }
 
   leveldb::WriteOptions options;
-  options.sync = false;
+  options.sync = batch.sync(); // 事务提交会置 true（保证落盘）
 
   leveldb::Status status = db_->Write(options, &leveldb_batch);
 
@@ -499,7 +575,7 @@ Status LevelDBEngine::write_batch(const WriteBatch& batch) {
 }
 
 // ----- 迭代器 -----
-std::unique_ptr<Iterator> LevelDBEngine::new_iterator(const KeyRange& range) {
+std::unique_ptr<Iterator> LevelDBEngine::new_iterator(const KeyRange &range) {
   if (!is_open_) {
     return nullptr;
   }
@@ -512,13 +588,66 @@ std::unique_ptr<Iterator> LevelDBEngine::new_iterator(const KeyRange& range) {
 
   leveldb::ReadOptions options;
   options.verify_checksums = true;
-  leveldb::Iterator* it = db_->NewIterator(options);
+  leveldb::Iterator *it = db_->NewIterator(options);
   this->active_iterators_.insert(it);
-  auto iter = std::make_unique<LevelDBIterator>(this, it, range);
-  return iter;
+  auto inner = std::make_unique<LevelDBIterator>(this, it, range);
+  if (tx_ == nullptr) {
+    return inner;
+  }
+  // 事务里扫描：过滤掉本事务删掉的 key、覆盖本事务改过的值
+  return std::make_unique<MergingIterator>(std::move(inner), tx_.get(), range);
 }
 
-void LevelDBEngine::unregister_iterator(leveldb::Iterator* it) {
+// ----- 事务（悲观单写者）-----
+Status LevelDBEngine::begin_transaction() {
+  if (!is_open_) {
+    return Status::InternalError;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ != nullptr) {
+    return Status::Busy; // 同时只允许一个写事务
+  }
+  tx_ = std::make_unique<TxBuffer>();
+  return Status::OK;
+}
+
+Status LevelDBEngine::commit_transaction() {
+  if (!is_open_) {
+    return Status::InternalError;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ == nullptr) {
+    return Status::NotFound;
+  }
+  if (tx_->exceeds()) {
+    return Status::InvalidArgument; // 事务太大（调用方应 rollback）
+  }
+  // 摘下缓冲：apply 阶段不能再走"进缓冲"那条路
+  std::unique_ptr<TxBuffer> tx = std::move(tx_);
+  WriteBatch batch = tx->to_batch();
+  batch.set_sync(true); // 提交必须落盘
+  const Status status =
+      apply_batch_locked(batch); // 已持锁，不能再调 write_batch
+  if (status != Status::OK) {
+    tx_ = std::move(tx); // 失败：缓冲留着，调用方可以重试或回滚
+    return status;
+  }
+  return Status::OK;
+}
+
+Status LevelDBEngine::rollback_transaction() {
+  if (!is_open_) {
+    return Status::InternalError;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ == nullptr) {
+    return Status::NotFound;
+  }
+  tx_.reset(); // DB 从没被动过：这就是完整的回滚
+  return Status::OK;
+}
+
+void LevelDBEngine::unregister_iterator(leveldb::Iterator *it) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto iter = active_iterators_.find(it);
   if (iter != active_iterators_.end()) {
@@ -530,7 +659,6 @@ bool LevelDBEngine::has_active_iterators() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return !active_iterators_.empty();
 }
-
 
 // ----- 管理 -----
 void LevelDBEngine::flush() {
@@ -564,4 +692,4 @@ std::string LevelDBEngine::stats() const {
   return oss.str();
 }
 
-}  // namespace kv
+} // namespace kv

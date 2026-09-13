@@ -34,7 +34,7 @@ class KVEngine;
 
 namespace sql {
 
-class TableCursor;  // relation/cursor.h（避免和 sql::Cursor 混淆）
+class TableCursor; // relation/cursor.h（避免和 sql::Cursor 混淆）
 
 class Table {
 public:
@@ -55,10 +55,13 @@ public:
   // ----- 读 -----
 
   // 点查：不存在返回 nullopt（不算错误）
-  std::expected<std::optional<Row>, RelError>
-  find(const Value &primary_key) const;
+  // 点查：不存在**不是错误**，而是"结果不存在" -> RelErrorCode::NOT_FOUND。
+  // （和游标的 CursorErrorCode::END 同一套约定：状态用错误码表达，
+  //   不用 expected<optional<T>> 那种两层套娃。）
+  std::expected<Row, RelError> find(const Value &primary_key) const;
 
   // 点查：不存在返回 NOT_FOUND 错误
+  // （get 与 find 现在是同一个语义，保留 get 只为调用点可读性）
   std::expected<Row, RelError> get(const Value &primary_key) const;
 
   // 按逻辑主键区间扫描；ascending=false 时反向扫（ORDER BY pk DESC）

@@ -285,6 +285,20 @@ Status MockEngine::get(const Key &key, ByteValue *value) {
 
   std::lock_guard<std::mutex> lock(mutex_);
 
+  // 事务读穿：本事务写过就返回自己的值，删过就是不存在
+  if (tx_ != nullptr) {
+    const OverlayOp op = tx_->lookup(key);
+    if (op.is_tombstone()) {
+      return Status::NotFound;
+    }
+    if (op.has_value()) {
+      if (value) {
+        *value = op.value;
+      }
+      return Status::OK;
+    }
+  }
+
   auto it = data_.find(key);
   if (it == data_.end()) {
     return Status::NotFound;
@@ -304,6 +318,11 @@ Status MockEngine::put(const Key &key, const ByteValue &value) {
 
   std::lock_guard<std::mutex> lock(mutex_);
 
+  if (tx_ != nullptr) {
+    tx_->put(key, value);
+    return Status::OK;
+  }
+
   data_[key] = value;
   return Status::OK;
 }
@@ -314,6 +333,11 @@ Status MockEngine::remove(const Key &key) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
+
+  if (tx_ != nullptr) {
+    tx_->remove(key);
+    return Status::OK; // 事务里删不存在的 key 也算成功（提交时是幂等的）
+  }
 
   auto it = data_.find(key);
   if (it == data_.end()) {
@@ -330,6 +354,12 @@ bool MockEngine::exists(const Key &key) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ != nullptr) {
+    const OverlayOp op = tx_->lookup(key);
+    if (op.covered()) {
+      return op.has_value();
+    }
+  }
   return data_.find(key) != data_.end();
 }
 
@@ -372,20 +402,58 @@ Status MockEngine::write_batch(const WriteBatch &batch) {
 
   std::lock_guard<std::mutex> lock(mutex_);
 
+  // 事务里再写批量：路由进缓冲（同一个事务里仍然保持顺序与原子性）
+  if (tx_ != nullptr) {
+    for (const auto &op : batch.ops()) {
+      switch (op.type) {
+      case WriteBatch::OpType::kPut:
+        if (op.data.value.has_value()) {
+          tx_->put(op.data.key, op.data.value.value());
+        }
+        break;
+      case WriteBatch::OpType::kRemove:
+        tx_->remove(op.data.key);
+        break;
+      case WriteBatch::OpType::kRemoveRange:
+        tx_->remove_range(op.data.key, op.range_end);
+        break;
+      }
+    }
+    return Status::OK;
+  }
+
+  return apply_batch_locked(batch);
+}
+
+// 直接落到 data_（不经过事务缓冲）。调用方必须已经持有 mutex_。
+Status MockEngine::apply_batch_locked(const WriteBatch &batch) {
+  if (fail_writes_) {
+    return Status::IOError;
+  }
+  // 两趟：先整体校验，再整体应用 —— 这样"任何一条 op 非法"时
+  // 一条都不会落下（和 LevelDB 的 WriteBatch 原子性对齐）。
+  for (const auto &op : batch.ops()) {
+    if (op.type == WriteBatch::OpType::kPut && !op.data.value.has_value()) {
+      return Status::InvalidArgument;
+    }
+    if (op.type == WriteBatch::OpType::kRemoveRange &&
+        op.range_end <= op.data.key) {
+      return Status::InvalidArgument;
+    }
+  }
   for (const auto &op : batch.ops()) {
     if (op.type == WriteBatch::OpType::kPut) {
-      if (op.data.value.has_value()) {
-        data_[op.data.key] = op.data.value.value();
-      } else {
-        // 如果 value 为空，视为删除
-        // data_.erase(op.data.key);
-        fprintf(stderr, "key:[%s]'s value is empty\n", op.data.key.c_str());
+      data_[op.data.key] = op.data.value.value();
+    } else if (op.type == WriteBatch::OpType::kRemoveRange) {
+      // [begin, end) 整段删除（DROP / TRUNCATE 用）
+      auto it = data_.lower_bound(op.data.key);
+      while (it != data_.end() && it->first < op.range_end) {
+        it = data_.erase(it);
       }
     } else { // kRemove
       data_.erase(op.data.key);
     }
   }
-
   return Status::OK;
 }
 
@@ -396,7 +464,60 @@ std::unique_ptr<Iterator> MockEngine::new_iterator(const KeyRange &range) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  return std::make_unique<MockIterator>(&data_, range);
+  auto inner = std::make_unique<MockIterator>(&data_, range);
+  if (tx_ == nullptr) {
+    return inner;
+  }
+  // 事务里扫描：过滤掉本事务删掉的 key、覆盖本事务改过的值
+  return std::make_unique<MergingIterator>(std::move(inner), tx_.get(), range);
+}
+
+// ----- 事务 -----
+Status MockEngine::begin_transaction() {
+  if (!is_open_) {
+    return Status::InternalError;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ != nullptr) {
+    return Status::Busy; // 悲观单写者：同时只允许一个写事务
+  }
+  tx_ = std::make_unique<TxBuffer>();
+  return Status::OK;
+}
+
+Status MockEngine::commit_transaction() {
+  if (!is_open_) {
+    return Status::InternalError;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ == nullptr) {
+    return Status::NotFound;
+  }
+  if (tx_->exceeds()) {
+    return Status::InvalidArgument; // 事务太大（调用方应 rollback）
+  }
+  // 先把缓冲摘下来：apply 阶段不能再走"进缓冲"那条路
+  std::unique_ptr<TxBuffer> tx = std::move(tx_);
+  WriteBatch batch = tx->to_batch();
+  batch.set_sync(true);
+  const Status status = apply_batch_locked(batch);
+  if (status != Status::OK) {
+    tx_ = std::move(tx); // 失败：缓冲留着，调用方可以重试或回滚
+    return status;
+  }
+  return Status::OK; // tx 析构 = 丢弃缓冲
+}
+
+Status MockEngine::rollback_transaction() {
+  if (!is_open_) {
+    return Status::InternalError;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tx_ == nullptr) {
+    return Status::NotFound;
+  }
+  tx_.reset(); // DB 从没被动过：这就是完整的回滚
+  return Status::OK;
 }
 
 // ----- 管理 -----

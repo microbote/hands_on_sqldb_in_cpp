@@ -30,10 +30,10 @@ struct Fixture {
       return std::nullopt;
     }
     auto found = table->find(sql::Value(id, sql::DataType::INT));
-    if (!found.has_value() || !found->has_value()) {
+    if (!found.has_value()) {
       return std::nullopt;
     }
-    return std::move(**found);
+    return std::move(*found);
   }
 
   size_t row_count() {

@@ -146,6 +146,8 @@ target_compile_features(sql_planner PUBLIC cxx_std_23)
 # ============================================================
 add_library(sql_kv STATIC
     storage/mock_engine/mock_engine.cpp
+    storage/kv_engine/tx_buffer.cpp
+    storage/kv_engine/merging_iterator.cpp
 )
 
 target_include_directories(sql_kv PUBLIC

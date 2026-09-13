@@ -356,12 +356,14 @@ ExecError ScanExecutor::open_impl() {
   }
   if (point_lookup_) {
     auto found = table_->find(point_key_);
-    if (!found.has_value()) {
+    if (found.has_value()) {
+      point_row_ = std::move(*found);
+    } else if (found.error().code == sql::RelErrorCode::NOT_FOUND) {
+      // 点不存在：正常结束（空结果），不是错误
+      done_ = true;
+    } else {
       error_ = sql::to_cursor_error(found.error());
       return to_exec_error(error_);
-    }
-    if (found->has_value()) {
-      point_row_ = std::move(**found);
     }
     return ExecError();
   }

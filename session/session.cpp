@@ -97,6 +97,34 @@ bool match_keyword(const std::string &sql, size_t pos, const char *keyword,
   return true;
 }
 
+// 整条语句就是一个事务控制关键字？（BEGIN / COMMIT / ROLLBACK 及其别名）
+// 返回归一化后的命令名。
+std::optional<std::string> transaction_command(const std::string &statement) {
+  size_t end = statement.size();
+  while (end > 0 &&
+         (statement[end - 1] == ';' || is_space(statement[end - 1]))) {
+    --end;
+  }
+  size_t begin = 0;
+  while (begin < end && is_space(statement[begin])) {
+    ++begin;
+  }
+  std::string word = statement.substr(begin, end - begin);
+  for (char &c : word) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  if (word == "BEGIN" || word == "START TRANSACTION") {
+    return std::string("BEGIN");
+  }
+  if (word == "COMMIT" || word == "END") {
+    return std::string("COMMIT");
+  }
+  if (word == "ROLLBACK" || word == "ABORT") {
+    return std::string("ROLLBACK");
+  }
+  return std::nullopt;
+}
+
 StrippedExplain strip_explain_prefix(const std::string &sql) {
   StrippedExplain result;
   size_t begin = 0;
@@ -193,6 +221,47 @@ sql::TableSchema schema_from_query(const sql::CreateTableQuery &query) {
   }
   return schema;
 }
+
+// ============================================================
+// 自动提交守卫：整个语句一个事务
+//
+//   - 构造时 begin（引擎已经有事务时——将来的显式 BEGIN——就加入它，不重复开）；
+//   - commit() 显式提交并解除守卫；
+//   - 析构时若还没提交 -> 自动 rollback：**任何提前 return 都不会留下半截写**。
+//     这就是"语句原子性"的实现方式。
+// ============================================================
+class AutoCommit {
+public:
+  explicit AutoCommit(kv::KVEngine *engine) : engine_(engine) {
+    if (engine_ != nullptr && !engine_->in_transaction()) {
+      active_ = engine_->begin_transaction() == kv::Status::OK;
+    }
+  }
+  ~AutoCommit() {
+    if (active_ && engine_ != nullptr) {
+      engine_->rollback_transaction();
+    }
+  }
+  AutoCommit(const AutoCommit &) = delete;
+  AutoCommit &operator=(const AutoCommit &) = delete;
+
+  bool active() const { return active_; }
+
+  kv::Status commit() {
+    if (!active_ || engine_ == nullptr) {
+      return kv::Status::OK;
+    }
+    const kv::Status status = engine_->commit_transaction();
+    if (status == kv::Status::OK) {
+      active_ = false; // 提交成功：解除守卫，析构时不再回滚
+    }
+    return status;
+  }
+
+private:
+  kv::KVEngine *engine_;
+  bool active_ = false;
+};
 
 } // namespace
 
@@ -308,13 +377,63 @@ Session::execute(const std::string &sql) {
                                         statement));
   }
 
+  // ---- 事务控制：BEGIN / COMMIT / ROLLBACK ----
+  if (const auto command = transaction_command(statement);
+      command.has_value()) {
+    if (*command == "BEGIN") {
+      return begin_transaction(statement);
+    }
+    if (*command == "COMMIT") {
+      return commit_transaction(statement);
+    }
+    return rollback_transaction(statement);
+  }
+  // 事务里出过错之后只允许 ROLLBACK：否则失败的语句会留下半截改动
+  if (tx_failed_) {
+    return std::unexpected(SessionError(
+        SessionErrorCode::TRANSACTION_ERROR,
+        "current transaction is aborted; issue ROLLBACK", statement));
+  }
+
   auto query = prepare(statement);
   if (!query.has_value()) {
     return std::unexpected(query.error());
   }
+
+  // 写语句 / DDL / USE：整个语句包成一个事务（自动提交）。
+  // 读语句不开事务（不需要原子性，也不该长期占着写锁）。
+  // 守卫在析构时自动回滚 —— 下面任何提前 return 都不会留下半截写。
+  const bool own_transaction = !in_transaction_; // 显式事务里让位给事务本身
+  AutoCommit auto_commit(
+      (own_transaction && !query->is_select()) ? engine_.get() : nullptr);
+  if (own_transaction && !query->is_select() && !auto_commit.active()) {
+    return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
+                                        "cannot begin transaction (busy?)",
+                                        statement));
+  }
+  const auto finish =
+      [&](std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+              result) {
+        if (!result.has_value()) {
+          if (in_transaction_) {
+            tx_failed_ = true; // 事务里出错：只能 ROLLBACK（Postgres 风格）
+          }
+          return result; // 守卫析构自动回滚
+        }
+        const kv::Status committed = auto_commit.commit();
+        if (committed != kv::Status::OK) {
+          return std::expected<std::unique_ptr<exec::ResultCursor>,
+                               SessionError>(std::unexpected(SessionError(
+              SessionErrorCode::EXECUTE_ERROR,
+              std::string("commit failed: ") + kv::status_to_string(committed),
+              statement)));
+        }
+        return result;
+      };
+
   // DDL / USE：没有行流，直接落到 Catalog
   if (query->is_ddl() || query->is_ctrl()) {
-    return execute_catalog_statement(*query, statement);
+    return finish(execute_catalog_statement(*query, statement));
   }
   if (!query->is_dml()) {
     return std::unexpected(SessionError(
@@ -330,19 +449,21 @@ Session::execute(const std::string &sql) {
   // 打开表（执行器按表视图落 KV 操作）
   auto table = catalog_.open_table(plan_db(**planned), plan_table(**planned));
   if (!table.has_value()) {
-    return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
-                                        table.error().to_string(), statement));
+    return finish(
+        std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
+                                     table.error().to_string(), statement)));
   }
   auto shared_table = std::make_shared<sql::Table>(std::move(*table));
 
   // 执行（写语句在这里就跑完；SELECT 惰性，第一次 next() 才启动）
   auto cursor = exec::execute(**planned, std::move(shared_table));
   if (!cursor.has_value()) {
-    return std::unexpected(from_exec_error(cursor.error(), statement));
+    return finish(std::unexpected(from_exec_error(cursor.error(), statement)));
   }
   // 写语句：立即检查是否出错（错误不会等到 next() 才暴露）
   if (!(*cursor)->root()->produces_rows() && (*cursor)->error().is_error()) {
-    return std::unexpected(from_cursor_error((*cursor)->error(), statement));
+    return finish(
+        std::unexpected(from_cursor_error((*cursor)->error(), statement)));
   }
   // 写语句真的改了行 -> 更新这张表的"最后写入时间"与行数（成本模型/元命令用）
   if ((*cursor)->root()->is_write() && (*cursor)->affected_rows() > 0) {
@@ -355,7 +476,80 @@ Session::execute(const std::string &sql) {
     }
     catalog_.touch_table(plan_db(**planned), plan_table(**planned), delta);
   }
-  return std::move(*cursor);
+  return finish(std::move(*cursor));
+}
+
+// ============================================================
+// 事务控制（BEGIN / COMMIT / ROLLBACK）
+// ============================================================
+std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+Session::begin_transaction(const std::string &statement) {
+  if (in_transaction_) {
+    return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                                        "already in a transaction", statement));
+  }
+  if (engine_ == nullptr) {
+    return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
+                                        "no storage engine", statement));
+  }
+  const kv::Status status = engine_->begin_transaction();
+  if (status != kv::Status::OK) {
+    return std::unexpected(
+        SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                     std::string("cannot begin transaction: ") +
+                         kv::status_to_string(status),
+                     statement));
+  }
+  in_transaction_ = true;
+  tx_failed_ = false;
+  return exec::empty_result();
+}
+
+std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+Session::commit_transaction(const std::string &statement) {
+  if (!in_transaction_ || engine_ == nullptr) {
+    return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                                        "no transaction to commit", statement));
+  }
+  if (tx_failed_) {
+    // 事务已经坏了：COMMIT 实际执行回滚，并明确告诉调用方
+    engine_->rollback_transaction();
+    in_transaction_ = false;
+    tx_failed_ = false;
+    return std::unexpected(SessionError(
+        SessionErrorCode::TRANSACTION_ERROR,
+        "transaction was aborted; rolled back instead of committing",
+        statement));
+  }
+  const kv::Status status = engine_->commit_transaction();
+  if (status != kv::Status::OK) {
+    // 缓冲还留在引擎里：可以重试 COMMIT，也可以 ROLLBACK
+    return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                                        std::string("commit failed: ") +
+                                            kv::status_to_string(status),
+                                        statement));
+  }
+  in_transaction_ = false;
+  return exec::empty_result();
+}
+
+std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+Session::rollback_transaction(const std::string &statement) {
+  if (!in_transaction_ || engine_ == nullptr) {
+    return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                                        "no transaction to roll back",
+                                        statement));
+  }
+  const kv::Status status = engine_->rollback_transaction();
+  in_transaction_ = false;
+  tx_failed_ = false;
+  if (status != kv::Status::OK) {
+    return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
+                                        std::string("rollback failed: ") +
+                                            kv::status_to_string(status),
+                                        statement));
+  }
+  return exec::empty_result();
 }
 
 // ============================================================

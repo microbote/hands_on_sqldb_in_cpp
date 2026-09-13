@@ -10,8 +10,8 @@ namespace kv {
 enum class EngineType { MOCK, LEVELDB, ROCKSDB };
 
 class KVEngineFactory {
- public:
+public:
   static std::unique_ptr<KVEngine> create(EngineType type);
 };
 
-}  // namespace kv
+} // namespace kv

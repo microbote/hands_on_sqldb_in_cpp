@@ -406,23 +406,10 @@ bool KVCatalog::remove_prefix(const std::string &prefix) {
   if (!is_open() || prefix.empty()) {
     return false;
   }
-  kv::KeyRange range;
-  range.start = prefix;
-  range.end = keys::prefix_end(prefix);
-  std::vector<std::string> doomed;
-  auto it = engine_->new_iterator(range);
-  while (it != nullptr && it->valid()) {
-    doomed.push_back(it->key());
-    it->next();
-  }
-  if (it != nullptr && it->status() != kv::Status::OK &&
-      it->status() != kv::Status::NotFound) {
-    return false;
-  }
-  if (doomed.empty()) {
-    return true;
-  }
-  return engine_->remove_batch(doomed) == kv::Status::OK;
+  // 整段删：交给引擎（事务里只占一条 op，不用先收集所有 key）
+  kv::WriteBatch batch;
+  batch.remove_range(prefix, keys::prefix_end(prefix));
+  return engine_->write_batch(batch) == kv::Status::OK;
 }
 
 } // namespace sql
