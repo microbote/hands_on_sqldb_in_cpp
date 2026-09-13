@@ -6,6 +6,7 @@ add_executable(test_executor
     test_select.cpp
     test_sort_limit.cpp
     test_write.cpp
+    test_text_result.cpp
 )
 
 target_link_libraries(test_executor PRIVATE

@@ -59,7 +59,7 @@ SET 列表、VALUES）**拷成自己的成员**，运行期不再解引用计划
 
 ## 5. 测试
 
-`tests/test_executor/`（40 用例）：
+`tests/test_executor/`（43 用例）：
 
 - `test_select.cpp`：全表/区间/点查/IN 区间拼接/跳点/非主键过滤/恒假条件/
   未知列（UNKNOWN 不保留行）/投影/`SELECT *`/游标 close/坏行报错。
@@ -68,10 +68,21 @@ SET 列表、VALUES）**拷成自己的成员**，运行期不再解引用计划
   不加 LIMIT 的对照组必须报错）、非主键排序、TopN、OFFSET、`LIMIT 0`、
   NULL 排在最前、并列时主键 tiebreak、超出内存上限报 `MEMORY_LIMIT`。
 - `test_write.cpp`：按主键/非主键/无 WHERE 的 UPDATE，链式 DELETE，
-  INSERT（列清单、无列清单、NOT NULL 缺失、列数不匹配、NULL 主键）、
+  INSERT（列清单、无列清单、NOT NULL 缺失、列数不匹配、NULL 主键、
+  **主键重复报 CONSTRAINT_VIOLATION 且不覆盖旧行**）、
   写语句无结果行 + 受影响行数。
+- `test_text_result.cpp`：`exec::text_result()`（单列文本结果集，EXPLAIN 用）——
+  行数/列名/正常结束/空结果集/close 幂等。
 
-## 6. 已知缺口
+## 6. 没有计划节点的结果集：`text_result()`
+
+`EXPLAIN` 的输出不是查询结果，但也不该另开一条"打印文本"的通道：
+`exec::text_result(column, lines)` 返回一个普通的 `ResultCursor`，
+根算子是把行物化在内存里的 `MaterializedExecutor`（`plan() == nullptr`，
+不对应计划树里的任何东西）。客户端拿到的东西和 SELECT 完全一样
+（`columns()` / `next()` / `close()`），所以 CLI 不用为 EXPLAIN 写分支。
+
+## 7. 已知缺口
 
 - **多行 VALUES 语法未支持**：`INSERT ... VALUES (...), (...)` 目前解析失败
   （`statement` 层其实已经预留了多行处理，只差 `sql.y` 的一个产生式）。

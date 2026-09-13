@@ -273,3 +273,124 @@ TEST(TxSession, StatementAliasesWork) {
   CHECK(sess_test::run(session, "begin;", &error) != nullptr);
   CHECK(sess_test::run(session, "Commit ;", &error) != nullptr);
 }
+
+TEST(TxSession, WorkKeywordFormsAreAccepted) {
+  // BEGIN WORK / COMMIT WORK / ROLLBACK WORK 是标准写法：
+  // 语法层认出来（老的文本层匹配只认六个整串，这些形式会被当成语法错误）
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 0));
+
+  session::SessionError error;
+  CHECK(sess_test::run(session, "BEGIN WORK", &error) != nullptr);
+  CHECK(session.in_transaction());
+  CHECK(sess_test::run(session, "ROLLBACK WORK", &error) != nullptr);
+  CHECK(!session.in_transaction());
+
+  CHECK(sess_test::run(session, "BEGIN WORK;", &error) != nullptr);
+  CHECK(sess_test::run(session, "COMMIT WORK;", &error) != nullptr);
+  CHECK(!session.in_transaction());
+}
+
+TEST(TxSession, GrammarOwnsTransactionDiagnostics) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 1));
+
+  // 不支持的形式由语法层给出**具体原因**（而不是笼统的 syntax error）
+  session::SessionError error;
+  CHECK(sess_test::run(session, "COMMIT AND CHAIN", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::PARSE_ERROR);
+  CHECK(error.message.find("AND CHAIN") != std::string::npos);
+
+  CHECK(sess_test::run(session, "ROLLBACK TO SAVEPOINT sp1", &error) ==
+        nullptr);
+  CHECK(error.code == session::SessionErrorCode::PARSE_ERROR);
+  CHECK(error.message.find("SAVEPOINT") != std::string::npos);
+
+  CHECK(sess_test::run(session, "BEGIN DEFERRED", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::PARSE_ERROR);
+  CHECK(error.message.find("transaction modes") != std::string::npos);
+
+  // 事务关键字现在被保留（和 END/DESC 一样）：不能当表名/列名用
+  CHECK(sess_test::run(session, "SELECT commit FROM users", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::PARSE_ERROR);
+  // 但只认整词：BEGINNER 只是普通标识符（这里因为不是语句开头而语法错）
+  CHECK(sess_test::run(session, "BEGINNER", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::PARSE_ERROR);
+  CHECK(error.message.find("transaction modes") == std::string::npos);
+}
+
+TEST(TxSession, AbortedTransactionMasksSyntaxErrorsToo) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 2));
+
+  // 造一条坏行，让 DELETE 在执行期失败（校验器看不出来）
+  auto table = session.catalog().open_table(sql::Identifier("shop"),
+                                            sql::Identifier("users"));
+  CHECK(table.has_value());
+  if (table.has_value()) {
+    const std::string key =
+        table->encode_key(sql::Value(int64_t{2}, sql::DataType::INT));
+    CHECK(engine->put(key, "garbage") == kv::Status::OK);
+  }
+
+  session::SessionError error;
+  CHECK(sess_test::run(session, "BEGIN WORK", &error) != nullptr);
+  CHECK(sess_test::run(session, "DELETE FROM users", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::EXECUTE_ERROR);
+
+  // 事务已中止：连语法错误也被"事务已中止"盖住（Postgres 风格）——
+  // 否则用户会以为"改一下语法就能继续"，实际上必须 ROLLBACK
+  CHECK(sess_test::run(session, "SELCT 1", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::TRANSACTION_ERROR);
+  CHECK(error.message.find("aborted") != std::string::npos);
+
+  // 事务控制语句例外：中止状态下 ROLLBACK 仍然必须能跑
+  CHECK(sess_test::run(session, "ROLLBACK WORK", &error) != nullptr);
+  CHECK(!session.in_transaction());
+}
+
+TEST(TxSession, ExplainIsRejectedInAnAbortedTransaction) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 2));
+
+  // 造一条坏行让 DELETE 在执行期失败 -> 事务中止
+  auto table = session.catalog().open_table(sql::Identifier("shop"),
+                                            sql::Identifier("users"));
+  CHECK(table.has_value());
+  if (table.has_value()) {
+    const std::string key =
+        table->encode_key(sql::Value(int64_t{2}, sql::DataType::INT));
+    CHECK(engine->put(key, "garbage") == kv::Status::OK);
+  }
+
+  session::SessionError error;
+  CHECK(sess_test::run(session, "BEGIN", &error) != nullptr);
+  CHECK(sess_test::run(session, "DELETE FROM users", &error) == nullptr);
+  CHECK(error.code == session::SessionErrorCode::EXECUTE_ERROR);
+
+  // 中止的事务里连 EXPLAIN 也不放行（ANALYZE 会真的读数据）
+  auto explained =
+      sess_test::explain(session, "EXPLAIN ANALYZE SELECT * FROM users");
+  CHECK(!explained.ok);
+  CHECK(explained.error.code == session::SessionErrorCode::TRANSACTION_ERROR);
+
+  CHECK(sess_test::run(session, "ROLLBACK", &error) != nullptr);
+}
+
+TEST(TxSession, ExplainOnTransactionStatementIsRejected) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 0));
+
+  // 事务控制语句没有计划树：EXPLAIN 不能编造一个（语法层认得 BEGIN，
+  // 所以这里的提示比"语法错误"具体）
+  auto explained = sess_test::explain(session, "EXPLAIN BEGIN;");
+  CHECK(!explained.ok);
+  CHECK(explained.error.code == session::SessionErrorCode::NOT_SUPPORTED);
+  CHECK(explained.error.message.find("BEGIN") != std::string::npos);
+  CHECK(!session.in_transaction()); // EXPLAIN 没有真的开事务
+}

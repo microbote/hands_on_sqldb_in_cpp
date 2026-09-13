@@ -26,6 +26,7 @@ enum class RelErrorCode : uint8_t {
   SCHEMA_ERROR,         // 行/schema 校验失败，细节在 SchemaError 里
   PRIMARY_KEY_NULL,     // 主键是 NULL
   PRIMARY_KEY_MISMATCH, // 更新时行里的主键和 key 不一致
+  DUPLICATE_PRIMARY_KEY, // INSERT 的主键已经存在（唯一约束）
   COLUMN_NOT_FOUND,
   KV_ERROR, // 底层 KV 返回非 OK
   NOT_SUPPORTED,
@@ -47,6 +48,8 @@ inline const char *rel_error_message(RelErrorCode code) {
     return "Primary key is NULL";
   case RelErrorCode::PRIMARY_KEY_MISMATCH:
     return "Primary key in row does not match the key";
+  case RelErrorCode::DUPLICATE_PRIMARY_KEY:
+    return "Duplicate primary key";
   case RelErrorCode::COLUMN_NOT_FOUND:
     return "Column not found";
   case RelErrorCode::KV_ERROR:

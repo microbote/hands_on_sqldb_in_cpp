@@ -257,3 +257,25 @@ TEST(Validator, DynamicCatalogChangesAreVisible) {
   expect_error(catalog, "SELECT * FROM users;",
                stmt::StmtErrorCode::TABLE_NOT_FOUND);
 }
+
+TEST(Validator, TransactionStatementsNeedNoSchema) {
+  MemoryCatalog catalog;
+  catalog.set_open(true); // 打开但没 USE：事务控制语句不看库/表
+
+  expect_ok(catalog, "BEGIN;");
+  expect_ok(catalog, "BEGIN WORK;");
+  expect_ok(catalog, "START TRANSACTION;");
+  expect_ok(catalog, "COMMIT WORK;");
+  expect_ok(catalog, "END;");
+  expect_ok(catalog, "ROLLBACK;");
+  expect_ok(catalog, "ABORT WORK;");
+
+  // 会话状态（是否已经在事务里）不在校验层判断：那是 session 的事，
+  // 所以同一条 BEGIN 校验两次都通过
+  expect_ok(catalog, "BEGIN;");
+
+  // 但 catalog 没打开时仍然拒绝——和别的语句一样，先要求连接可用
+  MemoryCatalog closed;
+  const auto error = validate_sql(closed, "BEGIN;");
+  CHECK(error.code == stmt::StmtErrorCode::VALIDATOR_NOT_INIT);
+}

@@ -205,6 +205,34 @@ TEST(Write, InsertMultiRowValuesIsNotSupportedYet) {
   CHECK(!error.empty());
 }
 
+TEST(Write, InsertDuplicatePrimaryKeyFailsAndKeepsOldRow) {
+  Fixture env;
+  size_t before = env.row_count();
+
+  std::string error;
+  auto cursor = exectest::run_sql(
+      *env.catalog, "INSERT INTO users (id, name, age) VALUES (3, 'clash', 7)",
+      &error);
+  CHECK(cursor == nullptr);
+  CHECK(error.find("duplicate primary key") != std::string::npos);
+
+  // 没有覆盖：原来的行还在，行数也没变（INSERT 不是 UPSERT）
+  CHECK_EQ(env.row_count(), before);
+  const auto row = env.row(3);
+  CHECK(row.has_value());
+  if (row.has_value()) {
+    CHECK((*row)[1].as_str() != std::string("clash"));
+  }
+
+  // 换个没被占用的主键照样能插
+  auto fresh = exectest::run_sql(
+      *env.catalog, "INSERT INTO users (id, name, age) VALUES (1000, 'ok', 1)");
+  CHECK(fresh != nullptr);
+  if (fresh != nullptr) {
+    CHECK_EQ(fresh->affected_rows(), size_t{1});
+  }
+}
+
 TEST(Write, InsertWithoutColumnListUsesSchemaOrder) {
   Fixture env;
   auto cursor =

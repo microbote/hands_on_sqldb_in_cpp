@@ -195,29 +195,6 @@ bool is_exit_command(const std::string &line) {
          line == "QUIT";
 }
 
-// 这条语句是不是 EXPLAIN（独立关键字，大小写不敏感）
-bool is_explain(const std::string &statement) {
-  size_t begin = 0;
-  while (begin < statement.size() &&
-         std::isspace(static_cast<unsigned char>(statement[begin])) != 0) {
-    ++begin;
-  }
-  constexpr size_t kLength = 7; // "explain"
-  if (statement.size() < begin + kLength) {
-    return false;
-  }
-  std::string head = statement.substr(begin, kLength);
-  for (char &c : head) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  if (head != "explain") {
-    return false;
-  }
-  const size_t after = begin + kLength;
-  return after >= statement.size() ||
-         std::isspace(static_cast<unsigned char>(statement[after])) != 0;
-}
-
 // ============================================================
 // 打印
 // ============================================================
@@ -563,17 +540,6 @@ int run_text(session::Session &session, const std::string &text,
                              : statement.start_column};
       if (options.echo_sql) {
         fmt::print("{}\n", stmt::highlight_sql(statement.text, options.colors));
-      }
-      // EXPLAIN：只出计划，不执行
-      if (is_explain(statement.text)) {
-        auto explained = session.explain(statement.text);
-        if (!explained.has_value()) {
-          print_error(to_absolute(explained.error(), absolute), options.colors);
-          ++failures;
-          continue;
-        }
-        fmt::print("{}", *explained);
-        continue;
       }
       auto result = session.execute(statement.text);
       if (!result.has_value()) {

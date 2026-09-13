@@ -237,6 +237,64 @@ TEST(Cursor, ResetRescansTheSameRange) {
 // ============================================================
 // 写入
 // ============================================================
+// INSERT 不是 UPSERT：主键已存在必须报错，而且**不能覆盖**原来那一行
+TEST(Table, InsertWithExistingPrimaryKeyIsRejected) {
+  Fixture env;
+
+  auto duplicate = env.table->insert(reltest::users_row(3, "other", 999));
+  CHECK(!duplicate.has_value());
+  if (!duplicate.has_value()) {
+    CHECK(duplicate.error().code == sql::RelErrorCode::DUPLICATE_PRIMARY_KEY);
+    CHECK(duplicate.error().to_string().find("3") != std::string::npos);
+  }
+
+  // 原来那一行原封不动
+  const auto existing = env.table->find(int_value(3));
+  CHECK(existing.has_value());
+  if (existing.has_value()) {
+    CHECK_EQ((*existing)[1].as_str(), std::string("user3"));
+    CHECK_EQ((*existing)[2].as_int(), int64_t{30});
+  }
+  CHECK_EQ(env.scan_all_ids().size(), size_t{9});
+
+  // 删掉之后同一个主键可以再插
+  CHECK(env.table->remove(int_value(3)).has_value());
+  auto reinserted = env.table->insert(reltest::users_row(3, "other", 999));
+  CHECK(reinserted.has_value());
+  const auto replaced = env.table->find(int_value(3));
+  CHECK(replaced.has_value());
+  if (replaced.has_value()) {
+    CHECK_EQ((*replaced)[1].as_str(), std::string("other"));
+  }
+}
+
+// 事务里"插两次同一个主键"要立刻报错（存在性判断走覆盖层，不是只查 DB）
+TEST(Table, InsertInsideTransactionSeesItsOwnWrites) {
+  auto engine = reltest::open_engine();
+  sql::Table table(engine, sql::Identifier("shop"),
+                   reltest::make_users_schema());
+
+  CHECK(engine->begin_transaction() == kv::Status::OK);
+  CHECK(table.insert(reltest::users_row(1, "a", 10)).has_value());
+
+  auto duplicate = table.insert(reltest::users_row(1, "b", 20));
+  CHECK(!duplicate.has_value());
+  if (!duplicate.has_value()) {
+    CHECK(duplicate.error().code == sql::RelErrorCode::DUPLICATE_PRIMARY_KEY);
+  }
+  // 事务里读取到的还是第一次插入的那一行
+  const auto found = table.find(int_value(1));
+  CHECK(found.has_value());
+  if (found.has_value()) {
+    CHECK_EQ((*found)[1].as_str(), std::string("a"));
+  }
+
+  // 回滚之后两边都不存在：可以正常插入同一个主键
+  CHECK(engine->rollback_transaction() == kv::Status::OK);
+  CHECK(!table.find(int_value(1)).has_value());
+  CHECK(table.insert(reltest::users_row(1, "c", 30)).has_value());
+}
+
 TEST(Table, RejectRowThatDoesNotMatchSchema) {
   Fixture f;
   // 列数不对

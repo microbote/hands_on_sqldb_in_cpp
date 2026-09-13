@@ -19,4 +19,7 @@ INSERT INTO t (id, name, v) VALUES (3, 'c', 30);
 BEGIN;
 INSERT INTO t (id, name, v) VALUES (4, 'd', 40);
 COMMIT;
+BEGIN WORK;
+INSERT INTO t (id, name, v) VALUES (5, 'e', 50);
+ROLLBACK WORK;
 SELECT id, name, v FROM t ORDER BY id;

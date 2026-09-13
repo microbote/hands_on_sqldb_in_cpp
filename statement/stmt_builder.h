@@ -48,6 +48,8 @@ private:
   build_stmt_create_table(const ASTNode *ast);
   std::expected<sql::Query, StmtError>
   build_stmt_drop_table(const ASTNode *ast);
+  std::expected<sql::Query, StmtError>
+  build_stmt_transaction(const ASTNode *ast);
 
   // ---- 片段转换 ----
   std::expected<sql::Value, StmtError> build_value(const ASTNode *ast);

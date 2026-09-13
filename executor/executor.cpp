@@ -29,6 +29,8 @@ ExecError to_exec_error(const CursorError &error) {
     return ExecError(ExecErrorCode::SCHEMA_ERROR, error.to_string());
   case CursorErrorCode::NOT_FOUND:
     return ExecError(ExecErrorCode::TABLE_NOT_FOUND, error.to_string());
+  case CursorErrorCode::CONSTRAINT_VIOLATION:
+    return ExecError(ExecErrorCode::CONSTRAINT_VIOLATION, error.to_string());
   case CursorErrorCode::INVALID_ARGUMENT:
     return ExecError(ExecErrorCode::INVALID_ARGUMENT, error.to_string());
   default:
@@ -253,6 +255,52 @@ public:
 
 private:
   const plan::PlanNode *plan_ = nullptr;
+  sql::CursorError error_;
+};
+
+// 物化算子：行已经在内存里（EXPLAIN 的计划文本行用），逐行吐出去。
+// 没有计划节点（plan() == nullptr）：它不对应计划树里的任何东西。
+class MaterializedExecutor : public Executor {
+public:
+  explicit MaterializedExecutor(std::vector<sql::Row> rows)
+      : rows_(std::move(rows)) {}
+  ~MaterializedExecutor() override { close(); }
+
+  ExecError open_impl() override {
+    if (opened_) {
+      return ExecError(ExecErrorCode::ALREADY_OPEN, "already open");
+    }
+    opened_ = true;
+    return ExecError();
+  }
+  std::expected<sql::Row, CursorError> next_impl() override {
+    if (error_.is_error()) {
+      return std::unexpected(error_);
+    }
+    if (!opened_) {
+      error_ = CursorError(CursorErrorCode::INVALID_ARGUMENT,
+                           "materialized cursor is not open");
+      return std::unexpected(error_);
+    }
+    if (cursor_ >= rows_.size()) {
+      error_ = sql::end_of_stream();
+      return std::unexpected(error_);
+    }
+    return rows_[cursor_++];
+  }
+  void close_impl() override {
+    if (!error_.is_error()) {
+      error_ = sql::end_of_stream();
+    }
+  }
+  const plan::PlanNode *plan() const override { return nullptr; }
+  const sql::CursorError &error() const override { return error_; }
+  bool produces_rows() const override { return true; }
+
+private:
+  std::vector<sql::Row> rows_;
+  size_t cursor_ = 0;
+  bool opened_ = false;
   sql::CursorError error_;
 };
 
@@ -1140,6 +1188,22 @@ execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table,
 std::unique_ptr<ResultCursor> empty_result() {
   return std::make_unique<ResultCursor>(
       std::make_unique<EmptyExecutor>(nullptr), nullptr);
+}
+
+std::unique_ptr<ResultCursor> text_result(std::string column,
+                                          std::vector<std::string> lines) {
+  std::vector<sql::Row> rows;
+  rows.reserve(lines.size());
+  for (std::string &line : lines) {
+    sql::Row row;
+    row.push_back(sql::Value(std::move(line)));
+    rows.push_back(std::move(row));
+  }
+  std::vector<std::string> columns;
+  columns.push_back(std::move(column));
+  return std::make_unique<ResultCursor>(
+      std::make_unique<MaterializedExecutor>(std::move(rows)), nullptr,
+      std::move(columns));
 }
 
 } // namespace exec

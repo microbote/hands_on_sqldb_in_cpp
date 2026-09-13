@@ -124,6 +124,22 @@ static char* sql_unescape_string(const char* body, size_t len) {
 "primary"   { return TOK_PRIMARY; }
 "key"       { return TOK_KEY; }
 
+  /* 事务控制：BEGIN / COMMIT / ROLLBACK 及其标准别名。
+   这些词一旦保留就不能再当标识符用（和 END/DESC 等一样），
+   代价与标准 SQL 一致。 */
+"begin"       { return TOK_BEGIN; }
+"start"       { return TOK_START; }
+"transaction" { return TOK_TRANSACTION; }
+"work"        { return TOK_WORK; }
+"commit"      { return TOK_COMMIT; }
+"rollback"    { return TOK_ROLLBACK; }
+"end"         { return TOK_END; }
+"abort"       { return TOK_ABORT; }
+
+  /* 语句前缀：EXPLAIN [ANALYZE] <语句> */
+"explain"     { return TOK_EXPLAIN; }
+"analyze"     { return TOK_ANALYZE; }
+
   /* 关键字字面量：必须排在标识符规则之前 */
 "null"      { return TOK_NULL; }
 "true"      { return TOK_TRUE; }

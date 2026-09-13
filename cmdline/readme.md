@@ -42,8 +42,10 @@ echo "SELECT 1" | ./build/sqldb             # 管道输入当脚本
 | `\begin` / `\commit` / `\rollback` | 事务控制（等价 `BEGIN` / `COMMIT` / `ROLLBACK`） |
 | `\?` | 元命令帮助 |
 
-事务也可以用 SQL 语句写（大小写不限，`START TRANSACTION` / `END` / `ABORT`
-是它们的别名），两种写法等价。事务进行中提示符会在库名后加 `*`：
+事务也可以用 SQL 语句写：`BEGIN [WORK|TRANSACTION]` / `COMMIT [WORK]` /
+`ROLLBACK [WORK]`，外加标准别名 `START TRANSACTION` / `END` / `ABORT`
+（大小写不限）。**这些关键字由语法层识别**（`parser/sql.y` 的
+`transaction_stmt`），`\begin` 只是给同一批语句加个外壳：
 
 ```
 shop> \begin
@@ -106,23 +108,34 @@ Table "users"
 
 ## EXPLAIN
 
-`EXPLAIN <SELECT|INSERT|UPDATE|DELETE>` 打印计划树，**不执行**语句
-（`EXPLAIN` 大小写不敏感，也可以直接调用 `session.explain(sql)`；
-DDL/USE 没有计划，会报 `NOT_SUPPORTED`）：
+`EXPLAIN <SELECT|INSERT|UPDATE|DELETE>` 打印计划树，**不执行**语句。
+`EXPLAIN`/`ANALYZE` 是**语法层的关键字**（`parser/sql.y` 的 `explain_stmt`），
+和别的语句走同一个 `session.execute()`；输出是**单列结果集**
+（列名 `QUERY PLAN`，一个算子一行），所以 CLI 不需要为它单开一个分支。
+DDL/USE/事务语句没有计划，会报 `NOT_SUPPORTED`：
 
 ```sql
 shop> EXPLAIN SELECT id, name FROM users WHERE age >= 30 ORDER BY id DESC LIMIT 2;
+QUERY PLAN
+-----------------------------------------------------------------
 Project([id, name])
   Limit(limit=2 offset=0)
     Filter(age >= 30)
       FullScan(users pk=id INT, desc)
+(4 rows)
 
 shop> EXPLAIN SELECT * FROM users WHERE id IN (1, 3, 5);
+QUERY PLAN
+-------------------------------------------------------------------------
 RangeUnion(users pk=id INT, [[1, 1], [3, 3], [5, 5]], asc)
+(1 row)
 
 shop> EXPLAIN UPDATE users SET age = 1 WHERE id = 3;
+QUERY PLAN
+--------------------------------------------------------------------
 Update(users pk=id)
   IndexScan(users pk=id INT, [3, 3], asc)
+(2 rows)
 ```
 
 读法（和 planner 的约定一一对应）：
@@ -140,26 +153,31 @@ Update(users pk=id)
 
 ```sql
 shop> EXPLAIN ANALYZE SELECT id FROM users WHERE age >= 30 ORDER BY age LIMIT 2;
+QUERY PLAN
+--------------------------------------------------------------------------
 Project([id])  [rows=2 time=94us]
   Limit(limit=2 offset=0)  [rows=2 time=90us]
     TopN(order_by=[age ASC] n=2)  [rows=2 time=92us]
       Filter(age >= 30)  [rows=2 time=75us]
         FullScan(users pk=id INT, asc)  [rows=3 time=69us]
 (2 rows in result)
+(6 rows)
 ```
 
 读法：`FullScan rows=3` 说明排序前确实读了 3 行；把它换成
 `SELECT id FROM users ORDER BY id LIMIT 2` 会看到 `FullScan rows=2` ——
 **LIMIT 早停是可以用数字证明的**。
+（表格最后的 `(6 rows)` 是"结果集有 6 行"，也就是 5 行计划 + 1 行
+`(2 rows in result)`；psql 的 EXPLAIN 也是这个形状。）
 
 实现：执行器的 `open/next/close` 是**非虚包装**，里面才调算子的
 `open_impl/next_impl/close_impl`，所以"数行数、记时间"只写一处
 （`exec::ExecReport`）；不传 report 时零开销，算子实现里只有一个空指针判断。
 
-实现上 `EXPLAIN` 是 **session 层的能力**（语法层没有这个关键字）：
-`Session::explain()` 复用 `prepare()` + `build_plan()` 两段流水线，只是不调执行器；
-它会把 `EXPLAIN` 前缀摘掉再解析，并把错误位置换算回原始文本，所以出错时
-高亮的仍是用户写的那一行。
+实现上：语法层把 `EXPLAIN [ANALYZE]` 包成 `NODE_EXPLAIN`，session 在
+`prepare()` 里拆掉这层（被解释的语句照常走 builder/validator/planner），
+然后复用 `build_plan()`，只是不调执行器（ANALYZE 才真的跑一遍）。
+位置信息全程是**原文里的列号**，所以出错时高亮的仍是用户写的那一行。
 
 ## 输出
 
@@ -196,8 +214,9 @@ CLI 在切分语句（按顶层 `;`，跳过引号里的分号）时记下每条
 
 ## 已知缺口
 
-- 没有 `EXPLAIN`（计划树已经能 `plan_tree_to_string`，接一个命令即可）；
-- 没有 `\d` 之类的元命令（`list databases/tables` 需要 session 暴露只读接口，已有 `catalog()`）；
-- 一次 `-e` 里多条语句是支持的（CLI 自己切分），但脚本不支持 `BEGIN/COMMIT`
-  （KV 层有事务接口，session 还没暴露）；
+- 事务/EXPLAIN 关键字（`BEGIN/COMMIT/ROLLBACK/EXPLAIN/ANALYZE/...`）是保留字，
+  不能当表名/列名用；
+- 保存点（`SAVEPOINT`）、`COMMIT AND CHAIN`、隔离级别语法都不支持
+  （会报明确原因）。事务是**悲观单写者**：第二个连接开事务会 `busy`；
+- 表格宽度按字节算，CJK 会略微不齐（要精确得算 East Asian Width）。
 - 表格宽度按字节算，CJK 会略微不齐（要精确得算 East Asian Width）。

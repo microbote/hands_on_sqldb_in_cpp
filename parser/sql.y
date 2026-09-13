@@ -58,6 +58,11 @@ static int sql_limit_to_int(int64_t value, int *out) {
 /* DDL */
 %token TOK_CREATE TOK_DROP TOK_DATABASE TOK_TABLE
 %token TOK_PRIMARY TOK_KEY
+/* 事务控制 */
+%token TOK_BEGIN TOK_COMMIT TOK_ROLLBACK TOK_START TOK_TRANSACTION TOK_WORK
+%token TOK_END TOK_ABORT
+/* 语句前缀 */
+%token TOK_EXPLAIN TOK_ANALYZE
 %token TOK_NULL TOK_TRUE TOK_FALSE
 %token TOK_LEX_ERROR
 
@@ -87,6 +92,12 @@ static int sql_limit_to_int(int64_t value, int *out) {
 %type <spec> data_type 
 %type <num> opt_nullable opt_primary_key
 
+/* 事务控制 */
+%type <node> transaction_stmt
+
+/* 语句前缀 */
+%type <node> explain_stmt
+
 
 %left TOK_OR
 %left TOK_AND
@@ -99,6 +110,7 @@ static int sql_limit_to_int(int64_t value, int *out) {
 
 input:
     statement ';'     { set_parsed_ast($1); }
+    | explain_stmt ';' { set_parsed_ast($1); }
     ;
 
 statement:
@@ -111,6 +123,7 @@ statement:
     | drop_db_stmt    { $$ = $1; }
     | create_table_stmt { $$ = $1; }
     | drop_table_stmt { $$ = $1; }
+    | transaction_stmt { $$ = $1; }
     ;
 
 
@@ -223,6 +236,81 @@ opt_nullable:
     %empty                { $$ = 1; }   /* 默认可为空 */
     | TOK_NOT TOK_NULL    { $$ = 0; }   /* NOT NULL */
     | TOK_NULL            { $$ = 1; }   /* 显式 NULL */
+    ;
+
+/* ============================================================
+   EXPLAIN [ANALYZE] <语句>
+
+   只是给语句加一层"不要执行、给我计划"的前缀：包成一个 NODE_EXPLAIN
+   节点，被解释的语句还是原来的节点类型（session 拆掉这层后照常走
+   builder/validator/planner）。EXPLAIN 的输出不是查询结果，所以
+   sql::Query 里没有它。
+   ============================================================ */
+explain_stmt:
+    TOK_EXPLAIN statement {
+        $$ = make_explain_node(0, $2);
+        AST_SET_SPAN($$, @$);
+    }
+    | TOK_EXPLAIN TOK_ANALYZE statement {
+        $$ = make_explain_node(1, $3);
+        AST_SET_SPAN($$, @$);
+    }
+    ;
+
+/* ============================================================
+   事务控制：BEGIN / COMMIT / ROLLBACK
+
+   语法层只负责"认出这是哪一种事务操作"，执行（开事务/提交/回滚、
+   "事务已中止"之类的会话状态）在 session 层，因为它需要连接级状态。
+   这里同时给出标准别名与明确报错的未支持形式（比 "syntax error" 有用）。
+   ============================================================ */
+transaction_stmt:
+    TOK_BEGIN                    { $$ = make_transaction_node(TXN_BEGIN);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_BEGIN TOK_WORK         { $$ = make_transaction_node(TXN_BEGIN);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_BEGIN TOK_TRANSACTION  { $$ = make_transaction_node(TXN_BEGIN);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_START TOK_TRANSACTION  { $$ = make_transaction_node(TXN_BEGIN);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_COMMIT                 { $$ = make_transaction_node(TXN_COMMIT);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_COMMIT TOK_WORK        { $$ = make_transaction_node(TXN_COMMIT);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_END                    { $$ = make_transaction_node(TXN_COMMIT);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_END TOK_WORK           { $$ = make_transaction_node(TXN_COMMIT);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_ROLLBACK               { $$ = make_transaction_node(TXN_ROLLBACK);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_ROLLBACK TOK_WORK      { $$ = make_transaction_node(TXN_ROLLBACK);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_ABORT                  { $$ = make_transaction_node(TXN_ROLLBACK);
+                                   AST_SET_SPAN($$, @$); }
+    | TOK_ABORT TOK_WORK         { $$ = make_transaction_node(TXN_ROLLBACK);
+                                   AST_SET_SPAN($$, @$); }
+    /* ---- 明确报错的未支持形式 ---- */
+    | TOK_BEGIN TOK_IDENT {
+        yyerror("transaction modes are not supported (use plain BEGIN)");
+        YYERROR;
+    }
+    | TOK_START TOK_TRANSACTION TOK_IDENT {
+        yyerror("transaction modes are not supported (use START TRANSACTION)");
+        YYERROR;
+    }
+    | TOK_COMMIT TOK_AND TOK_IDENT {
+        yyerror("COMMIT AND CHAIN/NO CHAIN is not supported");
+        YYERROR;
+    }
+    | TOK_ROLLBACK TOK_AND TOK_IDENT {
+        yyerror("ROLLBACK AND CHAIN/NO CHAIN is not supported");
+        YYERROR;
+    }
+    | TOK_ROLLBACK TOK_IDENT {
+        /* 只可能是 ROLLBACK TO [SAVEPOINT] name —— 我们没有保存点 */
+        yyerror("ROLLBACK TO SAVEPOINT is not supported");
+        YYERROR;
+    }
     ;
 
 /* ============================================================

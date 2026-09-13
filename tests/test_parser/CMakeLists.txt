@@ -11,6 +11,8 @@ add_executable(test_parser
     test_source_span.cpp
     test_lex_tokens.cpp
     test_error_reporting.cpp
+    test_transaction.cpp
+    test_explain.cpp
 )
 
 # 链接 parser（自带 flex/bison 生成步骤）与 sql_types（用于别名一致性测试）

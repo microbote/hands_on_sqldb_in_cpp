@@ -60,6 +60,8 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
 |------|------|
 | DDL | `CREATE/DROP DATABASE`、`CREATE/DROP TABLE`、内联 `PRIMARY KEY`、`NOT NULL` / `NULL` |
 | DML | `SELECT`（含 `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`）、`INSERT`（多行值/列列表）、`UPDATE`、`DELETE` |
+| 事务 | `BEGIN [WORK\|TRANSACTION]`、`START TRANSACTION`、`COMMIT [WORK]`、`END [WORK]`、`ROLLBACK [WORK]`、`ABORT [WORK]`（别名在语法动作里归一化成 `TXN_BEGIN/TXN_COMMIT/TXN_ROLLBACK`） |
+| 语句前缀 | `EXPLAIN [ANALYZE] <语句>` → `NODE_EXPLAIN`（包住被解释的语句；不是查询，由 session 拆掉） |
 | 条件 | `= != <> > >= < <=`、`AND/OR/NOT`、`IN/NOT IN`、`LIKE/NOT LIKE`、`IS [NOT] NULL`、括号分组 |
 | 类型 | `TINYINT/INT8`、`SMALLINT/INT16`、`INT/INTEGER/INT32`、`BIGINT/INT64`、`CHAR(n)`、`VARCHAR(n)`/`VARYING`、`TEXT`、`BOOLEAN/BOOL`、`DATE`、`TIME`、`DATETIME/TIMESTAMP` |
 | 字面量 | 整数（int64，越界报错）、负数、`NULL`、`TRUE`/`FALSE`、字符串（支持 `''` 转义） |
@@ -73,6 +75,7 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
 | `IF NOT EXISTS` / `IF EXISTS` | DDL 幂等语法 |
 | 双引号/反引号标识符 | `"col"`、`` `col` ``；字符串请用单引号 |
 | 字符串反斜杠转义 | `'\n'`、`\'`（标准 SQL 的 `''` 已支持） |
+| 保存点与事务模式 | `SAVEPOINT`、`ROLLBACK TO SAVEPOINT`、`COMMIT AND CHAIN`、`START TRANSACTION ISOLATION LEVEL ...`（**给明确原因**，不是笼统的 syntax error） |
 | 其它 | JOIN、子查询、`DISTINCT`、聚合、`GROUP BY`/`HAVING`、`BETWEEN`、算术表达式 |
 
 ## 错误处理约定
@@ -92,5 +95,18 @@ ctest --test-dir build -R 'test_parser|test_sql_types' --output-on-failure
   因为 `parser.tab.c` / `lex.yy.c` 是按 C 编译的。
 - `yyerror` 由 `sql.y` 声明、`parser.cpp` 定义（C 链接）。
 - `LIMIT/OFFSET` 的 AST 字段是 `int`，解析时做范围检查。
+- **不要对 `sql.l` / `sql.y` 跑 clang-format**：它们不是 C/C++（`%{`、`%token`、
+  `%type` 会被当成代码重排/重缩进，flex/bison 直接报 `bad character: #`）。
+  这两个文件按现有风格手写；`ast.cpp` / `ast.h` 照常格式化。
 - AST 节点注册表 `nodes[]` 按 `NodeType` 顺序排列，并有编译期长度检查，
   新增节点时同时改 `NodeType`、结构体与注册表。
+- 事务关键字（`BEGIN/START/TRANSACTION/WORK/COMMIT/END/ROLLBACK/ABORT`）
+  **是保留字**：与 `END/DESC` 等一样不能再当表名/列名用（标准 SQL 里
+  `BEGIN/COMMIT/ROLLBACK/END/ABORT/START` 本来就是保留字，多出来的是
+  `TRANSACTION`/`WORK`）。语法层不认识它们、由上层用文本匹配识别时，
+  注释、大小写、`EXPLAIN BEGIN` 之类的组合会绕过词法/语法检查 ——
+  所以它们放在这里，并且高亮自动跟随（见 `tests/test_parser/test_transaction.cpp`）。
+- `EXPLAIN`/`ANALYZE` 同理也是保留字。`EXPLAIN` 的 AST 是**前缀节点**
+  `NODE_EXPLAIN{analyze, statement}`：它包住被解释的语句（内层节点类型不变），
+  这样 `EXPLAIN BEGIN` / `EXPLAIN SELCT` 在语法层就能定位、高亮、报错，
+  而"要不要执行"由 session 决定（见 `tests/test_parser/test_explain.cpp`）。

@@ -25,15 +25,15 @@ TEST(CostModel, PointLookupsLoseOnTinyTable) {
   CHECK(sess_test::bootstrap(session, 3)); // 3 行表
 
   // 2 个点：2*(seek+row) = 4 > 3 行 -> 退化成全表扫，谓词放回过滤条件
-  auto planned =
-      session.explain("EXPLAIN SELECT * FROM users WHERE id IN (1, 3)");
-  CHECK(planned.has_value());
-  if (!planned.has_value()) {
+  auto planned = sess_test::explain(
+      session, "EXPLAIN SELECT * FROM users WHERE id IN (1, 3)");
+  CHECK(planned.ok);
+  if (!planned.ok) {
     return;
   }
-  CHECK(contains(*planned, "FullScan"));
-  CHECK(!contains(*planned, "RangeUnion"));
-  CHECK(contains(*planned, "Filter(id IN (1, 3))")); // 正确性靠它兜底
+  CHECK(contains(planned.text, "FullScan"));
+  CHECK(!contains(planned.text, "RangeUnion"));
+  CHECK(contains(planned.text, "Filter(id IN (1, 3))")); // 正确性靠它兜底
 }
 
 TEST(CostModel, PointLookupsWinOnLargeTable) {
@@ -41,14 +41,14 @@ TEST(CostModel, PointLookupsWinOnLargeTable) {
   session::Session session(engine);
   CHECK(sess_test::bootstrap(session, 100)); // 100 行表
 
-  auto planned =
-      session.explain("EXPLAIN SELECT * FROM users WHERE id IN (1, 3)");
-  CHECK(planned.has_value());
-  if (!planned.has_value()) {
+  auto planned = sess_test::explain(
+      session, "EXPLAIN SELECT * FROM users WHERE id IN (1, 3)");
+  CHECK(planned.ok);
+  if (!planned.ok) {
     return;
   }
-  CHECK(contains(*planned, "RangeUnion"));
-  CHECK(!contains(*planned, "Filter("));
+  CHECK(contains(planned.text, "RangeUnion"));
+  CHECK(!contains(planned.text, "Filter("));
 }
 
 TEST(CostModel, FallbackKeepsResultsIdentical) {
@@ -78,18 +78,19 @@ TEST(CostModel, PlansCarryEstimatedCost) {
   session::Session session(engine);
   CHECK(sess_test::bootstrap(session, 100));
 
-  auto planned = session.explain("EXPLAIN SELECT id FROM users WHERE id = 5");
-  CHECK(planned.has_value());
-  if (planned.has_value()) {
-    CHECK(contains(*planned, "cost="));
+  auto planned =
+      sess_test::explain(session, "EXPLAIN SELECT id FROM users WHERE id = 5");
+  CHECK(planned.ok);
+  if (planned.ok) {
+    CHECK(contains(planned.text, "cost="));
   }
   // ANALYZE 输出里同时有估算成本与实际行数
-  auto analyzed =
-      session.explain("EXPLAIN ANALYZE SELECT id FROM users WHERE id = 5");
-  CHECK(analyzed.has_value());
-  if (analyzed.has_value()) {
-    CHECK(contains(*analyzed, "cost="));
-    CHECK(contains(*analyzed, "[rows=1 "));
+  auto analyzed = sess_test::explain(
+      session, "EXPLAIN ANALYZE SELECT id FROM users WHERE id = 5");
+  CHECK(analyzed.ok);
+  if (analyzed.ok) {
+    CHECK(contains(analyzed.text, "cost="));
+    CHECK(contains(analyzed.text, "[rows=1 "));
   }
 }
 

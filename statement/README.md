@@ -16,6 +16,16 @@ SQL 文本 --parser--> AST --StatementBuilder--> sql::Query --StatementValidator
 
 辅助：`statement/source_span.h`（位置格式化、caret 渲染、名字→位置解析）。
 
+事务控制语句（`BEGIN` / `COMMIT` / `ROLLBACK`，别名在语法层已归一化）走的是
+**纯结构转换**：`NODE_TRANSACTION` → `sql::TransactionStmt{kind}`，
+校验层直接放行 —— 因为"是否已经在事务里 / 能不能开始事务"是**会话状态**，
+属于 session 层，builder/validator 不碰（见 `session/session.cpp` 的
+`execute()` 分派）。
+
+`NODE_EXPLAIN`（`EXPLAIN [ANALYZE] <语句>`）**不是查询**，所以 builder 不认它：
+调用方（session）要在 `prepare()` 里先拆掉这层，把内层语句交给 builder；
+直接扔进来会得到 `UNSUPPORTED_AST_NODE`，而不是被当成普通语句执行。
+
 调用方（未来的执行器/shell）需要自己把通过校验的 DDL 落到 Catalog 上，
 或者走上层事务接口 —— validator 是只读的。
 
@@ -145,4 +155,3 @@ SQL 文本 ──► parser/sql.l（唯一的词法规则）
   所以"去掉 ANSI 转义后 == 原文"是一条可测的不变量（已有用例）。
 - 限制：`lex_collect_tokens()` 会自行建立/销毁扫描缓冲，**不能在 `yyparse()`
   进行中调用**；它与解析器一样是非重入的。
-

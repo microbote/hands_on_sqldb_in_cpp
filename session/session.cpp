@@ -52,128 +52,37 @@ SessionError from_plan_error(SessionErrorCode code,
 
 SessionError from_exec_error(const exec::ExecError &error,
                              const std::string &sql) {
-  return SessionError(SessionErrorCode::EXECUTE_ERROR, error.to_string(), sql);
+  const SessionErrorCode code =
+      error.code == exec::ExecErrorCode::CONSTRAINT_VIOLATION
+          ? SessionErrorCode::CONSTRAINT_VIOLATION
+          : SessionErrorCode::EXECUTE_ERROR;
+  return SessionError(code, error.to_string(), sql);
 }
 
 SessionError from_cursor_error(const sql::CursorError &error,
                                const std::string &sql) {
-  return SessionError(SessionErrorCode::EXECUTE_ERROR, error.to_string(), sql);
+  const SessionErrorCode code =
+      error.code == sql::CursorErrorCode::CONSTRAINT_VIOLATION
+          ? SessionErrorCode::CONSTRAINT_VIOLATION
+          : SessionErrorCode::EXECUTE_ERROR;
+  return SessionError(code, error.to_string(), sql);
 }
 
-// ---- EXPLAIN 前缀处理 ----
-//
-// `EXPLAIN SELECT ...` 是 session/CLI 层的能力（语法层没有这个关键字）：
-// 这里把前缀摘掉，并记下"摘掉了多少列"，好把错误位置换算回原始文本。
-struct StrippedExplain {
-  std::string text;
-  uint32_t column_shift = 0; // 首行列偏移（前缀在第 1 行）
-  bool had_prefix = false;
-  bool analyze = false; // EXPLAIN ANALYZE
-};
-
-bool is_space(char c) {
-  return std::isspace(static_cast<unsigned char>(c)) != 0;
-}
-
-// 从 pos 起匹配一个独立的关键字（大小写不敏感）；成功返回关键字之后的偏移
-bool match_keyword(const std::string &sql, size_t pos, const char *keyword,
-                   size_t *after) {
-  const size_t length = std::string(keyword).size();
-  if (sql.size() < pos + length) {
-    return false;
-  }
-  for (size_t i = 0; i < length; ++i) {
-    const char c = static_cast<char>(
-        std::tolower(static_cast<unsigned char>(sql[pos + i])));
-    if (c != keyword[i]) {
-      return false;
+// 把多行文本切成行（EXPLAIN 的"一行一个结果行"用）：
+// 末尾的空行不产生结果行（否则会多出一行空行）。
+std::vector<std::string> split_lines(const std::string &text) {
+  std::vector<std::string> lines;
+  size_t begin = 0;
+  while (begin < text.size()) {
+    const size_t end = text.find('\n', begin);
+    if (end == std::string::npos) {
+      lines.push_back(text.substr(begin));
+      break;
     }
+    lines.push_back(text.substr(begin, end - begin));
+    begin = end + 1;
   }
-  const size_t end = pos + length;
-  if (end < sql.size() && !is_space(sql[end])) {
-    return false; // explainxxx 这种词不算
-  }
-  *after = end;
-  return true;
-}
-
-// 整条语句就是一个事务控制关键字？（BEGIN / COMMIT / ROLLBACK 及其别名）
-// 返回归一化后的命令名。
-std::optional<std::string> transaction_command(const std::string &statement) {
-  size_t end = statement.size();
-  while (end > 0 &&
-         (statement[end - 1] == ';' || is_space(statement[end - 1]))) {
-    --end;
-  }
-  size_t begin = 0;
-  while (begin < end && is_space(statement[begin])) {
-    ++begin;
-  }
-  std::string word = statement.substr(begin, end - begin);
-  for (char &c : word) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  if (word == "BEGIN" || word == "START TRANSACTION") {
-    return std::string("BEGIN");
-  }
-  if (word == "COMMIT" || word == "END") {
-    return std::string("COMMIT");
-  }
-  if (word == "ROLLBACK" || word == "ABORT") {
-    return std::string("ROLLBACK");
-  }
-  return std::nullopt;
-}
-
-StrippedExplain strip_explain_prefix(const std::string &sql) {
-  StrippedExplain result;
-  size_t begin = 0;
-  while (begin < sql.size() && is_space(sql[begin])) {
-    ++begin;
-  }
-  size_t rest = 0;
-  if (!match_keyword(sql, begin, "explain", &rest)) {
-    result.text = sql;
-    return result;
-  }
-  // 可选的 ANALYZE（跟在 EXPLAIN 后面）
-  size_t scan_from = rest;
-  while (scan_from < sql.size() && is_space(sql[scan_from])) {
-    ++scan_from;
-  }
-  size_t after_analyze = 0;
-  if (match_keyword(sql, scan_from, "analyze", &after_analyze)) {
-    result.analyze = true;
-    rest = after_analyze;
-  }
-  while (rest < sql.size() && is_space(sql[rest])) {
-    ++rest;
-  }
-  result.text = rest < sql.size() ? sql.substr(rest) : std::string();
-  result.column_shift = static_cast<uint32_t>(rest);
-  result.had_prefix = true;
-  return result;
-}
-
-// 把"摘掉 EXPLAIN 之后"的列号换算回原始文本；同时把 error.sql 换回原始文本
-// —— 否则 highlight() 会在摘掉前缀的文本上按绝对列号取片段，位置会偏。
-SessionError restore_original_text(SessionError error,
-                                   const std::string &original,
-                                   uint32_t shift) {
-  if (shift == 0) {
-    return error;
-  }
-  error.sql = original;
-  if (!sspan_valid(error.span)) {
-    return error;
-  }
-  if (error.span.begin_line == 1) {
-    error.span.begin_column += shift;
-  }
-  if (error.span.end_line == 1) {
-    error.span.end_column += shift;
-  }
-  return error;
+  return lines;
 }
 
 // 计划里目标表的库名/表名（扫描节点或写节点上都带着）
@@ -294,7 +203,7 @@ plan::StatsProvider Session::stats_provider() const {
 }
 
 // pipeline 前半段：解析 + 建 Query + 语义校验（execute/explain 共用）
-std::expected<sql::Query, SessionError>
+std::expected<Session::Prepared, SessionError>
 Session::prepare(const std::string &statement) {
   // ---- 1) 解析 ----
   parser::Parser parser;
@@ -316,23 +225,39 @@ Session::prepare(const std::string &statement) {
     return std::unexpected(std::move(error));
   }
 
-  // ---- 2) AST -> Query ----
+  // ---- 2) 拆掉 EXPLAIN 前缀（语法层给的 NODE_EXPLAIN）----
+  // 被解释的还是原来那条语句：位置、错误的处理都跟平时一样
+  const ASTNode *root = parsed.ast.get();
+  bool explain = false;
+  bool analyze = false;
+  if (root->type == NODE_EXPLAIN) {
+    const auto *node = reinterpret_cast<const ExplainNode *>(root->data);
+    explain = true;
+    analyze = node->analyze != 0;
+    root = node->statement;
+    if (root == nullptr) {
+      return std::unexpected(SessionError(SessionErrorCode::BUILD_ERROR,
+                                          "EXPLAIN has no statement",
+                                          statement));
+    }
+  }
+
+  // ---- 3) AST -> Query ----
   stmt::StatementBuilder builder;
-  auto query = builder.build(parsed.ast.get());
+  auto query = builder.build(root);
   if (!query.has_value()) {
     return std::unexpected(from_stmt_error(SessionErrorCode::BUILD_ERROR,
                                            query.error(), statement));
   }
 
-  // ---- 3) 语义校验（带"名字 -> 位置"解析器，错误能定位到 SQL 片段）----
-  stmt::StatementValidator validator(
-      catalog_, stmt::make_span_resolver(parsed.ast.get()));
+  // ---- 4) 语义校验（带"名字 -> 位置"解析器，错误能定位到 SQL 片段）----
+  stmt::StatementValidator validator(catalog_, stmt::make_span_resolver(root));
   auto valid = validator.validate(*query);
   if (!valid.has_value()) {
     return std::unexpected(from_stmt_error(SessionErrorCode::VALIDATE_ERROR,
                                            valid.error(), statement));
   }
-  return std::move(*query);
+  return Prepared{std::move(*query), explain, analyze};
 }
 
 // pipeline 后半段：重写 -> 优化 -> 生成计划树（execute/explain 共用）
@@ -377,36 +302,49 @@ Session::execute(const std::string &sql) {
                                         statement));
   }
 
-  // ---- 事务控制：BEGIN / COMMIT / ROLLBACK ----
-  if (const auto command = transaction_command(statement);
-      command.has_value()) {
-    if (*command == "BEGIN") {
-      return begin_transaction(statement);
+  auto prepared = prepare(statement);
+  // ---- 事务控制：BEGIN / COMMIT / ROLLBACK（语法层认出来，这里执行）----
+  // 放在"事务已中止"检查之前：中止状态下唯一还能跑的就是 ROLLBACK。
+  // `EXPLAIN BEGIN` 不走这条（下面单独处理）：被解释的事务语句不会执行。
+  if (prepared.has_value() && !prepared->explain) {
+    if (const sql::TransactionStmt *tx = prepared->query.transaction();
+        tx != nullptr) {
+      switch (tx->kind) {
+      case sql::TransactionKind::BEGIN:
+        return begin_transaction(statement);
+      case sql::TransactionKind::COMMIT:
+        return commit_transaction(statement);
+      case sql::TransactionKind::ROLLBACK:
+        return rollback_transaction(statement);
+      }
     }
-    if (*command == "COMMIT") {
-      return commit_transaction(statement);
-    }
-    return rollback_transaction(statement);
   }
   // 事务里出过错之后只允许 ROLLBACK：否则失败的语句会留下半截改动
+  // （这里先报"事务已中止"，连语法错误也被它盖住 —— 与 Postgres 一致）
   if (tx_failed_) {
     return std::unexpected(SessionError(
         SessionErrorCode::TRANSACTION_ERROR,
         "current transaction is aborted; issue ROLLBACK", statement));
   }
+  if (!prepared.has_value()) {
+    return std::unexpected(prepared.error());
+  }
+  const sql::Query &query = prepared->query;
 
-  auto query = prepare(statement);
-  if (!query.has_value()) {
-    return std::unexpected(query.error());
+  // EXPLAIN：被解释的语句**不执行**（ANALYZE 才真的跑一遍），输出是
+  // 单列文本结果集。放在"事务已中止"检查之后 —— 中止的事务里连 EXPLAIN
+  // 也不许跑（ANALYZE 会真的读数据），和 Postgres 的语义一致。
+  if (prepared->explain) {
+    return execute_explain(query, prepared->analyze, statement);
   }
 
   // 写语句 / DDL / USE：整个语句包成一个事务（自动提交）。
   // 读语句不开事务（不需要原子性，也不该长期占着写锁）。
   // 守卫在析构时自动回滚 —— 下面任何提前 return 都不会留下半截写。
   const bool own_transaction = !in_transaction_; // 显式事务里让位给事务本身
-  AutoCommit auto_commit(
-      (own_transaction && !query->is_select()) ? engine_.get() : nullptr);
-  if (own_transaction && !query->is_select() && !auto_commit.active()) {
+  AutoCommit auto_commit((own_transaction && !query.is_select()) ? engine_.get()
+                                                                 : nullptr);
+  if (own_transaction && !query.is_select() && !auto_commit.active()) {
     return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
                                         "cannot begin transaction (busy?)",
                                         statement));
@@ -432,16 +370,16 @@ Session::execute(const std::string &sql) {
       };
 
   // DDL / USE：没有行流，直接落到 Catalog
-  if (query->is_ddl() || query->is_ctrl()) {
-    return finish(execute_catalog_statement(*query, statement));
+  if (query.is_ddl() || query.is_ctrl()) {
+    return finish(execute_catalog_statement(query, statement));
   }
-  if (!query->is_dml()) {
-    return std::unexpected(SessionError(
-        SessionErrorCode::NOT_SUPPORTED,
-        "unsupported statement: " + query->to_string(), statement));
+  if (!query.is_dml()) {
+    return std::unexpected(
+        SessionError(SessionErrorCode::NOT_SUPPORTED,
+                     "unsupported statement: " + query.to_string(), statement));
   }
 
-  auto planned = build_plan(*query, statement);
+  auto planned = build_plan(query, statement);
   if (!planned.has_value()) {
     return std::unexpected(planned.error());
   }
@@ -469,9 +407,9 @@ Session::execute(const std::string &sql) {
   if ((*cursor)->root()->is_write() && (*cursor)->affected_rows() > 0) {
     const int64_t affected = static_cast<int64_t>((*cursor)->affected_rows());
     int64_t delta = 0; // UPDATE 不改行数
-    if (query->is_insert()) {
+    if (query.is_insert()) {
       delta = affected;
-    } else if (query->is_delete()) {
+    } else if (query.is_delete()) {
       delta = -affected;
     }
     catalog_.touch_table(plan_db(**planned), plan_table(**planned), delta);
@@ -627,71 +565,62 @@ Session::table_schema(const sql::Identifier &table,
 
 // ============================================================
 // EXPLAIN
+//
+// 和别的语句走同一个入口（execute），只是不执行被解释的语句：
+//   EXPLAIN <语句>          -> 计划文本（每个算子一行）
+//   EXPLAIN ANALYZE <查询>  -> 真跑一遍，每行带上实际行数/耗时
+//
+// 输出是**单列结果集**（列名 "QUERY PLAN"），所以客户端用同一套
+// next()/close() 取行；CLI 不再需要"这是不是 EXPLAIN"的文本判断。
 // ============================================================
-std::expected<std::string, SessionError>
-Session::explain(const std::string &sql, bool analyze) {
-  const StrippedExplain stripped = strip_explain_prefix(sql);
-  const bool want_analyze = analyze || stripped.analyze;
-  const std::string statement = normalize_sql(stripped.text);
-  const auto shifted = [&](SessionError error) {
+std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+Session::execute_explain(const sql::Query &query, bool analyze,
+                         const std::string &statement) {
+  if (query.is_transaction()) {
+    // 事务控制语句执行的是会话状态（开/提交/回滚），没有计划可看
     return std::unexpected(
-        restore_original_text(std::move(error), sql, stripped.column_shift));
-  };
-
-  if (statement.empty() || statement == ";") {
-    return std::unexpected(
-        SessionError(SessionErrorCode::EMPTY_SQL, "empty statement", sql));
+        SessionError(SessionErrorCode::NOT_SUPPORTED,
+                     "EXPLAIN does not apply to transaction statements: " +
+                         query.to_string(),
+                     statement));
   }
-  if (!catalog_.is_open()) {
-    return shifted(SessionError(SessionErrorCode::EXECUTE_ERROR,
-                                "storage engine is not open", statement));
-  }
-
-  auto query = prepare(statement);
-  if (!query.has_value()) {
-    return shifted(query.error());
-  }
-  if (query->is_ddl() || query->is_ctrl()) {
+  if (query.is_ddl() || query.is_ctrl() || !query.is_dml()) {
     // DDL/USE 没有计划树：只是 Catalog 上的一次动作
-    return shifted(SessionError(
+    return std::unexpected(SessionError(
         SessionErrorCode::NOT_SUPPORTED,
         "EXPLAIN only supports SELECT/INSERT/UPDATE/DELETE", statement));
   }
-  if (!query->is_dml()) {
-    return shifted(SessionError(SessionErrorCode::NOT_SUPPORTED,
-                                "unsupported statement: " + query->to_string(),
-                                statement));
+
+  auto planned = build_plan(query, statement);
+  if (!planned.has_value()) {
+    return std::unexpected(planned.error());
   }
 
-  auto planned = build_plan(*query, statement);
-  if (!planned.has_value()) {
-    return shifted(planned.error());
-  }
-  // 注意：这里**不执行**，只看计划
-  if (!want_analyze) {
-    // 普通 EXPLAIN：**不执行**，只看计划
-    return plan::plan_tree_to_string(**planned);
+  // 普通 EXPLAIN：**不执行**，只看计划
+  if (!analyze) {
+    return exec::text_result("QUERY PLAN",
+                             split_lines(plan::plan_tree_to_string(**planned)));
   }
 
   // EXPLAIN ANALYZE：真的执行一遍。只允许 SELECT —— 写语句会真的改数据，
-  // 这里直接拒绝（要分析写语句得等事务支持，包在 ROLLBACK 里跑）。
-  if (!query->is_select()) {
-    return shifted(SessionError(
+  // 这里直接拒绝（要分析写语句得把它包在事务里跑完再回滚）。
+  if (!query.is_select()) {
+    return std::unexpected(SessionError(
         SessionErrorCode::NOT_SUPPORTED,
         "EXPLAIN ANALYZE only supports SELECT (it would really modify data)",
         statement));
   }
   auto table = catalog_.open_table(plan_db(**planned), plan_table(**planned));
   if (!table.has_value()) {
-    return shifted(SessionError(SessionErrorCode::EXECUTE_ERROR,
-                                table.error().to_string(), statement));
+    return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
+                                        table.error().to_string(), statement));
   }
   auto shared_table = std::make_shared<sql::Table>(std::move(*table));
 
   exec::ExecReport report;
   auto cursor = exec::execute(**planned, std::move(shared_table), &report);
   if (!cursor.has_value()) {
-    return shifted(from_exec_error(cursor.error(), statement));
+    return std::unexpected(from_exec_error(cursor.error(), statement));
   }
   // 拉完整个结果流：统计只有跑完才完整
   size_t rows = 0;
@@ -702,16 +631,17 @@ Session::explain(const std::string &sql, bool analyze) {
       continue;
     }
     if (row.error().is_error()) {
-      return shifted(from_cursor_error(row.error(), statement));
+      return std::unexpected(from_cursor_error(row.error(), statement));
     }
     break;
   }
   (*cursor)->close();
 
-  std::string text = exec::explain_text(**planned, &report);
-  text += "(" + std::to_string(rows) + " row" + (rows == 1 ? "" : "s") +
-          " in result)\n";
-  return text;
+  std::vector<std::string> lines =
+      split_lines(exec::explain_text(**planned, &report));
+  lines.push_back("(" + std::to_string(rows) + " row" + (rows == 1 ? "" : "s") +
+                  " in result)");
+  return exec::text_result("QUERY PLAN", std::move(lines));
 }
 
 // ============================================================

@@ -1031,6 +1031,79 @@ void free_column_def_node(ASTNode *node) {
 }
 
 /* ============================================================
+   NODE_TRANSACTION
+   ============================================================ */
+const char *transaction_kind_to_string(AstTransactionKind kind) {
+  switch (kind) {
+  case TXN_BEGIN:
+    return "BEGIN";
+  case TXN_COMMIT:
+    return "COMMIT";
+  case TXN_ROLLBACK:
+    return "ROLLBACK";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+ASTNode *make_transaction_node(AstTransactionKind kind) {
+  ASTNode *node = ast_alloc_node(NODE_TRANSACTION, sizeof(TransactionNode));
+  USE_DATA(data, node, TransactionNode);
+  if (data == nullptr) {
+    free(node);
+    return NULL;
+  }
+  data->kind = kind;
+  return node;
+}
+
+int print_transaction_node(ASTNode *node, int indent, int offset, char *buffer,
+                           size_t buffer_size) {
+  TransactionNode *data = (TransactionNode *)node->data;
+  offset = append_indent(buffer, buffer_size, offset, indent);
+  offset = safe_append(buffer, buffer_size, offset, "TRANSACTION(%s)\n",
+                       transaction_kind_to_string(data->kind));
+  return offset;
+}
+
+void free_transaction_node(ASTNode *node) { free(node); }
+
+/* ============================================================
+   NODE_EXPLAIN
+   ============================================================ */
+ASTNode *make_explain_node(int analyze, ASTNode *statement) {
+  ASTNode *node = ast_alloc_node(NODE_EXPLAIN, sizeof(ExplainNode));
+  USE_DATA(data, node, ExplainNode);
+  if (data == nullptr) {
+    free(node);
+    return NULL;
+  }
+  data->analyze = analyze;
+  data->statement = statement;
+  return node;
+}
+
+int print_explain_node(ASTNode *node, int indent, int offset, char *buffer,
+                       size_t buffer_size) {
+  ExplainNode *data = (ExplainNode *)node->data;
+  offset = append_indent(buffer, buffer_size, offset, indent);
+  offset = safe_append(buffer, buffer_size, offset, "EXPLAIN(analyze=%d)\n",
+                       data->analyze);
+  // 被解释的语句缩进一层打印（它才是主体）
+  offset =
+      print_node(data->statement, step(indent), offset, buffer, buffer_size);
+  return offset;
+}
+
+void free_explain_node(ASTNode *node) {
+  ExplainNode *data = (ExplainNode *)node->data;
+  if (data->statement != nullptr) {
+    free_ast(data->statement);
+  }
+  free(node);
+}
+
+/* ============================================================
    NodeLifetime 注册表
 
    纯 C 风格：按 NodeType 的声明顺序逐个列出（不使用指定下标初始化），
@@ -1091,6 +1164,12 @@ static NodeLifetime nodes[NODE_TYPE_COUNT] = {
     {NODE_COLUMN_DEF, (NodeDataConstructor)make_column_def_node,
      (NodeDataDestructor)free_column_def_node,
      (NodeDataPrinter)print_column_def_node},
+    {NODE_TRANSACTION, (NodeDataConstructor)make_transaction_node,
+     (NodeDataDestructor)free_transaction_node,
+     (NodeDataPrinter)print_transaction_node},
+    {NODE_EXPLAIN, (NodeDataConstructor)make_explain_node,
+     (NodeDataDestructor)free_explain_node,
+     (NodeDataPrinter)print_explain_node},
 };
 
 /* 编译期检查：登记表必须覆盖 NODE_TYPE_COUNT 个节点（纯 C，不用 C++） */

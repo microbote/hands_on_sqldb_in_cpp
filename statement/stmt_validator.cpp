@@ -96,6 +96,11 @@ StatementValidator::validate(const sql::Query &stmt) const {
     return failed(
         make_error(StmtErrorCode::UNKNOWN_STMT_TYPE, "unknown statement type"));
   }
+  // 事务控制语句没有库/表/列可校验：执行期的会话状态检查（是否已在事务里、
+  // 能否开始事务）需要连接状态，属于 session 层的事
+  if (stmt.is_transaction()) {
+    return ok();
+  }
   if (stmt.is_ddl()) {
     return validate_ddl(stmt);
   }

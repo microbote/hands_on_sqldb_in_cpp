@@ -16,6 +16,9 @@ CursorError to_cursor_error(const RelError &error) {
     return CursorError(CursorErrorCode::NOT_FOUND, error.to_string());
   case RelErrorCode::SCHEMA_ERROR:
     return CursorError(CursorErrorCode::SCHEMA_ERROR, error.to_string());
+  case RelErrorCode::DUPLICATE_PRIMARY_KEY:
+    return CursorError(CursorErrorCode::CONSTRAINT_VIOLATION,
+                       error.to_string());
   case RelErrorCode::NOT_OPEN:
   case RelErrorCode::KV_ERROR:
     return CursorError(CursorErrorCode::IO_ERROR, error.to_string());

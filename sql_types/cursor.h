@@ -34,7 +34,8 @@ enum class CursorErrorCode : uint8_t {
   OK = 0,
   END, // 流正常结束（不是错误）
   NOT_FOUND,
-  SCHEMA_ERROR, // 行与 schema 不匹配（数据损坏）
+  SCHEMA_ERROR,         // 行与 schema 不匹配（数据损坏）
+  CONSTRAINT_VIOLATION, // 约束不满足（主键重复等）
   INVALID_ARGUMENT,
   IO_ERROR,
   INTERNAL,
@@ -50,6 +51,8 @@ inline const char *cursor_error_message(CursorErrorCode code) {
     return "Row not found";
   case CursorErrorCode::SCHEMA_ERROR:
     return "Row does not match schema";
+  case CursorErrorCode::CONSTRAINT_VIOLATION:
+    return "Constraint violation";
   case CursorErrorCode::INVALID_ARGUMENT:
     return "Invalid argument";
   case CursorErrorCode::IO_ERROR:

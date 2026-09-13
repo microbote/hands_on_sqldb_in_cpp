@@ -454,4 +454,11 @@ execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table,
 // 有它，"一条 SQL -> 一个游标"的调用约定就能统一。
 std::unique_ptr<ResultCursor> empty_result();
 
+// 一个"文本结果集"游标：单列（列名由调用方给，例如 "QUERY PLAN"），
+// 每个元素一行。EXPLAIN 用它把计划文本当普通结果集交给客户端 ——
+// 这样 EXPLAIN 和别的语句走同一条 next()/close() 路径，CLI 不需要
+// 为它单开一个"打印文本"的分支（见 session::Session::execute）。
+std::unique_ptr<ResultCursor> text_result(std::string column,
+                                          std::vector<std::string> lines);
+
 } // namespace exec

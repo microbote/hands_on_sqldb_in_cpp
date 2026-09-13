@@ -60,15 +60,16 @@ struct TableInfo {
 // ============================================================
 enum class SessionErrorCode : uint8_t {
   OK = 0,
-  EMPTY_SQL,         // 空语句
-  PARSE_ERROR,       // 词法/语法
-  BUILD_ERROR,       // AST -> Query
-  VALIDATE_ERROR,    // 语义校验（库/表/列不存在、类型不匹配……）
-  REWRITE_ERROR,     // 查询重写
-  OPTIMIZE_ERROR,    // 优化（主键抽取等）
-  PLAN_ERROR,        // 生成计划
-  EXECUTE_ERROR,     // 执行（含 DDL 落库失败）
-  NOT_SUPPORTED,     // 该语句类型这里不处理
+  EMPTY_SQL,            // 空语句
+  PARSE_ERROR,          // 词法/语法
+  BUILD_ERROR,          // AST -> Query
+  VALIDATE_ERROR,       // 语义校验（库/表/列不存在、类型不匹配……）
+  REWRITE_ERROR,        // 查询重写
+  OPTIMIZE_ERROR,       // 优化（主键抽取等）
+  PLAN_ERROR,           // 生成计划
+  EXECUTE_ERROR,        // 执行（含 DDL 落库失败）
+  CONSTRAINT_VIOLATION, // 约束不满足（主键重复等）
+  NOT_SUPPORTED,        // 该语句类型这里不处理
   TRANSACTION_ERROR, // 事务控制错误（重复 BEGIN / COMMIT 无事务 / 事务已中止）
 };
 
@@ -92,6 +93,8 @@ inline const char *session_error_message(SessionErrorCode code) {
     return "Plan error";
   case SessionErrorCode::EXECUTE_ERROR:
     return "Execution error";
+  case SessionErrorCode::CONSTRAINT_VIOLATION:
+    return "Constraint violation";
   case SessionErrorCode::NOT_SUPPORTED:
     return "Statement is not supported";
   case SessionErrorCode::TRANSACTION_ERROR:
@@ -152,21 +155,19 @@ public:
   //
   //   SELECT 类：惰性执行，第一次 next() 才真正开始扫；
   //   写语句：这里就执行完（affected_rows() 读受影响行数）；
-  //   DDL/USE：落到 Catalog，返回空游标。
+  //   DDL/USE：落到 Catalog，返回空游标；
+  //   EXPLAIN [ANALYZE] <语句>：返回**单列结果集**（列名 "QUERY PLAN"，
+  //     每个元素一行），和别的语句一样走 next()。
+  //
+  // EXPLAIN 由语法层识别（parser/sql.y 的 explain_stmt），session 把它拆掉：
+  // 被解释的语句照常走 builder/validator/optimizer/planner，只是不执行
+  // （ANALYZE 时才真的执行一遍并带上统计）。DDL/USE 没有计划树 ->
+  // NOT_SUPPORTED；ANALYZE 只允许 SELECT（写语句会真的改数据）。
   std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
   execute(const std::string &sql);
 
-  // EXPLAIN：只跑 pipeline 到"计划树"为止，**不执行**，返回计划树的文本形式。
-  //
-  // 入参带不带 EXPLAIN 前缀都行（`EXPLAIN SELECT ...` 与 `SELECT ...` 等价），
-  // 方便 CLI 直接把整条语句递进来。DDL/USE 没有计划，返回 NOT_SUPPORTED。
-  //
-  // analyze = true（`EXPLAIN ANALYZE ...`）：**真的执行一遍**，输出每个算子的
-  // 实际行数与耗时。只允许 SELECT —— 写语句会真的改数据，这里直接拒绝。
-  std::expected<std::string, SessionError> explain(const std::string &sql,
-                                                   bool analyze = false);
-
-  // 显式事务：BEGIN / COMMIT / ROLLBACK（文本层关键字，语法层不认识它们）。
+  // 显式事务：BEGIN / COMMIT / ROLLBACK（语法层认出来的语句，
+  // 见 parser/sql.y 的 transaction_stmt；执行与会话状态在这里）。
   // 在事务里时，语句的自动提交让位给事务本身（由 COMMIT/ROLLBACK 收尾）。
   bool in_transaction() const { return in_transaction_; }
 
@@ -187,11 +188,25 @@ public:
 
 private:
   // pipeline 前半段：解析 + 建 Query + 语义校验（execute/explain 共用）
-  std::expected<sql::Query, SessionError> prepare(const std::string &statement);
+  //
+  // EXPLAIN 前缀只影响"这条语句要不要执行"（以及要不要带统计），
+  // 所以在这里就拆掉：query 始终是**被解释的那条语句**。
+  struct Prepared {
+    sql::Query query;
+    bool explain = false; // EXPLAIN 前缀
+    bool analyze = false; // EXPLAIN ANALYZE
+  };
+  std::expected<Prepared, SessionError> prepare(const std::string &statement);
 
   // pipeline 后半段：重写 -> 优化 -> 生成计划树（execute/explain 共用）
   std::expected<std::unique_ptr<plan::PlanNode>, SessionError>
   build_plan(const sql::Query &query, const std::string &statement);
+
+  // EXPLAIN：生成计划（ANALYZE 时执行一遍拿统计），把结果变成
+  // 单列文本结果集
+  std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
+  execute_explain(const sql::Query &query, bool analyze,
+                  const std::string &statement);
 
   // 把 KVCatalog 的统计（维护着的行数）喂给优化器的成本模型
   plan::StatsProvider stats_provider() const;

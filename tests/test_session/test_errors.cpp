@@ -82,6 +82,36 @@ TEST(SessionError, UseUnknownDatabaseFails) {
   CHECK(error.code == session::SessionErrorCode::VALIDATE_ERROR);
 }
 
+TEST(SessionError, DuplicatePrimaryKeyIsConstraintViolation) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 2)); // id = 1, 2（age = id * 10）
+
+  const auto error = expect_error(
+      session, "INSERT INTO users (id, name, age) VALUES (1, 'clash', 7)");
+  CHECK(error.code == session::SessionErrorCode::CONSTRAINT_VIOLATION);
+  CHECK(error.message.find("duplicate primary key") != std::string::npos);
+
+  // 没有覆盖，也没有多出一行
+  bool ok = false;
+  const auto ids =
+      sess_test::first_column_ints(session, "SELECT id FROM users", &ok);
+  CHECK(ok);
+  CHECK_EQ(ids.size(), size_t{2});
+  const auto ages = sess_test::first_column_ints(
+      session, "SELECT age FROM users WHERE id = 1", &ok);
+  CHECK(ok);
+  CHECK_EQ(ages.size(), size_t{1});
+  if (ages.size() == 1) {
+    CHECK_EQ(ages[0], int64_t{10});
+  }
+
+  // 失败的是"重复主键"这一件事：换主键立刻能用
+  CHECK(sess_test::run(
+            session, "INSERT INTO users (id, name, age) VALUES (9, 'new', 90)",
+            nullptr) != nullptr);
+}
+
 TEST(SessionError, DuplicateCreateTableFails) {
   auto engine = sess_test::open_engine();
   session::Session session(engine);

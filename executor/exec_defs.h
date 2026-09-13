@@ -37,6 +37,7 @@ enum class ExecErrorCode : uint8_t {
   UNSUPPORTED_PLAN, // 计划里有本执行器还不支持的节点
   UNSUPPORTED_STMT, // 语句类型不支持（比如 DDL 走别的入口）
   SCHEMA_ERROR,
+  CONSTRAINT_VIOLATION, // 约束不满足（主键重复等）
   MEMORY_LIMIT, // 排序等超出内存上限（外部排序还没做）
   IO_ERROR,
   INTERNAL,
@@ -62,6 +63,8 @@ inline const char *exec_error_message(ExecErrorCode code) {
     return "Unsupported statement";
   case ExecErrorCode::SCHEMA_ERROR:
     return "Row does not match schema";
+  case ExecErrorCode::CONSTRAINT_VIOLATION:
+    return "Constraint violation";
   case ExecErrorCode::MEMORY_LIMIT:
     return "Memory limit exceeded";
   case ExecErrorCode::IO_ERROR:

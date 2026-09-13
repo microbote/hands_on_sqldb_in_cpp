@@ -40,6 +40,10 @@ typedef enum {
   NODE_CREATE_TABLE,
   NODE_DROP_TABLE,
   NODE_COLUMN_DEF,
+  /* 事务控制 */
+  NODE_TRANSACTION,
+  /* 语句前缀修饰 */
+  NODE_EXPLAIN,
   NODE_TYPE_COUNT
 } NodeType;
 
@@ -91,6 +95,10 @@ static inline const char *node_type_to_string(NodeType type) {
     return "DROP_TABLE";
   case NODE_COLUMN_DEF:
     return "COLUMN_DEF";
+  case NODE_TRANSACTION:
+    return "TRANSACTION";
+  case NODE_EXPLAIN:
+    return "EXPLAIN";
   default:
     return "UNKNOWN_NODE_TYPE";
   }
@@ -390,6 +398,46 @@ ASTNode *make_column_def_node(const char *name, CDataType data_type,
 int print_column_def_node(ASTNode *node, int indent, int offset, char *buffer,
                           size_t buffer_size);
 void free_column_def_node(ASTNode *node);
+
+/* ============ 事务控制节点 ============ */
+// NODE_TRANSACTION
+//
+// 事务控制语句没有别的字段：只是"哪一种操作"。
+//   BEGIN [WORK|TRANSACTION] / START TRANSACTION -> TXN_BEGIN
+//   COMMIT [WORK] / END [WORK]                   -> TXN_COMMIT
+//   ROLLBACK [WORK] / ABORT [WORK]               -> TXN_ROLLBACK
+typedef enum {
+  TXN_BEGIN,
+  TXN_COMMIT,
+  TXN_ROLLBACK,
+} AstTransactionKind;
+
+typedef struct TransactionNode {
+  AstTransactionKind kind;
+} TransactionNode;
+
+ASTNode *make_transaction_node(AstTransactionKind kind);
+const char *transaction_kind_to_string(AstTransactionKind kind);
+int print_transaction_node(ASTNode *node, int indent, int offset, char *buffer,
+                           size_t buffer_size);
+void free_transaction_node(ASTNode *node);
+
+/* ============ 语句前缀修饰节点 ============ */
+// NODE_EXPLAIN：`EXPLAIN [ANALYZE] <语句>`
+//
+// 它**不是**一条查询：输出是计划文本（一个单列结果集），所以不进
+// sql::Query —— session 在 builder 之前把它拆掉（见 session 的 prepare()）。
+// 放在 AST 里的好处：`EXPLAIN BEGIN` / `EXPLAIN SELCT` 这类组合由
+// 语法层一次说清，高亮、位置、注释都跟普通语句同一条路径。
+typedef struct ExplainNode {
+  int analyze;        // 1 = EXPLAIN ANALYZE（真的执行一遍）
+  ASTNode *statement; // 被解释的语句（本节点拥有它，随本节点释放）
+} ExplainNode;
+
+ASTNode *make_explain_node(int analyze, ASTNode *statement);
+int print_explain_node(ASTNode *node, int indent, int offset, char *buffer,
+                       size_t buffer_size);
+void free_explain_node(ASTNode *node);
 
 // AST 节点基类
 typedef struct ASTNode {

@@ -150,6 +150,12 @@ void collect_from_statement(const ASTNode *ast, std::vector<NamedSpan> &out) {
                    db->db_span});
     break;
   }
+  case NODE_EXPLAIN: {
+    // EXPLAIN 只是一层前缀：里面照常收集（span 都是原文里的列号）
+    const auto *explain = reinterpret_cast<const ExplainNode *>(ast->data);
+    collect_from_statement(explain->statement, out);
+    break;
+  }
   default:
     break;
   }

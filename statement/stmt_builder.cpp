@@ -64,6 +64,16 @@ StatementBuilder::build(const ASTNode *ast) {
     return finish(build_stmt_create_table(ast));
   case NODE_DROP_TABLE:
     return finish(build_stmt_drop_table(ast));
+  case NODE_TRANSACTION:
+    return finish(build_stmt_transaction(ast));
+  case NODE_EXPLAIN:
+    // EXPLAIN 是"语句修饰"，不是查询：session 在调用 builder 之前就把它
+    // 拆掉了（见 session/session.cpp 的 prepare()）。走到这里说明调用方
+    // 直接把带前缀的 AST 递了进来 —— 明说，而不是当成普通查询执行。
+    return std::unexpected(make_error(
+        StmtErrorCode::UNSUPPORTED_AST_NODE,
+        "EXPLAIN is a statement modifier; the caller must unwrap it first",
+        ast->span));
   default:
     return std::unexpected(make_error(
         StmtErrorCode::UNKNOWN_AST_Type,
@@ -573,6 +583,34 @@ StatementBuilder::build_stmt_drop_table(const ASTNode *ast) {
   }
   sql::DropTableQuery query;
   query.table = sql::Identifier(data->table_name);
+  return sql::Query(std::move(query));
+}
+
+// ============================================================
+// 事务控制：AST 的 kind 直接映射成 sql::TransactionKind
+// （别名在语法层已经归一化，这里只有三种）
+// ============================================================
+std::expected<sql::Query, StmtError>
+StatementBuilder::build_stmt_transaction(const ASTNode *ast) {
+  const auto *data = reinterpret_cast<const TransactionNode *>(ast->data);
+  sql::TransactionStmt query;
+  switch (data->kind) {
+  case TXN_BEGIN:
+    query.kind = sql::TransactionKind::BEGIN;
+    break;
+  case TXN_COMMIT:
+    query.kind = sql::TransactionKind::COMMIT;
+    break;
+  case TXN_ROLLBACK:
+    query.kind = sql::TransactionKind::ROLLBACK;
+    break;
+  default:
+    return std::unexpected(
+        make_error(StmtErrorCode::INVALID_AST_NODE,
+                   std::string("unknown transaction kind: ") +
+                       std::to_string(static_cast<int>(data->kind)),
+                   ast->span));
+  }
   return sql::Query(std::move(query));
 }
 

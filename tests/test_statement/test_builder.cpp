@@ -268,3 +268,40 @@ TEST(Builder, AcceptsConstAst) {
   // 传 const 指针不会改变 AST：再读一次仍然有效
   CHECK(ast->type == NODE_SELECT);
 }
+
+TEST(Builder, BuildsTransactionStatements) {
+  // 别名在语法层就归一化了：builder 只看到三种 kind
+  auto begin = build_sql("BEGIN WORK;");
+  REQUIRE_QUERY(begin, begin_query);
+  CHECK(begin_query.is_transaction());
+  CHECK(begin_query.type() == sql::QueryType::TRANSACTION);
+  CHECK(!begin_query.is_ddl() && !begin_query.is_dml() &&
+        !begin_query.is_ctrl());
+  CHECK(begin_query.target_table() == nullptr);
+  CHECK(begin_query.to_string() == "BEGIN");
+  CHECK(begin_query.transaction() != nullptr);
+  if (begin_query.transaction() != nullptr) {
+    CHECK(begin_query.transaction()->kind == sql::TransactionKind::BEGIN);
+  }
+
+  auto commit = build_sql("END;");
+  REQUIRE_QUERY(commit, commit_query);
+  CHECK(commit_query.is_transaction());
+  CHECK(commit_query.to_string() == "COMMIT");
+  if (commit_query.transaction() != nullptr) {
+    CHECK(commit_query.transaction()->kind == sql::TransactionKind::COMMIT);
+  }
+
+  auto rollback = build_sql("ABORT;");
+  REQUIRE_QUERY(rollback, rollback_query);
+  CHECK(rollback_query.to_string() == "ROLLBACK");
+  if (rollback_query.transaction() != nullptr) {
+    CHECK(rollback_query.transaction()->kind == sql::TransactionKind::ROLLBACK);
+  }
+
+  // 事务访问器在别的语句类型上返回 nullptr（不是"另一种"查询）
+  auto select = build_sql("SELECT * FROM users;");
+  REQUIRE_QUERY(select, select_query);
+  CHECK(!select_query.is_transaction());
+  CHECK(select_query.transaction() == nullptr);
+}

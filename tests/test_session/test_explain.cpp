@@ -1,6 +1,9 @@
 // tests/test_session/test_explain.cpp
 //
-// EXPLAIN：只跑 pipeline 到计划树为止，不执行；输出就是 plan_tree_to_string。
+// EXPLAIN：由语法层识别（parser/sql.y 的 explain_stmt），session 拆掉前缀后
+// 只跑 pipeline 到计划树为止（**不执行**），把计划文本当成一个
+// **单列结果集**（列名 "QUERY PLAN"，一行一段）交给客户端 ——
+// 所以它和别的语句走同一条 execute()/next()/close() 路径。
 #include "test_framework.h"
 
 #include <memory>
@@ -13,17 +16,11 @@ namespace {
 // 建库建表塞数据，然后 EXPLAIN 一条语句
 std::string explain_sql(session::Session &session, const std::string &sql,
                         bool *ok = nullptr) {
-  auto result = session.explain(sql);
-  if (!result.has_value()) {
-    if (ok != nullptr) {
-      *ok = false;
-    }
-    return result.error().to_string();
-  }
+  auto result = sess_test::explain(session, sql);
   if (ok != nullptr) {
-    *ok = true;
+    *ok = result.ok;
   }
-  return *result;
+  return result.text;
 }
 
 bool contains(const std::string &text, const std::string &needle) {
@@ -137,23 +134,55 @@ TEST(Explain, WriteStatementsShowTheirScanChain) {
   CHECK(contains(plan, "Insert(users pk=id)"));
 }
 
-TEST(Explain, PrefixIsOptionalAndCaseInsensitive) {
+TEST(Explain, ResultIsASingleColumnOfPlanLines) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 3));
+
+  auto result = sess_test::explain(session, "EXPLAIN SELECT * FROM users");
+  CHECK(result.ok);
+  CHECK_EQ(result.columns.size(), size_t{1});
+  if (result.columns.size() == 1) {
+    CHECK_EQ(result.columns[0], std::string("QUERY PLAN"));
+  }
+  // 一行一个算子，拼接回来就是 plan_tree_to_string 的内容
+  CHECK(!result.rows.empty());
+  for (const sql::Row &row : result.rows) {
+    CHECK_EQ(row.size(), size_t{1});
+  }
+  CHECK(contains(result.text, "FullScan(users pk=id INT"));
+  // 每行都是一段单行文本（换行不会留在单元格里，表格才对得齐）
+  for (const sql::Row &row : result.rows) {
+    CHECK(row[0].as_str().find('\n') == std::string::npos);
+  }
+}
+
+TEST(Explain, KeywordIsCaseInsensitiveAndPlainSelectStillExecutes) {
   auto engine = sess_test::open_engine();
   session::Session session(engine);
   CHECK(sess_test::bootstrap(session, 3));
 
   bool ok = false;
-  const std::string with_prefix =
+  const std::string upper =
       explain_sql(session, "EXPLAIN SELECT * FROM users", &ok);
   CHECK(ok);
-  const std::string lowercase =
+  const std::string lower =
       explain_sql(session, "  explain   select * from users  ", &ok);
   CHECK(ok);
-  const std::string without_prefix =
-      explain_sql(session, "SELECT * FROM users", &ok);
+  CHECK_EQ(upper, lower);
+
+  // 不加 EXPLAIN 就是"真执行"：拿到的是数据行，不是计划
+  const auto ids =
+      sess_test::first_column_ints(session, "SELECT * FROM users", &ok);
   CHECK(ok);
-  CHECK_EQ(with_prefix, lowercase);
-  CHECK_EQ(with_prefix, without_prefix);
+  CHECK_EQ(ids.size(), size_t{3});
+  // EXPLAIN 不执行：表里还是 3 行
+  explain_sql(session, "EXPLAIN DELETE FROM users", &ok);
+  CHECK(ok);
+  const auto after =
+      sess_test::first_column_ints(session, "SELECT id FROM users", &ok);
+  CHECK(ok);
+  CHECK_EQ(after.size(), size_t{3});
 }
 
 TEST(Explain, DoesNotExecuteTheStatement) {
@@ -190,14 +219,19 @@ TEST(Explain, DdlIsNotSupported) {
   session::Session session(engine);
   CHECK(sess_test::bootstrap(session, 1));
 
-  auto result = session.explain("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)");
-  CHECK(!result.has_value());
-  if (!result.has_value()) {
-    CHECK(result.error().code == session::SessionErrorCode::NOT_SUPPORTED);
-  }
+  auto result = sess_test::explain(
+      session, "EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)");
+  CHECK(!result.ok);
+  CHECK(result.error.code == session::SessionErrorCode::NOT_SUPPORTED);
   // USE 同理
-  auto use = session.explain("EXPLAIN USE shop");
-  CHECK(!use.has_value());
+  auto use = sess_test::explain(session, "EXPLAIN USE shop");
+  CHECK(!use.ok);
+  CHECK(use.error.code == session::SessionErrorCode::NOT_SUPPORTED);
+  // 事务控制语句也没有计划树（语法层认得它，所以提示更具体）
+  auto begin = sess_test::explain(session, "EXPLAIN BEGIN");
+  CHECK(!begin.ok);
+  CHECK(begin.error.code == session::SessionErrorCode::NOT_SUPPORTED);
+  CHECK(begin.error.message.find("BEGIN") != std::string::npos);
 }
 
 TEST(Explain, ErrorsKeepTheirKind) {
@@ -205,29 +239,22 @@ TEST(Explain, ErrorsKeepTheirKind) {
   session::Session session(engine);
   CHECK(sess_test::bootstrap(session, 1));
 
-  // 表不存在 -> VALIDATE_ERROR，且位置换算回"原始文本"（含 EXPLAIN 前缀）
-  auto missing = session.explain("EXPLAIN SELECT * FROM missing");
-  CHECK(!missing.has_value());
-  if (!missing.has_value()) {
-    CHECK(missing.error().code == session::SessionErrorCode::VALIDATE_ERROR);
-    CHECK(sspan_valid(missing.error().span));
-    CHECK(missing.error().highlight(false).find("missing") !=
-          std::string::npos);
-  }
+  // 表不存在 -> VALIDATE_ERROR；位置是**原文里的列号**（前缀不再需要换算）
+  auto missing = sess_test::explain(session, "EXPLAIN SELECT * FROM missing");
+  CHECK(!missing.ok);
+  CHECK(missing.error.code == session::SessionErrorCode::VALIDATE_ERROR);
+  CHECK(sspan_valid(missing.error.span));
+  CHECK(missing.error.highlight(false).find("missing") != std::string::npos);
 
   // 语法错误 -> PARSE_ERROR
-  auto syntax = session.explain("EXPLAIN SELCT 1");
-  CHECK(!syntax.has_value());
-  if (!syntax.has_value()) {
-    CHECK(syntax.error().code == session::SessionErrorCode::PARSE_ERROR);
-  }
+  auto syntax = sess_test::explain(session, "EXPLAIN SELCT 1");
+  CHECK(!syntax.ok);
+  CHECK(syntax.error.code == session::SessionErrorCode::PARSE_ERROR);
 
-  // 空语句
-  auto empty = session.explain("EXPLAIN");
-  CHECK(!empty.has_value());
-  if (!empty.has_value()) {
-    CHECK(empty.error().code == session::SessionErrorCode::EMPTY_SQL);
-  }
+  // 光有 EXPLAIN 没有语句 -> 语法层报缺语句
+  auto empty = sess_test::explain(session, "EXPLAIN");
+  CHECK(!empty.ok);
+  CHECK(empty.error.code == session::SessionErrorCode::PARSE_ERROR);
 }
 
 // ============================================================
@@ -282,22 +309,25 @@ TEST(Explain, AnalyzeShowsFilterSelectivity) {
   CHECK(contains(plan, "(3 rows in result)"));
 }
 
-TEST(Explain, AnalyzeAcceptsExplicitFlagWithoutPrefix) {
+TEST(Explain, AnalyzeNeedsTheExplicitKeyword) {
   auto engine = sess_test::open_engine();
   session::Session session(engine);
   CHECK(sess_test::bootstrap(session, 2));
 
-  auto analyzed = session.explain("SELECT id FROM users", /*analyze=*/true);
-  CHECK(analyzed.has_value());
-  if (analyzed.has_value()) {
-    CHECK(contains(*analyzed, "[rows="));
-  }
-  // 不带 analyze 时不给统计
-  auto plain = session.explain("SELECT id FROM users");
-  CHECK(plain.has_value());
-  if (plain.has_value()) {
-    CHECK(!contains(*plain, "[rows="));
-  }
+  // 统计只来自语法层的 ANALYZE 关键字：EXPLAIN 后面不写就只能是估算
+  auto plain = sess_test::explain(session, "EXPLAIN SELECT id FROM users");
+  CHECK(plain.ok);
+  CHECK(!contains(plain.text, "[rows="));
+
+  auto analyzed =
+      sess_test::explain(session, "EXPLAIN ANALYZE SELECT id FROM users");
+  CHECK(analyzed.ok);
+  CHECK(contains(analyzed.text, "[rows="));
+
+  // ANALYZE 只是 EXPLAIN 的修饰词，单独出现不是语句
+  auto alone = sess_test::explain(session, "ANALYZE SELECT id FROM users");
+  CHECK(!alone.ok);
+  CHECK(alone.error.code == session::SessionErrorCode::PARSE_ERROR);
 }
 
 TEST(Explain, AnalyzeRejectsWriteStatementsAndLeavesDataAlone) {
@@ -309,11 +339,9 @@ TEST(Explain, AnalyzeRejectsWriteStatementsAndLeavesDataAlone) {
                                  "EXPLAIN ANALYZE UPDATE users SET age = 1",
                                  "EXPLAIN ANALYZE INSERT INTO users (id, name, "
                                  "age) VALUES (9, 'z', 1)"}) {
-    auto result = session.explain(sql);
-    CHECK(!result.has_value());
-    if (!result.has_value()) {
-      CHECK(result.error().code == session::SessionErrorCode::NOT_SUPPORTED);
-    }
+    auto result = sess_test::explain(session, sql);
+    CHECK(!result.ok);
+    CHECK(result.error.code == session::SessionErrorCode::NOT_SUPPORTED);
   }
   // 数据没被动过
   bool ok = false;
@@ -338,11 +366,10 @@ TEST(Explain, AnalyzeReportsExecutionErrors) {
     CHECK(engine->put(key, "garbage") == kv::Status::OK);
   }
 
-  auto result = session.explain("EXPLAIN ANALYZE SELECT * FROM users");
-  CHECK(!result.has_value());
-  if (!result.has_value()) {
-    CHECK(result.error().code == session::SessionErrorCode::EXECUTE_ERROR);
-  }
+  auto result =
+      sess_test::explain(session, "EXPLAIN ANALYZE SELECT * FROM users");
+  CHECK(!result.ok);
+  CHECK(result.error.code == session::SessionErrorCode::EXECUTE_ERROR);
 }
 
 TEST(Explain, AnalyzeOnEmptyResultStillPrintsThePlan) {

@@ -28,6 +28,7 @@ enum class QueryType : uint8_t {
   CREATE_DATABASE,
   DROP_DATABASE,
   USE_DATABASE,
+  TRANSACTION,
   UNKNOWN
 };
 
@@ -51,6 +52,8 @@ inline const char *query_type_to_string(QueryType type) {
     return "DROP_DATABASE";
   case QueryType::USE_DATABASE:
     return "USE_DATABASE";
+  case QueryType::TRANSACTION:
+    return "TRANSACTION";
   default:
     return "UNKNOWN";
   }
@@ -343,12 +346,44 @@ struct UseDatabaseQuery {
 };
 
 // ============================================================
+// 事务控制：BEGIN / COMMIT / ROLLBACK
+//
+// 只表达"用户写了哪一种事务操作"；真正的执行（开事务/提交/回滚、
+// 会话级状态）在 session 层 —— Query 是纯数据，不带连接状态。
+// 别名（START TRANSACTION / END / ABORT）在语法层就归一化成这三种。
+// ============================================================
+enum class TransactionKind : uint8_t {
+  BEGIN,
+  COMMIT,
+  ROLLBACK,
+};
+
+inline const char *transaction_kind_to_string(TransactionKind kind) {
+  switch (kind) {
+  case TransactionKind::BEGIN:
+    return "BEGIN";
+  case TransactionKind::COMMIT:
+    return "COMMIT";
+  case TransactionKind::ROLLBACK:
+    return "ROLLBACK";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+struct TransactionStmt {
+  TransactionKind kind = TransactionKind::BEGIN;
+
+  std::string to_string() const { return transaction_kind_to_string(kind); }
+};
+
+// ============================================================
 // QueryStmt 变体
 // ============================================================
 using QueryStmt =
     std::variant<SelectQuery, InsertQuery, UpdateQuery, DeleteQuery,
                  CreateTableQuery, DropTableQuery, CreateDatabaseQuery,
-                 DropDatabaseQuery, UseDatabaseQuery>;
+                 DropDatabaseQuery, UseDatabaseQuery, TransactionStmt>;
 
 // ============================================================
 // Query 包装类（统一接口）
@@ -385,6 +420,7 @@ public:
     return type_ == QueryType::CREATE_DATABASE;
   }
   bool is_drop_database() const { return type_ == QueryType::DROP_DATABASE; }
+  bool is_transaction() const { return type_ == QueryType::TRANSACTION; }
 
   bool is_ddl() const {
     return type_ == QueryType::CREATE_TABLE || type_ == QueryType::DROP_TABLE ||
@@ -446,6 +482,14 @@ public:
     return std::get_if<UseDatabaseQuery>(&stmt_);
   }
 
+  // 事务控制访问器（不是事务控制语句时返回 nullptr）
+  const TransactionStmt *transaction() const {
+    return std::get_if<TransactionStmt>(&stmt_);
+  }
+  TransactionStmt *transaction() {
+    return std::get_if<TransactionStmt>(&stmt_);
+  }
+
   // 获取目标表名（非 DML 返回 nullptr）
   const Identifier *target_table() const {
     if (auto *s = select())
@@ -483,6 +527,8 @@ public:
       return QueryType::DROP_DATABASE;
     else if constexpr (std::is_same_v<T, UseDatabaseQuery>)
       return QueryType::USE_DATABASE;
+    else if constexpr (std::is_same_v<T, TransactionStmt>)
+      return QueryType::TRANSACTION;
     else {
       static_assert(sizeof(T) == 0, "Unsupported query type");
     }

@@ -161,8 +161,20 @@ std::expected<void, RelError> Table::insert(const Row &row) {
         RelError(RelErrorCode::PRIMARY_KEY_NULL, "insert with NULL key"));
   }
 
+  // INSERT 不是 UPSERT：主键已经存在就报错，**不覆盖**。
+  // 事务里 exists() 会看覆盖层（TxBuffer），所以"同一个事务里插两次同 key"
+  // 也会被拦下来，而不是等到提交才炸。竞态不用管：写者只有一个，
+  // 而且语句本身包在事务里（见 session 的 AutoCommit）。
+  const Key key = encode_key(pk);
+  if (engine_->exists(key)) {
+    return std::unexpected(RelError(RelErrorCode::DUPLICATE_PRIMARY_KEY,
+                                    "duplicate primary key in " +
+                                        schema_.table_name().str() + ": " +
+                                        pk.to_string()));
+  }
+
   // 整行一个 blob（值 = Row::serialize(schema)）
-  const kv::Status status = engine_->put(encode_key(pk), encode_row(row));
+  const kv::Status status = engine_->put(key, encode_row(row));
   if (status != kv::Status::OK) {
     return std::unexpected(kv_error("put", status));
   }

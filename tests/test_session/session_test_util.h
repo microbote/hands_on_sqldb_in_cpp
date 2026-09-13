@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,6 +76,43 @@ inline std::vector<int64_t> first_column_ints(session::Session &session,
     *ok = cursor_error.end();
   }
   return values;
+}
+
+// EXPLAIN 的结果：单列结果集（列名 "QUERY PLAN"，一行一段计划文本）。
+// 测试里既想断言"计划长什么样"（text），也想断言错误码（error）。
+struct ExplainRun {
+  bool ok = false;
+  std::vector<std::string> columns; // 成功时的列名（一般是 {"QUERY PLAN"}）
+  std::vector<sql::Row> rows;       // 成功时的结果行
+  std::string text;                 // 成功：每行拼成多行文本；失败：错误信息
+  session::SessionError error;      // 失败时的错误（code/span/highlight）
+};
+
+inline ExplainRun explain(session::Session &session, const std::string &sql) {
+  ExplainRun outcome;
+  session::SessionError error;
+  auto cursor = run(session, sql, &error);
+  if (cursor == nullptr) {
+    outcome.error = error;
+    outcome.text = error.to_string();
+    return outcome;
+  }
+  sql::CursorError cursor_error;
+  outcome.rows = collect(*cursor, &cursor_error);
+  outcome.columns = cursor->columns();
+  if (cursor_error.is_error()) {
+    outcome.error =
+        session::SessionError(session::SessionErrorCode::EXECUTE_ERROR,
+                              cursor_error.to_string(), sql);
+    outcome.text = cursor_error.to_string();
+    return outcome;
+  }
+  for (const sql::Row &row : outcome.rows) {
+    outcome.text += row.size() > 0 ? row[0].as_str() : std::string();
+    outcome.text += "\n";
+  }
+  outcome.ok = true;
+  return outcome;
 }
 
 // 建库 + 建表 + 塞数据（id = 1..count, name = "userN", age = id*10）
