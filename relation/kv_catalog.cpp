@@ -2,6 +2,7 @@
 #include "kv_catalog.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -38,10 +39,67 @@ bool read_u32_le(const std::string &data, size_t &pos, uint32_t &out) {
   return true;
 }
 
+// 统计记录（固定长度 + 版本号）：
+//   v1（17 字节）：[版本=1][8B created][8B last_write]              —— 旧数据
+//   v2（25 字节）：[版本=2][8B created][8B last_write][8B rows]
+// rows = -1 表示未知（旧记录 / 还没统计过）。
+constexpr uint8_t kStatsVersion = 2;
+
+std::string encode_stats(int64_t created_at, int64_t last_write_at,
+                         int64_t row_count) {
+  std::string out;
+  out.reserve(25);
+  out.push_back(static_cast<char>(kStatsVersion));
+  const auto put_u64 = [&out](uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      out.push_back(static_cast<char>((value >> (8 * i)) & 0xFF));
+    }
+  };
+  put_u64(static_cast<uint64_t>(created_at));
+  put_u64(static_cast<uint64_t>(last_write_at));
+  put_u64(static_cast<uint64_t>(row_count));
+  return out;
+}
+
+bool decode_stats(const std::string &data, int64_t &created_at,
+                  int64_t &last_write_at, int64_t &row_count) {
+  if (data.empty()) {
+    return false;
+  }
+  const auto get_u64 = [&data](size_t pos) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+      value |= static_cast<uint64_t>(static_cast<unsigned char>(
+                   data[pos + static_cast<size_t>(i)]))
+               << (8 * i);
+    }
+    return value;
+  };
+  const uint8_t version = static_cast<uint8_t>(data[0]);
+  if (version == 1 && data.size() == 17) {
+    created_at = static_cast<int64_t>(get_u64(1));
+    last_write_at = static_cast<int64_t>(get_u64(9));
+    row_count = -1; // 旧记录没有行数
+    return true;
+  }
+  if (version == 2 && data.size() == 25) {
+    created_at = static_cast<int64_t>(get_u64(1));
+    last_write_at = static_cast<int64_t>(get_u64(9));
+    row_count = static_cast<int64_t>(get_u64(17));
+    return true;
+  }
+  return false;
+}
+
 } // namespace
 
-KVCatalog::KVCatalog(std::shared_ptr<kv::KVEngine> engine)
-    : engine_(std::move(engine)) {}
+KVCatalog::KVCatalog(std::shared_ptr<kv::KVEngine> engine, Clock now)
+    : engine_(std::move(engine)), now_(now ? std::move(now) : Clock([] {
+        return static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+      })) {}
 
 // ============================================================
 // 会话状态
@@ -176,6 +234,10 @@ bool KVCatalog::create_database(const Identifier &db_name) {
     write_meta(keys::databases(), serialize_names(dbs));
     return false;
   }
+  // 建库时间（统计信息）：一个固定长度的记录，不需要名单那套 framing
+  DatabaseStats stats;
+  stats.created_at = now_();
+  write_meta(keys::db_stats(db_name), encode_stats(stats.created_at, 0, -1));
   return true;
 }
 
@@ -190,6 +252,10 @@ bool KVCatalog::drop_database(const Identifier &db_name) {
   if (!remove_prefix(keys::db_data_prefix(db_name))) {
     return false;
   }
+  if (!remove_prefix(keys::table_stats_prefix(db_name))) {
+    return false;
+  }
+  engine_->remove(keys::db_stats(db_name));
   engine_->remove(keys::db_tables(db_name));
 
   // 2) 从库列表里摘掉
@@ -220,6 +286,8 @@ bool KVCatalog::create_table(const Identifier &db_name,
                   schema.serialize())) {
     return false;
   }
+  write_meta(keys::table_stats(db_name, schema.table_name()),
+             encode_stats(now_(), 0, 0)); // 建表时间 + 空表（0 行）
   auto tables = list_tables_raw(db_name);
   tables.push_back(schema.table_name());
   if (!write_table_list(db_name, tables)) {
@@ -240,6 +308,7 @@ bool KVCatalog::drop_table(const Identifier &db_name,
     return false;
   }
   engine_->remove(keys::db_schema(db_name, table_name));
+  engine_->remove(keys::table_stats(db_name, table_name));
 
   auto tables = list_tables_raw(db_name);
   const auto it = std::find(tables.begin(), tables.end(), table_name);
@@ -247,6 +316,59 @@ bool KVCatalog::drop_table(const Identifier &db_name,
     tables.erase(it);
   }
   return write_table_list(db_name, tables);
+}
+
+// ============================================================
+// 统计信息
+// ============================================================
+std::expected<DatabaseStats, RelError>
+KVCatalog::database_stats(const Identifier &db_name) const {
+  if (!database_exists(db_name)) {
+    return std::unexpected(RelError(RelErrorCode::NOT_FOUND,
+                                    "database not found: " + db_name.str()));
+  }
+  DatabaseStats stats;
+  int64_t last_write = 0;
+  int64_t rows = -1;
+  if (!decode_stats(read_meta(keys::db_stats(db_name)), stats.created_at,
+                    last_write, rows)) {
+    stats.created_at = 0; // 老数据没有统计记录：不报错，给 0
+  }
+  return stats;
+}
+
+std::expected<TableStats, RelError>
+KVCatalog::table_stats(const Identifier &db_name,
+                       const Identifier &table_name) const {
+  if (!table_exists(db_name, table_name)) {
+    return std::unexpected(
+        RelError(RelErrorCode::TABLE_NOT_FOUND,
+                 "table not found: " + db_name.str() + "." + table_name.str()));
+  }
+  TableStats stats;
+  if (!decode_stats(read_meta(keys::table_stats(db_name, table_name)),
+                    stats.created_at, stats.last_write_at, stats.row_count)) {
+    stats = TableStats{};
+  }
+  return stats;
+}
+
+bool KVCatalog::touch_table(const Identifier &db_name,
+                            const Identifier &table_name, int64_t row_delta) {
+  if (!table_exists(db_name, table_name)) {
+    return false;
+  }
+  auto stats = table_stats(db_name, table_name);
+  const int64_t created = stats.has_value() ? stats->created_at : 0;
+  int64_t rows = stats.has_value() ? stats->row_count : -1;
+  if (rows >= 0) {
+    rows += row_delta;
+    if (rows < 0) {
+      rows = 0; // 计数只可能因为漂移为负，兜一下
+    }
+  }
+  return write_meta(keys::table_stats(db_name, table_name),
+                    encode_stats(created, now_(), rows));
 }
 
 // ============================================================

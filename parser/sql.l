@@ -182,6 +182,11 @@ static char* sql_unescape_string(const char* body, size_t len) {
 
 [ \t\n\r]+ { lex_advance(yytext, (int)yyleng); }   /* 空白：只推进位置 */
 
+  /* 注释：SQL 标准两种写法。注释不产生 token（与 lex_tokens.h 的约定一致），
+   高亮器按"相邻 token 之间的空隙"原样复制，所以注释仍然会显示出来。 */
+"--"[^\n]* { lex_advance(yytext, (int)yyleng); }            /* 行注释 */
+"/*"([^*]|\*+[^*/])*\*+"/" { lex_advance(yytext, (int)yyleng); } /* 块注释（可跨行） */
+
   /* 其它字符：交给语法层报错，不能静默丢弃 */
 . {
     return yytext[0];
@@ -262,4 +267,3 @@ int lex_collect_tokens(const char* sql, LexToken** out) {
     *out = tokens;
     return count;
 }
-

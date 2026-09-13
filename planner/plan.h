@@ -42,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include "planner/cost.h"         // Cost（估算成本，EXPLAIN 展示用）
 #include "planner/optimizer.h"    // OptimizedQuery
 #include "planner/planner_defs.h" // PlanError / PlanErrorCode / Ordering
 #include "sql_types/query.h"
@@ -145,6 +146,14 @@ public:
 
   // 子节点；叶子返回 nullptr
   virtual const PlanNode *child() const { return nullptr; }
+
+  // 估算成本（占位性质）：由 Planner 用 CostModel 算出来，只用于 EXPLAIN 展示。
+  // 它**不参与任何正确性判断**；没有统计时就是默认值。
+  const Cost &cost() const { return cost_; }
+  void set_cost(Cost cost) { cost_ = cost; }
+
+protected:
+  Cost cost_;
 };
 
 // ============================================================

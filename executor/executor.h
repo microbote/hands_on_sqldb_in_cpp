@@ -25,6 +25,10 @@
 // DDL / USE 不在这里执行：它们没有行流，由上层用 sql::Catalog 完成
 // （USE 还需要会话状态，不在 Catalog 接口里）。
 //
+// **统计（EXPLAIN ANALYZE）**：`open/next/close` 是非虚的包装，
+// 里面调算子的 `open_impl/next_impl/close_impl` —— 这样"数行数/记时间"
+// 只写一处，算子实现不用操心。只有传了 ExecReport 才统计，平时零开销。
+//
 // **生命周期**：算子在构造时就把运行期要用的语义载荷（谓词、order_by、
 // LIMIT、投影列、SET 列表、VALUES）**拷成自己的成员**，运行期不再解引用
 // 计划节点 —— 计划树可以比游标先释放（planner 的产物是"一次性"的）。
@@ -52,6 +56,38 @@
 namespace exec {
 
 // ============================================================
+// 执行统计（EXPLAIN ANALYZE 用）
+//
+// ExecReport 由调用方（session）按"一次执行"创建一个，传给 creator/execute；
+// 不传就完全不统计（算子里只有一个空指针判断）。
+// ============================================================
+struct NodeStats {
+  const plan::PlanNode *node = nullptr;
+  size_t rows = 0;      // 这个算子产出的行数
+  int64_t start_us = 0; // 第一次 open 的时刻
+  int64_t end_us = 0;   // 结束（END / close）的时刻；0 = 还没结束
+};
+
+class ExecReport {
+public:
+  void on_open(const plan::PlanNode *node);
+  void on_row(const plan::PlanNode *node);
+  void on_finish(const plan::PlanNode *node);
+
+  const std::vector<NodeStats> &nodes() const { return nodes_; }
+  const NodeStats *find(const plan::PlanNode *node) const;
+  int64_t elapsed_us(const plan::PlanNode *node) const;
+
+private:
+  NodeStats &slot(const plan::PlanNode *node);
+  std::vector<NodeStats> nodes_;
+};
+
+// 计划树 + 实际统计（report 为空时就是纯计划树）
+std::string explain_text(const plan::PlanNode &root,
+                         const ExecReport *report = nullptr);
+
+// ============================================================
 // 算子接口（框架内部 SPI）
 // ============================================================
 class Executor {
@@ -60,20 +96,32 @@ public:
 
   // 启动：定位迭代器、把需要物化的数据拉完（Sort）、执行写语句。
   // 重复 open 返回 ExecErrorCode::ALREADY_OPEN。
-  virtual ExecError open() = 0;
+  ExecError open();
 
   // 取下一行：
   //   有值            -> Row
   //   CursorError::END -> 正常结束
   //   其它错误码       -> 出错（会粘住，和 sql::Cursor 的约定一致）
-  virtual std::expected<sql::Row, sql::CursorError> next() = 0;
+  std::expected<sql::Row, sql::CursorError> next();
 
   // 释放资源（迭代器/排序缓冲/物化结果）；幂等，析构也应调用
-  virtual void close() = 0;
+  void close();
 
   // 自己对应的计划节点（框架做 EXPLAIN/埋点用，不转发给客户端）
   virtual const plan::PlanNode *plan() const = 0;
 
+  // 挂上统计器（factory 建好后调用；nullptr = 不统计）
+  void set_report(ExecReport *report) { report_ = report; }
+
+protected:
+  virtual ExecError open_impl() = 0;
+  virtual std::expected<sql::Row, sql::CursorError> next_impl() = 0;
+  virtual void close_impl() = 0;
+
+private:
+  ExecReport *report_ = nullptr;
+
+public:
   // 已经发生的行流错误（OK = 还没出错，END = 已经到末尾）。
   // open() 失败时上层用它拿"更精确的那个错误"（open 返回的是 ExecError）。
   virtual const sql::CursorError &error() const {
@@ -83,6 +131,11 @@ public:
 
   // 是否产出结果行：SELECT 类为 true；INSERT/UPDATE/DELETE 为 false
   virtual bool produces_rows() const { return true; }
+
+  // 是否是"写语句"（影响行数有意义）：INSERT/UPDATE/DELETE 为 true，
+  // DDL/USE 的 EmptyExecutor 为 false —— 客户端用它区分
+  // "OK, N rows affected" 与纯 "OK"
+  virtual bool is_write() const { return false; }
 
   // 写语句的受影响行数（写完才有意义；非写算子恒为 0）
   virtual size_t affected_rows() const { return 0; }
@@ -100,9 +153,9 @@ public:
   ScanExecutor(const plan::ScanPlan *plan, std::shared_ptr<sql::Table> table);
   ~ScanExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override;
-  void close() override;
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return error_; }
 
@@ -137,9 +190,9 @@ public:
                  std::shared_ptr<sql::Table> table);
   ~FilterExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override;
-  void close() override;
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return child_->error(); }
   bool produces_rows() const override { return true; }
@@ -166,9 +219,9 @@ public:
                std::shared_ptr<sql::Table> table, size_t row_limit = 1'000'000);
   ~SortExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override;
-  void close() override;
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return error_; }
   bool produces_rows() const override { return true; }
@@ -197,9 +250,9 @@ public:
   LimitExecutor(const plan::LimitPlan *plan, std::unique_ptr<Executor> child);
   ~LimitExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override;
-  void close() override;
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return child_->error(); }
   bool produces_rows() const override { return true; }
@@ -223,9 +276,9 @@ public:
                   std::shared_ptr<sql::Table> table);
   ~ProjectExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override;
-  void close() override;
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return child_->error(); }
   bool produces_rows() const override { return true; }
@@ -251,14 +304,15 @@ public:
                  std::shared_ptr<sql::Table> table);
   ~UpdateExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override {
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override {
     return end_row();
   }
-  void close() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return error_; }
   bool produces_rows() const override { return false; }
+  bool is_write() const override { return true; }
   size_t affected_rows() const override { return affected_rows_; }
 
 private:
@@ -279,14 +333,15 @@ public:
                  std::shared_ptr<sql::Table> table);
   ~DeleteExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override {
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override {
     return end_row();
   }
-  void close() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return error_; }
   bool produces_rows() const override { return false; }
+  bool is_write() const override { return true; }
   size_t affected_rows() const override { return affected_rows_; }
 
 private:
@@ -306,14 +361,15 @@ public:
                  std::shared_ptr<sql::Table> table);
   ~InsertExecutor() override { close(); }
 
-  ExecError open() override;
-  std::expected<sql::Row, sql::CursorError> next() override {
+  ExecError open_impl() override;
+  std::expected<sql::Row, sql::CursorError> next_impl() override {
     return end_row();
   }
-  void close() override;
+  void close_impl() override;
   const plan::PlanNode *plan() const override { return plan_; }
   const sql::CursorError &error() const override { return error_; }
   bool produces_rows() const override { return false; }
+  bool is_write() const override { return true; }
   size_t affected_rows() const override { return affected_rows_; }
 
 private:
@@ -339,7 +395,8 @@ private:
 class ExecutorFactory {
 public:
   static std::expected<std::unique_ptr<Executor>, ExecError>
-  create(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table);
+  create(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table,
+         ExecReport *report = nullptr);
 };
 
 // ============================================================
@@ -353,9 +410,11 @@ public:
 class ResultCursor : public sql::Cursor {
 public:
   ResultCursor(std::unique_ptr<Executor> root,
-               std::shared_ptr<sql::Table> table);
+               std::shared_ptr<sql::Table> table,
+               std::vector<std::string> columns = {});
   ~ResultCursor() override { close(); }
 
+  // 门面实现的是 sql::Cursor（不是 Executor 的 SPI）
   std::expected<sql::Row, sql::CursorError> next() override;
   void close() override;
 
@@ -365,12 +424,16 @@ public:
 
   size_t affected_rows() const;
   const Executor *root() const { return root_.get(); }
+  // 结果列名（客户端格式化表格用）：SELECT 是投影列或表的所有列；
+  // 写语句 / DDL 为空
+  const std::vector<std::string> &columns() const { return columns_; }
   // 已经失败时的错误（OK 表示还没出错）
   const sql::CursorError &error() const { return error_; }
 
 private:
   std::unique_ptr<Executor> root_;
   std::shared_ptr<sql::Table> table_;
+  std::vector<std::string> columns_;
   bool opened_ = false;
   bool closed_ = false;
   sql::CursorError error_;
@@ -384,6 +447,11 @@ private:
 //           游标随后只会返回 END。
 // ============================================================
 std::expected<std::unique_ptr<ResultCursor>, ExecError>
-execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table);
+execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table,
+        ExecReport *report = nullptr);
+
+// 一个"没有行流"的游标：DDL / USE 这类没有结果集的语句用（next() 直接 END）。
+// 有它，"一条 SQL -> 一个游标"的调用约定就能统一。
+std::unique_ptr<ResultCursor> empty_result();
 
 } // namespace exec

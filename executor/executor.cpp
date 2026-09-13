@@ -2,6 +2,8 @@
 #include "executor.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -110,6 +112,186 @@ private:
 } // namespace
 
 // ============================================================
+// 执行统计（EXPLAIN ANALYZE）
+// ============================================================
+namespace {
+
+int64_t now_micros() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// 微秒 -> "0.123ms" / "12.3us"
+std::string format_micros(int64_t micros) {
+  if (micros < 0) {
+    return "-";
+  }
+  if (micros < 1000) {
+    return std::to_string(micros) + "us";
+  }
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%.3fms",
+                static_cast<double>(micros) / 1000.0);
+  return buffer;
+}
+
+} // namespace
+
+NodeStats &ExecReport::slot(const plan::PlanNode *node) {
+  for (NodeStats &stats : nodes_) {
+    if (stats.node == node) {
+      return stats;
+    }
+  }
+  nodes_.push_back(NodeStats{node, 0, 0, 0});
+  return nodes_.back();
+}
+
+void ExecReport::on_open(const plan::PlanNode *node) {
+  NodeStats &stats = slot(node);
+  if (stats.start_us == 0) {
+    stats.start_us = now_micros();
+  }
+}
+
+void ExecReport::on_row(const plan::PlanNode *node) { ++slot(node).rows; }
+
+void ExecReport::on_finish(const plan::PlanNode *node) {
+  NodeStats &stats = slot(node);
+  if (stats.end_us == 0) {
+    stats.end_us = now_micros();
+  }
+}
+
+const NodeStats *ExecReport::find(const plan::PlanNode *node) const {
+  for (const NodeStats &stats : nodes_) {
+    if (stats.node == node) {
+      return &stats;
+    }
+  }
+  return nullptr;
+}
+
+int64_t ExecReport::elapsed_us(const plan::PlanNode *node) const {
+  const NodeStats *stats = find(node);
+  if (stats == nullptr || stats->start_us == 0 || stats->end_us == 0) {
+    return -1; // 没测到（比如根本没打开过）
+  }
+  return stats->end_us - stats->start_us;
+}
+
+std::string explain_text(const plan::PlanNode &root, const ExecReport *report) {
+  std::string text;
+  int depth = 0;
+  for (const plan::PlanNode *node = &root; node != nullptr;
+       node = node->child()) {
+    text.append(static_cast<size_t>(depth) * 2, ' ');
+    text += node->to_string();
+    if (report != nullptr) {
+      const NodeStats *stats = report->find(node);
+      text += "  [rows=" + std::to_string(stats != nullptr ? stats->rows : 0);
+      text += " time=" + format_micros(report->elapsed_us(node));
+      text += " cost=" + node->cost().to_string() + "]";
+    }
+    text += "\n";
+    ++depth;
+  }
+  return text;
+}
+
+// ============================================================
+// NVI 包装：数行数/记时间只写一处，算子只管干活
+// ============================================================
+ExecError Executor::open() {
+  if (report_ != nullptr) {
+    report_->on_open(plan());
+  }
+  return open_impl();
+}
+
+std::expected<sql::Row, CursorError> Executor::next() {
+  auto row = next_impl();
+  if (report_ != nullptr) {
+    if (row.has_value()) {
+      report_->on_row(plan());
+    } else {
+      report_->on_finish(plan());
+    }
+  }
+  return row;
+}
+
+void Executor::close() {
+  close_impl();
+  if (report_ != nullptr) {
+    report_->on_finish(plan());
+  }
+}
+
+// 空算子：没有任何行源，next() 直接 END（DDL / USE 用）
+namespace {
+
+class EmptyExecutor : public Executor {
+public:
+  explicit EmptyExecutor(const plan::PlanNode *plan) : plan_(plan) {}
+  ~EmptyExecutor() override { close(); }
+
+  ExecError open_impl() override { return ExecError(); }
+  std::expected<sql::Row, CursorError> next_impl() override {
+    error_ = sql::end_of_stream();
+    return std::unexpected(error_);
+  }
+  void close_impl() override {
+    if (!error_.is_error()) {
+      error_ = sql::end_of_stream();
+    }
+  }
+  const plan::PlanNode *plan() const override { return plan_; }
+  const sql::CursorError &error() const override { return error_; }
+  bool produces_rows() const override { return false; }
+
+private:
+  const plan::PlanNode *plan_ = nullptr;
+  sql::CursorError error_;
+};
+
+} // namespace
+
+namespace {
+
+// 结果列名：投影节点决定顺序/别名；没有投影（SELECT *）就用表的所有列
+std::vector<std::string> result_columns(const plan::PlanNode &root,
+                                        const sql::Table &table) {
+  for (const plan::PlanNode *node = &root; node != nullptr;
+       node = node->child()) {
+    const auto *project = dynamic_cast<const plan::ProjectPlan *>(node);
+    if (project == nullptr) {
+      continue;
+    }
+    const std::vector<sql::ColumnRef> &columns = project->columns();
+    const bool wildcard =
+        columns.empty() || (columns.size() == 1 && columns[0].is_wildcard());
+    if (wildcard) {
+      break;
+    }
+    std::vector<std::string> names;
+    names.reserve(columns.size());
+    for (const auto &column : columns) {
+      names.push_back(column.display_name());
+    }
+    return names;
+  }
+  std::vector<std::string> names;
+  for (const auto &column : table.schema().columns()) {
+    names.push_back(column.name.str());
+  }
+  return names;
+}
+
+} // namespace
+
+// ============================================================
 // ScanExecutor
 // ============================================================
 ScanExecutor::ScanExecutor(const plan::ScanPlan *plan,
@@ -148,7 +330,7 @@ bool ScanExecutor::open_range(size_t index) {
   return false;
 }
 
-ExecError ScanExecutor::open() {
+ExecError ScanExecutor::open_impl() {
   if (opened_) {
     return ExecError(ExecErrorCode::ALREADY_OPEN, "scan already open");
   }
@@ -190,7 +372,7 @@ ExecError ScanExecutor::open() {
   return ExecError();
 }
 
-std::expected<sql::Row, CursorError> ScanExecutor::next() {
+std::expected<sql::Row, CursorError> ScanExecutor::next_impl() {
   if (error_.is_error()) {
     return std::unexpected(error_);
   }
@@ -234,7 +416,7 @@ std::expected<sql::Row, CursorError> ScanExecutor::next() {
   }
 }
 
-void ScanExecutor::close() {
+void ScanExecutor::close_impl() {
   if (range_cursor_ != nullptr) {
     range_cursor_->close();
     range_cursor_.reset();
@@ -274,9 +456,9 @@ bool FilterExecutor::keeps(const sql::Row &row) const {
   return sql::where_keeps(sql::evaluate_condition(*condition_, lookup));
 }
 
-ExecError FilterExecutor::open() { return child_->open(); }
+ExecError FilterExecutor::open_impl() { return child_->open(); }
 
-std::expected<sql::Row, CursorError> FilterExecutor::next() {
+std::expected<sql::Row, CursorError> FilterExecutor::next_impl() {
   while (true) {
     auto row = child_->next();
     if (!row.has_value()) {
@@ -288,7 +470,7 @@ std::expected<sql::Row, CursorError> FilterExecutor::next() {
   }
 }
 
-void FilterExecutor::close() { child_->close(); }
+void FilterExecutor::close_impl() { child_->close(); }
 
 // ============================================================
 // SortExecutor
@@ -300,7 +482,7 @@ SortExecutor::SortExecutor(const plan::SortPlan *plan,
       row_limit_(row_limit), order_by_(plan->order_by()),
       is_top_n_(plan->is_top_n()), top_n_(plan->top_n()) {}
 
-ExecError SortExecutor::open() {
+ExecError SortExecutor::open_impl() {
   if (opened_) {
     return ExecError(ExecErrorCode::ALREADY_OPEN, "sort already open");
   }
@@ -364,7 +546,7 @@ ExecError SortExecutor::open() {
   return ExecError();
 }
 
-std::expected<sql::Row, CursorError> SortExecutor::next() {
+std::expected<sql::Row, CursorError> SortExecutor::next_impl() {
   if (error_.is_error()) {
     return std::unexpected(error_);
   }
@@ -380,7 +562,7 @@ std::expected<sql::Row, CursorError> SortExecutor::next() {
   return std::move(rows_[cursor_++]);
 }
 
-void SortExecutor::close() {
+void SortExecutor::close_impl() {
   if (child_ != nullptr) {
     child_->close();
   }
@@ -399,14 +581,14 @@ LimitExecutor::LimitExecutor(const plan::LimitPlan *plan,
                              std::unique_ptr<Executor> child)
     : plan_(plan), child_(std::move(child)), limit_(plan->limit()) {}
 
-ExecError LimitExecutor::open() {
+ExecError LimitExecutor::open_impl() {
   skipped_ = 0;
   produced_ = 0;
   done_ = false;
   return child_->open();
 }
 
-std::expected<sql::Row, CursorError> LimitExecutor::next() {
+std::expected<sql::Row, CursorError> LimitExecutor::next_impl() {
   if (done_) {
     return end_of_stream();
   }
@@ -435,7 +617,7 @@ std::expected<sql::Row, CursorError> LimitExecutor::next() {
   return std::move(*row);
 }
 
-void LimitExecutor::close() {
+void LimitExecutor::close_impl() {
   if (child_ != nullptr) {
     child_->close();
   }
@@ -451,7 +633,7 @@ ProjectExecutor::ProjectExecutor(const plan::ProjectPlan *plan,
     : plan_(plan), child_(std::move(child)), table_(std::move(table)),
       columns_(plan->columns()) {}
 
-ExecError ProjectExecutor::open() {
+ExecError ProjectExecutor::open_impl() {
   column_indexes_.clear();
   const bool wildcard =
       columns_.empty() || (columns_.size() == 1 && columns_[0].is_wildcard());
@@ -468,7 +650,7 @@ ExecError ProjectExecutor::open() {
   return child_->open();
 }
 
-std::expected<sql::Row, CursorError> ProjectExecutor::next() {
+std::expected<sql::Row, CursorError> ProjectExecutor::next_impl() {
   auto row = child_->next();
   if (!row.has_value()) {
     return std::unexpected(row.error());
@@ -486,7 +668,7 @@ std::expected<sql::Row, CursorError> ProjectExecutor::next() {
   return projected;
 }
 
-void ProjectExecutor::close() {
+void ProjectExecutor::close_impl() {
   if (child_ != nullptr) {
     child_->close();
   }
@@ -505,7 +687,7 @@ UpdateExecutor::UpdateExecutor(const plan::UpdatePlan *plan,
   }
 }
 
-ExecError UpdateExecutor::open() {
+ExecError UpdateExecutor::open_impl() {
   if (opened_) {
     return ExecError(ExecErrorCode::ALREADY_OPEN, "update already open");
   }
@@ -561,7 +743,7 @@ std::expected<sql::Row, CursorError> UpdateExecutor::end_row() {
   return std::unexpected(error_);
 }
 
-void UpdateExecutor::close() {
+void UpdateExecutor::close_impl() {
   if (child_ != nullptr) {
     child_->close();
   }
@@ -575,7 +757,7 @@ DeleteExecutor::DeleteExecutor(const plan::DeletePlan *plan,
                                std::shared_ptr<sql::Table> table)
     : plan_(plan), child_(std::move(child)), table_(std::move(table)) {}
 
-ExecError DeleteExecutor::open() {
+ExecError DeleteExecutor::open_impl() {
   if (opened_) {
     return ExecError(ExecErrorCode::ALREADY_OPEN, "delete already open");
   }
@@ -626,7 +808,7 @@ std::expected<sql::Row, CursorError> DeleteExecutor::end_row() {
   return std::unexpected(error_);
 }
 
-void DeleteExecutor::close() {
+void DeleteExecutor::close_impl() {
   if (child_ != nullptr) {
     child_->close();
   }
@@ -694,7 +876,7 @@ InsertExecutor::build_row(size_t row_index) const {
   return row;
 }
 
-ExecError InsertExecutor::open() {
+ExecError InsertExecutor::open_impl() {
   if (opened_) {
     return ExecError(ExecErrorCode::ALREADY_OPEN, "insert already open");
   }
@@ -726,7 +908,7 @@ std::expected<sql::Row, CursorError> InsertExecutor::end_row() {
   return std::unexpected(error_);
 }
 
-void InsertExecutor::close() {
+void InsertExecutor::close_impl() {
   if (!error_.is_error()) {
     error_ = sql::end_of_stream();
   }
@@ -737,11 +919,18 @@ void InsertExecutor::close() {
 // ============================================================
 std::expected<std::unique_ptr<Executor>, ExecError>
 ExecutorFactory::create(const plan::PlanNode &plan,
-                        std::shared_ptr<sql::Table> table) {
+                        std::shared_ptr<sql::Table> table, ExecReport *report) {
   if (table == nullptr) {
     return std::unexpected(ExecError(ExecErrorCode::INVALID_ARGUMENT,
                                      "create executor without table"));
   }
+  // 统计器挂到每个算子上（nullptr = 不统计）
+  const auto attach = [report](std::unique_ptr<Executor> executor) {
+    if (executor != nullptr && report != nullptr) {
+      executor->set_report(report);
+    }
+    return executor;
+  };
 
   switch (plan.type()) {
   case plan::PlanType::FULL_SCAN:
@@ -758,8 +947,7 @@ ExecutorFactory::create(const plan::PlanNode &plan,
                     "plan targets table '" + scan->target().table.str() +
                         "' but got '" + table->table_name().str() + "'"));
     }
-    return std::unique_ptr<Executor>(
-        std::make_unique<ScanExecutor>(scan, std::move(table)));
+    return attach(std::make_unique<ScanExecutor>(scan, std::move(table)));
   }
   case plan::PlanType::FILTER: {
     const auto *filter = dynamic_cast<const plan::FilterPlan *>(&plan);
@@ -767,12 +955,12 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(
           ExecError(ExecErrorCode::INVALID_ARGUMENT, "filter without child"));
     }
-    auto child = create(*filter->child(), table);
+    auto child = create(*filter->child(), table, report);
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
-    return std::unique_ptr<Executor>(std::make_unique<FilterExecutor>(
-        filter, std::move(*child), std::move(table)));
+    return attach(std::make_unique<FilterExecutor>(filter, std::move(*child),
+                                                   std::move(table)));
   }
   case plan::PlanType::SORT: {
     const auto *sort = dynamic_cast<const plan::SortPlan *>(&plan);
@@ -780,12 +968,12 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(
           ExecError(ExecErrorCode::INVALID_ARGUMENT, "sort without child"));
     }
-    auto child = create(*sort->child(), table);
+    auto child = create(*sort->child(), table, report);
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
-    return std::unique_ptr<Executor>(std::make_unique<SortExecutor>(
-        sort, std::move(*child), std::move(table)));
+    return attach(std::make_unique<SortExecutor>(sort, std::move(*child),
+                                                 std::move(table)));
   }
   case plan::PlanType::LIMIT: {
     const auto *limit = dynamic_cast<const plan::LimitPlan *>(&plan);
@@ -793,12 +981,11 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(
           ExecError(ExecErrorCode::INVALID_ARGUMENT, "limit without child"));
     }
-    auto child = create(*limit->child(), table);
+    auto child = create(*limit->child(), table, report);
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
-    return std::unique_ptr<Executor>(
-        std::make_unique<LimitExecutor>(limit, std::move(*child)));
+    return attach(std::make_unique<LimitExecutor>(limit, std::move(*child)));
   }
   case plan::PlanType::PROJECT: {
     const auto *project = dynamic_cast<const plan::ProjectPlan *>(&plan);
@@ -806,12 +993,12 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(
           ExecError(ExecErrorCode::INVALID_ARGUMENT, "project without child"));
     }
-    auto child = create(*project->child(), table);
+    auto child = create(*project->child(), table, report);
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
-    return std::unique_ptr<Executor>(std::make_unique<ProjectExecutor>(
-        project, std::move(*child), std::move(table)));
+    return attach(std::make_unique<ProjectExecutor>(project, std::move(*child),
+                                                    std::move(table)));
   }
   case plan::PlanType::UPDATE: {
     const auto *update = dynamic_cast<const plan::UpdatePlan *>(&plan);
@@ -819,12 +1006,12 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(
           ExecError(ExecErrorCode::INVALID_ARGUMENT, "update without child"));
     }
-    auto child = create(*update->child(), table);
+    auto child = create(*update->child(), table, report);
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
-    return std::unique_ptr<Executor>(std::make_unique<UpdateExecutor>(
-        update, std::move(*child), std::move(table)));
+    return attach(std::make_unique<UpdateExecutor>(update, std::move(*child),
+                                                   std::move(table)));
   }
   case plan::PlanType::DELETE: {
     const auto *del = dynamic_cast<const plan::DeletePlan *>(&plan);
@@ -832,12 +1019,12 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(
           ExecError(ExecErrorCode::INVALID_ARGUMENT, "delete without child"));
     }
-    auto child = create(*del->child(), table);
+    auto child = create(*del->child(), table, report);
     if (!child.has_value()) {
       return std::unexpected(child.error());
     }
-    return std::unique_ptr<Executor>(std::make_unique<DeleteExecutor>(
-        del, std::move(*child), std::move(table)));
+    return attach(std::make_unique<DeleteExecutor>(del, std::move(*child),
+                                                   std::move(table)));
   }
   case plan::PlanType::INSERT: {
     const auto *insert = dynamic_cast<const plan::InsertPlan *>(&plan);
@@ -845,8 +1032,7 @@ ExecutorFactory::create(const plan::PlanNode &plan,
       return std::unexpected(ExecError(ExecErrorCode::INVALID_ARGUMENT,
                                        "node is not an insert plan"));
     }
-    return std::unique_ptr<Executor>(
-        std::make_unique<InsertExecutor>(insert, std::move(table)));
+    return attach(std::make_unique<InsertExecutor>(insert, std::move(table)));
   }
   default:
     // DDL / USE 没有行流：由上层用 sql::Catalog 执行（USE 还需要会话状态）
@@ -861,8 +1047,10 @@ ExecutorFactory::create(const plan::PlanNode &plan,
 // ResultCursor：客户端门面
 // ============================================================
 ResultCursor::ResultCursor(std::unique_ptr<Executor> root,
-                           std::shared_ptr<sql::Table> table)
-    : root_(std::move(root)), table_(std::move(table)) {}
+                           std::shared_ptr<sql::Table> table,
+                           std::vector<std::string> columns)
+    : root_(std::move(root)), table_(std::move(table)),
+      columns_(std::move(columns)) {}
 
 ExecError ResultCursor::open_now() {
   if (closed_) {
@@ -922,13 +1110,19 @@ size_t ResultCursor::affected_rows() const {
 }
 
 std::expected<std::unique_ptr<ResultCursor>, ExecError>
-execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table) {
-  auto root = ExecutorFactory::create(plan, table);
+execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table,
+        ExecReport *report) {
+  auto root = ExecutorFactory::create(plan, table, report);
   if (!root.has_value()) {
     return std::unexpected(root.error());
   }
-  auto cursor =
-      std::make_unique<ResultCursor>(std::move(*root), std::move(table));
+  // 结果列名：有投影节点就用投影列，否则用表的所有列（客户端格式化用）
+  std::vector<std::string> columns;
+  if ((*root)->produces_rows() && table != nullptr) {
+    columns = result_columns(plan, *table);
+  }
+  auto cursor = std::make_unique<ResultCursor>(
+      std::move(*root), std::move(table), std::move(columns));
 
   // 写语句：这里就执行（客户端不会来 fetch，语句必须真的落地）。
   // 行流语句（SELECT 类）：惰性 open，第一次 next() 才启动。
@@ -939,6 +1133,11 @@ execute(const plan::PlanNode &plan, std::shared_ptr<sql::Table> table) {
     }
   }
   return cursor;
+}
+
+std::unique_ptr<ResultCursor> empty_result() {
+  return std::make_unique<ResultCursor>(
+      std::make_unique<EmptyExecutor>(nullptr), nullptr);
 }
 
 } // namespace exec

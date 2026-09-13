@@ -12,7 +12,7 @@
 #include <string.h>
 
 size_t ast_min_buf_size = 4096;
-size_t ast_max_buf_size = 4*4096;
+size_t ast_max_buf_size = 4 * 4096;
 #define MIN_BUF_SIZE ast_min_buf_size
 #define MAX_BUF_SIZE ast_max_buf_size
 
@@ -23,9 +23,8 @@ int ast_debug = 0;
 
 #define DEBUG_PRINT ast_debug
 
-
-static void DEBUG(const char * fmt, ...) {
-  if(DEBUG_PRINT) {
+static void DEBUG(const char *fmt, ...) {
+  if (DEBUG_PRINT) {
     fprintf(stderr, "[DEBUG] ");
     va_list args;
     va_start(args, fmt);
@@ -33,7 +32,6 @@ static void DEBUG(const char * fmt, ...) {
     va_end(args);
     fprintf(stderr, "\n");
   }
-  
 }
 static int step(int indent) { return indent + STEP; }
 
@@ -285,12 +283,13 @@ int print_select_node(ASTNode *node, int indent, int offset, char *buffer,
   // condition
   if (data->condition != nullptr) {
     offset = print_title("WHERE:", step(indent), offset, buffer, buffer_size);
-    offset =
-        print_node(data->condition, step(step(indent)), offset, buffer, buffer_size);
+    offset = print_node(data->condition, step(step(indent)), offset, buffer,
+                        buffer_size);
   }
   // order_by
   if (data->order_by != nullptr) {
-    //offset = print_title("ORDER_BY:", step(indent), offset, buffer, buffer_size);
+    // offset = print_title("ORDER_BY:", step(indent), offset, buffer,
+    // buffer_size);
     offset =
         print_node(data->order_by, step(indent), offset, buffer, buffer_size);
   }
@@ -349,8 +348,9 @@ int print_insert_node(ASTNode *node, int indent, int offset, char *buffer,
   if (data->columns != nullptr) {
     offset =
         print_node(data->columns, step(indent), offset, buffer, buffer_size);
-  }else{
-    offset = print_title("COLUMNS: NULL", step(indent), offset, buffer, buffer_size);
+  } else {
+    offset =
+        print_title("COLUMNS: NULL", step(indent), offset, buffer, buffer_size);
   }
   if (data->values != nullptr) {
     offset =
@@ -402,8 +402,8 @@ int print_update_node(ASTNode *node, int indent, int offset, char *buffer,
   }
   if (data->condition != nullptr) {
     offset = print_title("WHERE: ", step(indent), offset, buffer, buffer_size);
-    offset =
-        print_node(data->condition, step(step(indent)), offset, buffer, buffer_size);
+    offset = print_node(data->condition, step(step(indent)), offset, buffer,
+                        buffer_size);
   }
   return offset;
 }
@@ -445,8 +445,8 @@ int print_delete_node(ASTNode *node, int indent, int offset, char *buffer,
                        (data->table != nullptr) ? data->table : "");
   if (data->condition != nullptr) {
     offset = print_title("WHERE: ", step(indent), offset, buffer, buffer_size);
-    offset =
-        print_node(data->condition, step(step(indent)), offset, buffer, buffer_size);
+    offset = print_node(data->condition, step(step(indent)), offset, buffer,
+                        buffer_size);
   }
   return offset;
 }
@@ -488,7 +488,7 @@ int print_assignment_node(ASTNode *node, int indent, int offset, char *buffer,
   } else {
     offset = print_node(data->value, 0, offset, buffer, buffer_size);
   }
-  offset = safe_append(buffer, buffer_size, offset-1, ")\n");
+  offset = safe_append(buffer, buffer_size, offset - 1, ")\n");
 
   return offset;
 }
@@ -532,7 +532,7 @@ int print_compare_node(ASTNode *node, int indent, int offset, char *buffer,
   } else {
     offset = safe_append(buffer, buffer_size, offset, "NULL ");
   }
-  offset = safe_append(buffer, buffer_size, offset-1, ")\n");
+  offset = safe_append(buffer, buffer_size, offset - 1, ")\n");
   return offset;
 }
 
@@ -575,7 +575,7 @@ int print_in_node(ASTNode *node, int indent, int offset, char *buffer,
   InNode *data = (InNode *)node->data;
   offset = append_indent(buffer, buffer_size, offset, indent);
   offset = safe_append(buffer, buffer_size, offset, "%s(column='%s')\n",
-                       data->excluded>0 ? "NOT_IN" : "IN",
+                       data->excluded > 0 ? "NOT_IN" : "IN",
                        (data->column != nullptr) ? data->column : "");
   if (data->values != nullptr) {
     offset =
@@ -623,14 +623,16 @@ int print_binary_node(ASTNode *node, int indent, int offset, char *buffer,
                        op_to_string(data->op));
   if (data->left != nullptr) {
     offset = print_title("LEFT:", step(indent), offset, buffer, buffer_size);
-    offset = print_node(data->left, step(step(indent)), offset, buffer, buffer_size);
+    offset =
+        print_node(data->left, step(step(indent)), offset, buffer, buffer_size);
   } else {
     offset =
         print_title("LEFT: NULL", step(indent), offset, buffer, buffer_size);
   }
   if (data->right != nullptr) {
     offset = print_title("RIGHT:", step(indent), offset, buffer, buffer_size);
-    offset = print_node(data->right, step(step(indent)), offset, buffer, buffer_size);
+    offset = print_node(data->right, step(step(indent)), offset, buffer,
+                        buffer_size);
   } else {
     offset =
         print_title("RIGHT: NULL", step(indent), offset, buffer, buffer_size);
@@ -730,19 +732,19 @@ int print_list(ASTNode *node, int indent, int offset, char *buffer,
   return offset;
 }
 
-  void free_list(ASTNode *list_node) {
-    if (list_node == nullptr) {
-      return;
-    }
-    USE_DATA(list, list_node, ASTNodeList);
-    ASTNode *curr = list->head;
-    while (curr != nullptr) {
-      ASTNode *next = curr->next;
-      free_ast(curr);
-      curr = next;
-    }
-    free(list_node);
+void free_list(ASTNode *list_node) {
+  if (list_node == nullptr) {
+    return;
   }
+  USE_DATA(list, list_node, ASTNodeList);
+  ASTNode *curr = list->head;
+  while (curr != nullptr) {
+    ASTNode *next = curr->next;
+    free_ast(curr);
+    curr = next;
+  }
+  free(list_node);
+}
 
 /* ============================================================
    NODE_ORDER
@@ -763,9 +765,10 @@ int print_order_node(ASTNode *node, int indent, int offset, char *buffer,
                      size_t buffer_size) {
   OrderNode *data = (OrderNode *)node->data;
   offset = append_indent(buffer, buffer_size, offset, indent);
-  offset = safe_append(
-      buffer, buffer_size, offset, "ORDER_BY(column='%s', dir=%s)\n",
-      (data->column != nullptr) ? data->column : "", op_to_string(data->direction));
+  offset = safe_append(buffer, buffer_size, offset,
+                       "ORDER_BY(column='%s', dir=%s)\n",
+                       (data->column != nullptr) ? data->column : "",
+                       op_to_string(data->direction));
   return offset;
 }
 
@@ -805,8 +808,8 @@ int print_limit_node(ASTNode *node, int indent, int offset, char *buffer,
            data->limit);
   snprintf(offset_text, sizeof(offset_text), data->has_offset ? "%d" : "-",
            data->offset);
-  offset = safe_append(buffer, buffer_size, offset, "LIMIT(limit=%s, offset=%s)\n",
-                       limit_text, offset_text);
+  offset = safe_append(buffer, buffer_size, offset,
+                       "LIMIT(limit=%s, offset=%s)\n", limit_text, offset_text);
   return offset;
 }
 
@@ -925,7 +928,8 @@ int print_create_table_node(ASTNode *node, int indent, int offset, char *buffer,
       safe_append(buffer, buffer_size, offset, "CREATE_TABLE(table='%s')\n",
                   (data->table_name != nullptr) ? data->table_name : "");
   if (data->columns != nullptr) {
-    offset = print_node(data->columns, step(indent), offset, buffer, buffer_size);
+    offset =
+        print_node(data->columns, step(indent), offset, buffer, buffer_size);
   }
   return offset;
 }
@@ -995,8 +999,8 @@ ASTNode *make_column_def_node(const char *name, CDataType data_type,
 /* 类型名 + 可选长度，例如 VARCHAR(32) */
 static void format_column_type(const ColumnDefNode *data, char *out,
                                size_t out_size) {
-  if (data->length > 0 && (data->data_type == DT_CHAR ||
-                           data->data_type == DT_VARCHAR)) {
+  if (data->length > 0 &&
+      (data->data_type == DT_CHAR || data->data_type == DT_VARCHAR)) {
     snprintf(out, out_size, "%s(%u)", data_type_to_string(data->data_type),
              data->length);
   } else {
@@ -1013,8 +1017,7 @@ int print_column_def_node(ASTNode *node, int indent, int offset, char *buffer,
   offset = safe_append(buffer, buffer_size, offset,
                        "COLUMN_DEFINE(NAME='%s', DATA_TYPE=%s, PRIMARY_KEY=%d, "
                        "NULLABLE=%d)\n",
-                       (data->name != nullptr) ? data->name : "",
-                       type_name,
+                       (data->name != nullptr) ? data->name : "", type_name,
                        data->is_primary_key, data->nullable);
   return offset;
 }
@@ -1121,11 +1124,11 @@ void free_ast(ASTNode *node) {
   if ((obj != nullptr) && (obj->do_free != nullptr)) {
     DEBUG("free(NODE:%s), %p freed\n", node_type_to_string(node->type), node);
     obj->do_free(node);
-    
+
   } else {
     // fallback: 只释放节点本身（不处理子节点）
     DEBUG("free_ast: node type %d, %p freed (no free function)\n", node->type,
-           node);
+          node);
     free(node);
   }
 }

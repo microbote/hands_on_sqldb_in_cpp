@@ -130,7 +130,7 @@ std::vector<KeyRange> coalesce_adjacent_points(std::vector<KeyRange> ranges,
       continue;
     }
     const Value start = ranges[i].point_value();
-    if (start.is_null()) {  // NULL 是单点，不能和后一个值连起来
+    if (start.is_null()) { // NULL 是单点，不能和后一个值连起来
       result.push_back(ranges[i]);
       ++i;
       continue;
@@ -150,6 +150,20 @@ std::vector<KeyRange> coalesce_adjacent_points(std::vector<KeyRange> ranges,
     i = last + 1;
   }
   return result;
+}
+
+// 候选集是不是"稀疏点集"（全是退化区间、不含区间扫描）：
+// 只有这种情况才轮得到"点查 vs 全表扫"的成本比较。
+bool is_sparse_point_set(const std::vector<KeyRange> &ranges) {
+  if (ranges.size() < 2) {
+    return false; // 单点：规则上就是点查，不再比较
+  }
+  for (const KeyRange &range : ranges) {
+    if (!range.is_point() || range.is_empty()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // 主键条件 -> 候选区间集合。
@@ -576,13 +590,49 @@ Optimizer::convert_to_key_range(const sql::Query &query,
   out.primary_key = pk_result.pk_column;
   out.primary_key_type = pk_result.pk_type;
 
+  // 统计（成本模型用）：拿不到就保持 -1，后面退回规则行为
+  RelationStats stats;
+  if (stats_) {
+    stats = stats_(pk_result.db, pk_result.table);
+  }
+  out.estimated_table_rows = stats.rows_known ? stats.rows : -1;
+
   std::vector<KeyRange> candidates;
   if (pk_result.pk_cond) {
     auto converted = range_of_condition(*pk_result.pk_cond, pk_result.pk_type);
     if (converted.has_value()) {
       candidates = normalize_ranges(std::move(*converted));
-      candidates = coalesce_adjacent_points(std::move(candidates),
-                                            pk_result.pk_type);
+      candidates =
+          coalesce_adjacent_points(std::move(candidates), pk_result.pk_type);
+      // ============================================================
+      // 唯一的成本决策点（占位）：稀疏点集要不要真的下推？
+      //
+      // k 个点查 ≈ k 次 seek + k 行；全表扫 ≈ N 行。点集相对表太大时，
+      // 走全表扫描 + 过滤更便宜 —— 此时**必须把主键谓词放回过滤条件**，
+      // 否则会得到一个"少扫了但结果不对"的计划（成本模型不允许影响正确性）。
+      // ============================================================
+      // 对比口径要和 EXPLAIN 显示的一致：全表扫要算上"每行都过一遍谓词"
+      // 的过滤成本（点查不需要），否则会选出"看起来更贵"的计划。
+      const double point_cost =
+          cost_model_.point_lookups(static_cast<int64_t>(candidates.size()))
+              .total;
+      const double scan_cost = cost_model_
+                                   .filter(cost_model_.full_scan(stats),
+                                           static_cast<double>(stats.rows))
+                                   .total;
+      if (stats.rows_known && point_cost > scan_cost && !candidates.empty() &&
+          is_sparse_point_set(candidates)) {
+        out.ranges.push_back(KeyRange::all(pk_result.pk_type));
+        out.remaining_filter = rewrite_condition_tree(
+            rebuild_split(pk_result.pk_cond->clone(),
+                          pk_result.remaining ? pk_result.remaining->clone()
+                                              : nullptr)
+                .get());
+        collect_exclusions(out.remaining_filter.get(), out.primary_key,
+                           out.exclude_keys);
+        out.is_point_query = false;
+        return out;
+      }
       if (candidates.empty()) {
         candidates.push_back(KeyRange::empty(pk_result.pk_type));
       }

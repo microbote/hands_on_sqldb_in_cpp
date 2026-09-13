@@ -209,3 +209,122 @@ TEST(Catalog, ClosedEngineReportsNotOpen) {
     CHECK(table.error().code == sql::RelErrorCode::NOT_OPEN);
   }
 }
+
+// ============================================================
+// 统计信息（建表/建库时间、最后写入时间）
+// ============================================================
+TEST(Catalog, StatsRecordsCreationTimeWithInjectedClock) {
+  auto engine = reltest::open_engine();
+  int64_t now = 1000;
+  sql::KVCatalog catalog(engine, [&now] { return now; });
+
+  CHECK(catalog.create_database(kDb));
+  now = 2000; // 建库时间应当在那一刻定格
+  CHECK(catalog.create_table(kDb, reltest::make_users_schema()));
+
+  auto db_stats = catalog.database_stats(kDb);
+  CHECK(db_stats.has_value());
+  if (db_stats.has_value()) {
+    CHECK_EQ(db_stats->created_at, int64_t{1000});
+  }
+  auto table_stats = catalog.table_stats(kDb, sql::Identifier("users"));
+  CHECK(table_stats.has_value());
+  if (table_stats.has_value()) {
+    CHECK_EQ(table_stats->created_at, int64_t{2000});
+    CHECK_EQ(table_stats->last_write_at, int64_t{0}); // 还没写过
+  }
+}
+
+TEST(Catalog, TouchTableUpdatesLastWriteTime) {
+  auto engine = reltest::open_engine();
+  int64_t now = 100;
+  sql::KVCatalog catalog(engine, [&now] { return now; });
+  CHECK(catalog.create_database(kDb));
+  CHECK(catalog.create_table(kDb, reltest::make_users_schema()));
+
+  now = 500;
+  CHECK(catalog.touch_table(kDb, sql::Identifier("users")));
+  auto stats = catalog.table_stats(kDb, sql::Identifier("users"));
+  CHECK(stats.has_value());
+  if (stats.has_value()) {
+    CHECK_EQ(stats->created_at, int64_t{100});    // 建表时间不变
+    CHECK_EQ(stats->last_write_at, int64_t{500}); // 写入时间更新了
+  }
+  // 表不存在时不能瞎写
+  CHECK(!catalog.touch_table(kDb, sql::Identifier("nope")));
+}
+
+TEST(Catalog, StatsSurviveReopenAndAreDroppedWithTheTable) {
+  auto engine = reltest::open_engine();
+  int64_t now = 42;
+  {
+    sql::KVCatalog catalog(engine, [&now] { return now; });
+    CHECK(catalog.create_database(kDb));
+    CHECK(catalog.create_table(kDb, reltest::make_users_schema()));
+    now = 99;
+    CHECK(catalog.touch_table(kDb, sql::Identifier("users")));
+  }
+  // 新实例从 KV 读回
+  {
+    sql::KVCatalog reopened(engine, [&now] { return now; });
+    auto stats = reopened.table_stats(kDb, sql::Identifier("users"));
+    CHECK(stats.has_value());
+    if (stats.has_value()) {
+      CHECK_EQ(stats->created_at, int64_t{42});
+      CHECK_EQ(stats->last_write_at, int64_t{99});
+    }
+    // DROP TABLE 要把统计一起删掉：重新建表后 last_write_at 必须回到 0
+    CHECK(reopened.drop_table(kDb, sql::Identifier("users")));
+    now = 123;
+    CHECK(reopened.create_table(kDb, reltest::make_users_schema()));
+    auto fresh = reopened.table_stats(kDb, sql::Identifier("users"));
+    CHECK(fresh.has_value());
+    if (fresh.has_value()) {
+      CHECK_EQ(fresh->created_at, int64_t{123});
+      CHECK_EQ(fresh->last_write_at, int64_t{0}); // 没有残留旧值
+    }
+  }
+}
+
+TEST(Catalog, DropDatabaseRemovesStats) {
+  auto engine = reltest::open_engine();
+  int64_t now = 7;
+  sql::KVCatalog catalog(engine, [&now] { return now; });
+  CHECK(catalog.create_database(kDb));
+  CHECK(catalog.create_table(kDb, reltest::make_users_schema()));
+  now = 70;
+  CHECK(catalog.touch_table(kDb, sql::Identifier("users")));
+  CHECK(catalog.drop_database(kDb));
+
+  // 重建同名库表：统计必须是全新的（旧的 dbstats/tablestats 已被清掉）
+  now = 777;
+  CHECK(catalog.create_database(kDb));
+  CHECK(catalog.create_table(kDb, reltest::make_users_schema()));
+  auto db_stats = catalog.database_stats(kDb);
+  CHECK(db_stats.has_value());
+  if (db_stats.has_value()) {
+    CHECK_EQ(db_stats->created_at, int64_t{777});
+  }
+  auto table_stats = catalog.table_stats(kDb, sql::Identifier("users"));
+  CHECK(table_stats.has_value());
+  if (table_stats.has_value()) {
+    CHECK_EQ(table_stats->last_write_at, int64_t{0});
+  }
+}
+
+TEST(Catalog, StatsForMissingObjectsReportErrors) {
+  auto engine = reltest::open_engine();
+  sql::KVCatalog catalog(engine);
+  CHECK(catalog.create_database(kDb));
+
+  auto db_stats = catalog.database_stats(sql::Identifier("nope"));
+  CHECK(!db_stats.has_value());
+  if (!db_stats.has_value()) {
+    CHECK(db_stats.error().code == sql::RelErrorCode::NOT_FOUND);
+  }
+  auto table_stats = catalog.table_stats(kDb, sql::Identifier("nope"));
+  CHECK(!table_stats.has_value());
+  if (!table_stats.has_value()) {
+    CHECK(table_stats.error().code == sql::RelErrorCode::TABLE_NOT_FOUND);
+  }
+}

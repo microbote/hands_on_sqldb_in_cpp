@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "planner/cost.h"
 #include "planner/planner_defs.h"
 #include "sql_types/catalog.h"
 #include "sql_types/identifier.h"
@@ -60,6 +61,8 @@ struct OptimizedQuery {
   sql::KeySet exclude_keys;
   bool is_point_query = false;
   sql::ConditionPtr remaining_filter;
+  // 表行数（-1 = 未知）：planner 用它算成本，也是成本模型唯一依赖的统计量
+  int64_t estimated_table_rows = -1;
 
   // Query 没有默认构造（type_ 由 variant 推导，不允许"空 Query"），
   // 所以 OptimizedQuery 也没有默认构造：必须带着语句一起构造。
@@ -102,7 +105,10 @@ struct OptimizedQuery {
 
 class Optimizer {
 public:
-  explicit Optimizer(const sql::Catalog &catalog) : catalog_(catalog) {}
+  // stats 可选：给了才能做基于成本的决策（"稀疏点集要不要下推"）；
+  // 不给就退回纯规则行为（统计未知时同样退回规则）。
+  explicit Optimizer(const sql::Catalog &catalog, StatsProvider stats = {})
+      : catalog_(catalog), stats_(std::move(stats)) {}
 
   // 根据 query 类型分派：只有 DML 需要"主键抽取 -> 重写 -> 转 KeyRange"，
   // DDL/USE 不带扫描空间（ranges = {all()} 的规范形式）。
@@ -157,6 +163,8 @@ private:
 
 private:
   const sql::Catalog &catalog_; // only for lookup, so make const constraint.
+  StatsProvider stats_;         // 统计供给（可为空）
+  CostModel cost_model_;        // 极简成本模型（占位）
 };
 
 } // namespace plan

@@ -16,7 +16,9 @@
 // relation 自己的操作（open_table）用 std::expected<_, RelError>。
 #pragma once
 
+#include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,9 +36,27 @@ class KVEngine;
 
 namespace sql {
 
+// ============================================================
+// 统计信息（元命令等客户端展示用）
+// ============================================================
+struct DatabaseStats {
+  int64_t created_at = 0; // 建库时间（Unix 秒）
+};
+
+struct TableStats {
+  int64_t created_at = 0;    // 建表时间（Unix 秒）
+  int64_t last_write_at = 0; // 最近一次改了这张表的写语句时间（0 = 还没写过）
+  // 维护着的行数：只给优化器估算用（-1 = 未知）。
+  // 元命令 \dt / \d 显示的行数仍然是现算的，保证看到的是真值。
+  int64_t row_count = -1;
+};
+
 class KVCatalog : public Catalog {
 public:
-  explicit KVCatalog(std::shared_ptr<kv::KVEngine> engine);
+  // 时间源可注入：默认取系统时间；测试里给个假时钟就能做确定性断言
+  using Clock = std::function<int64_t()>;
+
+  explicit KVCatalog(std::shared_ptr<kv::KVEngine> engine, Clock now = {});
   ~KVCatalog() override = default;
 
   // ===== sql::Catalog 接口 =====
@@ -73,6 +93,17 @@ public:
   std::expected<Table, RelError>
   open_current_table(const Identifier &table_name) const;
 
+  // ---- 统计信息 ----
+  std::expected<DatabaseStats, RelError>
+  database_stats(const Identifier &db_name) const;
+  std::expected<TableStats, RelError>
+  table_stats(const Identifier &db_name, const Identifier &table_name) const;
+
+  // 写语句改了表之后由上层调用（session 用）：更新"最后写入时间"，
+  // 并按 delta 调整行数（INSERT +n / DELETE -n / UPDATE 传 0）
+  bool touch_table(const Identifier &db_name, const Identifier &table_name,
+                   int64_t row_delta = 0);
+
   kv::KVEngine *engine() const { return engine_.get(); }
 
 private:
@@ -93,6 +124,7 @@ private:
 
   std::shared_ptr<kv::KVEngine> engine_;
   Identifier current_db_; // 会话状态：当前数据库（USE）
+  Clock now_;             // 时间源（默认系统时间）
 };
 
 } // namespace sql

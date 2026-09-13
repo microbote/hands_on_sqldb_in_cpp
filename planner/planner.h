@@ -20,13 +20,18 @@ namespace plan {
 
 class Planner {
 public:
-  Planner() = default;
+  // 成本模型只用来给计划节点标估算成本（EXPLAIN 展示），不影响正确性
+  explicit Planner(CostModel cost_model = {})
+      : cost_model_(std::move(cost_model)) {}
   virtual ~Planner() = default;
 
   // 返回堆上的计划节点：PlanNode 是多态基类，按值返回必然切片
   // （原接口的 `std::expected<PlanNode, PlanError>` 无法编译）。
   std::expected<std::unique_ptr<PlanNode>, PlanError>
   plan(OptimizedQuery query);
+
+private:
+  CostModel cost_model_;
 };
 
 } // namespace plan

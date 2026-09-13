@@ -101,3 +101,19 @@ DDL/USE: 叶子
 
 `Planner::plan()` 返回 `std::expected<std::unique_ptr<PlanNode>, PlanError>`：
 `PlanNode` 是抽象基类，按值返回会切片，原签名无法编译。
+
+### 4. 成本模型（`planner/cost.h`）—— **占位性质**
+
+这一步只是为了把"统计 → 成本 → 选计划"这个环节真实地放进链路，不追求准确：
+
+- `Cost{startup, total}` 两个数：LIMIT 只关心 startup，其余关心 total；
+- **目前唯一的决策点**：稀疏点集要不要下推（`optimizer.cpp`）。
+  `k` 个点查 ≈ `k*(seek + 1 行)`；全表扫 + 过滤 ≈ `N*(扫一行 + 过一遍谓词)`；
+  点集相对表太大时退回全表扫 —— **此时必须把主键谓词放回 `remaining_filter`**，
+  否则会得到"少扫了但结果不对"的计划（成本模型不允许影响正确性）。
+- 常数是相对量（扫一行 = 1），`seek = 10`：约 `k > N/5` 时点集退化。
+- 统计只有一个数：表的行数。它来自 `@system/tablestats`（session 在写语句后维护，
+  `sql_types` 的 Catalog 接口不用改 —— planner 通过 `StatsProvider` 这个
+  `std::function` 拿统计）。**统计缺失时不做决策**，退回纯规则行为。
+- `EXPLAIN` 打印 `cost=startup..total`，`EXPLAIN ANALYZE` 打印实际行数/耗时 ——
+  两栏对照才能判断模型准不准。

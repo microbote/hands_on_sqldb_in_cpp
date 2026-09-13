@@ -135,6 +135,7 @@ std::string plan_tree_to_string(const PlanNode &root) {
   while (node != nullptr) {
     text.append(static_cast<size_t>(depth) * 2, ' ');
     text += node->to_string();
+    text += "  [cost=" + node->cost().to_string() + "]";
     text += "\n";
     node = node->child();
     ++depth;

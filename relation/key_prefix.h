@@ -85,6 +85,30 @@ inline std::string db_schema_prefix(const Identifier &db) {
 }
 
 // ============================================================
+// 统计信息 Key
+//
+// 只存"创建时间/最后写入时间"这类无法从数据本身推出来的东西；
+// 行数是需要时扫出来的（不维护计数器，避免写放大与计数漂移）。
+// key 形状与 schema 刻意不同，按前缀删不会误伤。
+// ============================================================
+
+// 某个库的统计（创建时间）
+inline std::string db_stats(const Identifier &db) {
+  return "@system/dbstats/" + encode_identifier(db);
+}
+
+// 某张表的统计（创建时间、最后写入时间）
+inline std::string table_stats(const Identifier &db, const Identifier &table) {
+  return "@system/tablestats/" + encode_identifier(db) + "/" +
+         encode_identifier(table);
+}
+
+// 某个库下所有表统计的前缀（DROP DATABASE 用）
+inline std::string table_stats_prefix(const Identifier &db) {
+  return "@system/tablestats/" + encode_identifier(db) + "/";
+}
+
+// ============================================================
 // 数据 Key
 // ============================================================
 

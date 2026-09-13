@@ -141,8 +141,8 @@ target_link_libraries(sql_planner PUBLIC
 target_compile_features(sql_planner PUBLIC cxx_std_23)
 
 # ============================================================
-# KV 存储层（mock 引擎；leveldb 仍走 legacy Makefile，
-# 需要时把 leveldb_engine.cpp + ../Debug 的头/库接进来即可）
+# KV 存储层：mock 引擎必带；leveldb 若在 ../Debug 里能找到头/库就一起编
+# （CLI 的 --engine=leveldb 依赖它，找不到时只剩 mock）
 # ============================================================
 add_library(sql_kv STATIC
     storage/mock_engine/mock_engine.cpp
@@ -153,6 +153,24 @@ target_include_directories(sql_kv PUBLIC
 )
 
 target_compile_features(sql_kv PUBLIC cxx_std_23)
+
+find_path(LEVELDB_INCLUDE_DIR NAMES leveldb/db.h
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../Debug/include)
+find_library(LEVELDB_LIBRARY NAMES leveldb
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../Debug/lib)
+
+if(LEVELDB_INCLUDE_DIR AND LEVELDB_LIBRARY)
+    message(STATUS "leveldb found: ${LEVELDB_LIBRARY}")
+    target_sources(sql_kv PRIVATE
+        storage/kv_engine/kv_factory.cpp
+        storage/leveldb_engine/leveldb_engine.cpp
+    )
+    target_include_directories(sql_kv PUBLIC ${LEVELDB_INCLUDE_DIR})
+    target_link_libraries(sql_kv PUBLIC ${LEVELDB_LIBRARY})
+    target_compile_definitions(sql_kv PUBLIC SQLDB_HAVE_LEVELDB=1)
+else()
+    message(STATUS "leveldb not found: CLI default engine will be mock")
+endif()
 
 # ============================================================
 # relation 关系层：sql::Catalog 的 KV 实现 + Table/Cursor 视图
@@ -197,6 +215,45 @@ target_link_libraries(sql_executor PUBLIC
 )
 
 target_compile_features(sql_executor PUBLIC cxx_std_23)
+
+# ============================================================
+# session 会话层：一条 SQL -> 游标（串起 parser/statement/planner/executor）
+# ============================================================
+add_library(sql_session STATIC
+    session/session.cpp
+)
+
+target_include_directories(sql_session PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/session
+)
+
+target_link_libraries(sql_session PUBLIC
+    sql_executor    # 自动带上 sql_planner + sql_relation + sql_types + sql_kv
+    sql_statement   # parser + StatementBuilder + StatementValidator + highlight
+)
+
+target_compile_features(sql_session PUBLIC cxx_std_23)
+
+# ============================================================
+# 命令行客户端 sqldb：SQL 文本 -> session -> 表格输出
+# ============================================================
+add_executable(sqldb cmdline/main.cpp)
+
+target_link_libraries(sqldb PRIVATE sql_session)
+
+# readline：有就用（交互历史/行编辑），没有就退回 std::getline
+find_path(READLINE_INCLUDE_DIR NAMES readline/readline.h
+    PATHS /usr/local/opt/readline/include /opt/homebrew/opt/readline/include)
+find_library(READLINE_LIBRARY NAMES readline
+    PATHS /usr/local/opt/readline/lib /opt/homebrew/opt/readline/lib)
+
+if(READLINE_INCLUDE_DIR AND READLINE_LIBRARY)
+    message(STATUS "readline found: ${READLINE_LIBRARY}")
+    target_include_directories(sqldb PRIVATE ${READLINE_INCLUDE_DIR})
+    target_link_libraries(sqldb PRIVATE ${READLINE_LIBRARY})
+    target_compile_definitions(sqldb PRIVATE SQLDB_HAVE_READLINE=1)
+endif()
 
 # 添加测试子目录
 enable_testing()

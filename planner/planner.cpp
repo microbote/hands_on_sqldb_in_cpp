@@ -53,6 +53,53 @@ TableRef make_table_ref(const OptimizedQuery &query) {
   return target;
 }
 
+// 候选集是不是"全是点"（用来选 point_lookups 还是 index_scan 的成本公式）
+bool is_point_set(const std::vector<sql::KeyRange> &ranges) {
+  if (ranges.empty()) {
+    return false;
+  }
+  for (const sql::KeyRange &range : ranges) {
+    if (!range.is_point()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 扫描算子会产出多少行（估算）：
+//   - 整数/时间族的区间有精确基数（KeyRange::size()），拿它当上界；
+//   - 拿不到就退回"整表行数"（悲观估计）；
+//   - 统计未知时返回 0（成本只有相对意义，反正不参与决策）。
+double estimate_scan_rows(const plan::PlanNode *node,
+                          const RelationStats &stats) {
+  const auto *scan = dynamic_cast<const plan::ScanPlan *>(node);
+  if (scan == nullptr) {
+    return stats.rows_known ? static_cast<double>(stats.rows) : 0.0;
+  }
+  std::vector<sql::KeyRange> ranges;
+  if (const auto *index = dynamic_cast<const plan::IndexScanPlan *>(node)) {
+    ranges.push_back(index->range());
+  } else if (const auto *united =
+                 dynamic_cast<const plan::RangeUnionPlan *>(node)) {
+    ranges = united->ranges();
+  } else {
+    return stats.rows_known ? static_cast<double>(stats.rows) : 0.0;
+  }
+
+  double total = 0.0;
+  for (const sql::KeyRange &range : ranges) {
+    const auto size = range.size();
+    if (!size.has_value()) {
+      return stats.rows_known ? static_cast<double>(stats.rows) : 0.0;
+    }
+    total += static_cast<double>(*size);
+  }
+  if (stats.rows_known && total > static_cast<double>(stats.rows)) {
+    total = static_cast<double>(stats.rows); // 行数不可能超过表
+  }
+  return total;
+}
+
 // ============================================================
 // 公共扫描链：Filter? -> RangeUnion? -> IndexScan/FullScan
 //
@@ -61,8 +108,11 @@ TableRef make_table_ref(const OptimizedQuery &query) {
 // 但仍然可以读语句本身（写语句要把 OptimizedQuery 移进自己的节点）。
 // ============================================================
 std::unique_ptr<PlanNode> build_scan_chain(OptimizedQuery &query,
-                                           bool ascending) {
+                                           bool ascending,
+                                           const CostModel &model) {
   const TableRef target = make_table_ref(query);
+  const RelationStats stats{query.estimated_table_rows,
+                            query.estimated_table_rows >= 0};
 
   sql::ConditionPtr filter = std::move(query.remaining_filter);
   query.remaining_filter = nullptr;
@@ -80,16 +130,26 @@ std::unique_ptr<PlanNode> build_scan_chain(OptimizedQuery &query,
   const bool has_exclusions = !exclude_keys.empty();
   if (!has_exclusions && ranges.size() == 1 && ranges[0].is_all()) {
     node = std::make_unique<FullScan>(target, ascending);
+    node->set_cost(model.full_scan(stats));
   } else if (!has_exclusions && ranges.size() == 1) {
     node = std::make_unique<IndexScanPlan>(target, std::move(ranges[0]),
                                            ascending);
+    node->set_cost(model.index_scan(estimate_scan_rows(node.get(), stats)));
   } else {
+    const bool all_points = is_point_set(ranges);
+    const size_t point_count = ranges.size();
     node = std::make_unique<RangeUnionPlan>(target, std::move(ranges),
                                             ascending, std::move(exclude_keys));
+    node->set_cost(
+        all_points ? model.point_lookups(static_cast<int64_t>(point_count))
+                   : model.index_scan(estimate_scan_rows(node.get(), stats)));
   }
 
   if (filter) {
+    const Cost child_cost = node->cost();
+    const double rows_in = estimate_scan_rows(node.get(), stats);
     node = std::make_unique<FilterPlan>(std::move(node), std::move(filter));
+    node->set_cost(model.filter(child_cost, rows_in));
   }
   return node;
 }
@@ -119,7 +179,7 @@ ScanOrder order_by_scan(const sql::SelectQuery &select,
 // SELECT: Project? -> Limit? -> Sort/TopN? -> (扫描链)
 // ============================================================
 std::expected<std::unique_ptr<PlanNode>, PlanError>
-plan_select(OptimizedQuery query) {
+plan_select(OptimizedQuery query, const CostModel &model) {
   const sql::SelectQuery *select = query.query.select();
   if (select == nullptr) {
     return std::unexpected(
@@ -134,21 +194,37 @@ plan_select(OptimizedQuery query) {
   const bool select_all = select->select_all();
   const ScanOrder order = order_by_scan(*select, query);
 
-  std::unique_ptr<PlanNode> node = build_scan_chain(query, order.ascending);
+  std::unique_ptr<PlanNode> node =
+      build_scan_chain(query, order.ascending, model);
+  const RelationStats stats{query.estimated_table_rows,
+                            query.estimated_table_rows >= 0};
+  const double estimated_rows =
+      stats.rows_known ? static_cast<double>(stats.rows) : 0.0;
 
   // Sort / TopN：只有"扫描顺序满足不了 ORDER BY"时才需要
   if (!order_by.empty() && !order.satisfied_by_scan) {
     const bool top_n = limit.has_limit();
+    const Cost child_cost = node->cost();
     node = std::make_unique<SortPlan>(std::move(node), order_by, top_n,
                                       top_n ? top_n_count(limit) : 0);
+    node->set_cost(top_n ? model.top_n(child_cost, estimated_rows,
+                                       static_cast<double>(top_n_count(limit)))
+                         : model.sort(child_cost, estimated_rows));
   }
 
   if (limit.has_limit() || limit.has_offset()) {
+    const Cost child_cost = node->cost();
+    const double produced = limit.has_limit()
+                                ? static_cast<double>(limit.limit_value())
+                                : estimated_rows;
     node = std::make_unique<LimitPlan>(std::move(node), limit);
+    node->set_cost(model.limit(child_cost, produced));
   }
 
   if (!select_all) {
+    const Cost child_cost = node->cost();
     node = std::make_unique<ProjectPlan>(std::move(node), columns);
+    node->set_cost(model.project(child_cost, estimated_rows));
   }
   return node;
 }
@@ -161,25 +237,31 @@ plan_select(OptimizedQuery query) {
 // 会读到 moved-from 的语句（这个坑踩过一次）。
 // ============================================================
 std::expected<std::unique_ptr<PlanNode>, PlanError>
-plan_update(OptimizedQuery query) {
+plan_update(OptimizedQuery query, const CostModel &model) {
   if (query.query.update() == nullptr) {
     return std::unexpected(
         PlanError(PlanErrorCode::UNSUPPORTED_PLAN, "not an update query"));
   }
-  std::unique_ptr<PlanNode> chain = build_scan_chain(query, /*ascending=*/true);
-  return std::unique_ptr<PlanNode>(
-      std::make_unique<UpdatePlan>(std::move(query), std::move(chain)));
+  std::unique_ptr<PlanNode> chain =
+      build_scan_chain(query, /*ascending=*/true, model);
+  const Cost child_cost = chain->cost();
+  auto node = std::make_unique<UpdatePlan>(std::move(query), std::move(chain));
+  node->set_cost(child_cost);
+  return std::unique_ptr<PlanNode>(std::move(node));
 }
 
 std::expected<std::unique_ptr<PlanNode>, PlanError>
-plan_delete(OptimizedQuery query) {
+plan_delete(OptimizedQuery query, const CostModel &model) {
   if (query.query.delete_() == nullptr) {
     return std::unexpected(
         PlanError(PlanErrorCode::UNSUPPORTED_PLAN, "not a delete query"));
   }
-  std::unique_ptr<PlanNode> chain = build_scan_chain(query, /*ascending=*/true);
-  return std::unique_ptr<PlanNode>(
-      std::make_unique<DeletePlan>(std::move(query), std::move(chain)));
+  std::unique_ptr<PlanNode> chain =
+      build_scan_chain(query, /*ascending=*/true, model);
+  const Cost child_cost = chain->cost();
+  auto node = std::make_unique<DeletePlan>(std::move(query), std::move(chain));
+  node->set_cost(child_cost);
+  return std::unique_ptr<PlanNode>(std::move(node));
 }
 
 } // namespace
@@ -188,11 +270,11 @@ std::expected<std::unique_ptr<PlanNode>, PlanError>
 Planner::plan(OptimizedQuery query) {
   switch (query.query.type()) {
   case sql::QueryType::SELECT:
-    return plan_select(std::move(query));
+    return plan_select(std::move(query), cost_model_);
   case sql::QueryType::UPDATE:
-    return plan_update(std::move(query));
+    return plan_update(std::move(query), cost_model_);
   case sql::QueryType::DELETE:
-    return plan_delete(std::move(query));
+    return plan_delete(std::move(query), cost_model_);
   case sql::QueryType::INSERT:
     // VALUES 作为行源留在语句里，所以 child 为空（为 INSERT ... SELECT 留位）
     return std::unique_ptr<PlanNode>(

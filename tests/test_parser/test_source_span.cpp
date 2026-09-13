@@ -149,12 +149,14 @@ TEST(SourceSpan, ColumnDefinitionHasSpan) {
 }
 
 TEST(SourceSpan, ErrorPositionUsesLineNumber) {
-  // 语法错误的位置由 parser 的错误信息给出（line N）
+  // 语法错误的位置现在是结构化的 (line, column)，message 保持纯文本
   parser::Parser parser;
   auto result = parser.parse("\n\n\nSELECT * FROM WHERE;");
   CHECK(!result.success);
   CHECK(result.error.has_value());
   if (result.error.has_value()) {
-    CHECK(result.error->message.find("line 4") != std::string::npos);
+    CHECK_EQ(result.error->line, 4);
+    CHECK(result.error->column > 0);
+    CHECK(result.error->to_string().find("line 4") != std::string::npos);
   }
 }

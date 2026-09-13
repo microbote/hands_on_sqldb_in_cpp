@@ -28,6 +28,13 @@ struct ParserGlobals {
   Parser *instance = nullptr;
   std::string error_buffer;
   bool has_error = false;
+  // 第一个错误的位置（1-based，0 = 未知）。lexer 已经用 YY_USER_ACTION
+  // 维护了 yylloc，这里只是把它一起带出来，供上层（session/CLI）
+  // 定位并高亮出错片段。
+  int error_line = 0;
+  int error_column = 0;
+  int error_end_line = 0;
+  int error_end_column = 0;
 };
 
 static ParserGlobals g_parser_state;
@@ -35,20 +42,22 @@ static ParserGlobals g_parser_state;
 // ============================================================
 // 错误回调函数（由 Bison 调用）
 // ============================================================
-#ifdef  __cplusplus
+#ifdef __cplusplus
 extern "C" {
-#endif 
+#endif
 void yyerror(const char *s) {
   if (g_parser_state.instance != nullptr) {
     // 只记录第一个错误：词法层报出的具体错误（例如整数字面量越界）
     // 不应该被随后的 "syntax error" 覆盖。
     if (!g_parser_state.has_error) {
-      std::string error = s;
-      if (yylineno > 0) {
-        error = "line " + std::to_string(yylineno) + ": " + error;
-      }
-      g_parser_state.instance->set_last_error(error);
-      g_parser_state.error_buffer = error;
+      // 位置信息单独记录，不再拼进 message 文本：
+      // 这样调用方既能拿到纯信息，也能拿到 (line, column) 去高亮。
+      g_parser_state.instance->set_last_error(s);
+      g_parser_state.error_buffer = s;
+      g_parser_state.error_line = static_cast<int>(yylloc.first_line);
+      g_parser_state.error_column = static_cast<int>(yylloc.first_column);
+      g_parser_state.error_end_line = static_cast<int>(yylloc.last_line);
+      g_parser_state.error_end_column = static_cast<int>(yylloc.last_column);
       g_parser_state.has_error = true;
     }
 
@@ -61,7 +70,6 @@ void yyerror(const char *s) {
 #ifdef __cplusplus
 }
 #endif
-
 
 // ============================================================
 // Parser 实现
@@ -105,7 +113,8 @@ ParseResult Parser::parse(const std::string &sql) {
     last_error_ = "Syntax error";
   }
   log("[Parser] Parse failed: " + last_error_);
-  return ParseResult(sql, ParseError(last_error_));
+  return ParseResult(sql, ParseError(g_parser_state.error_line,
+                                     g_parser_state.error_column, last_error_));
 }
 
 std::vector<ParseResult> Parser::parse_multi(const std::string &sql) {
@@ -121,7 +130,7 @@ std::vector<ParseResult> Parser::parse_multi(const std::string &sql) {
     size_t start = statement.find_first_not_of(" \t\n\r");
     if (start == std::string::npos) {
       continue;
-}
+    }
     statement = statement.substr(start);
 
     size_t end = statement.find_last_not_of(" \t\n\r");
@@ -217,6 +226,10 @@ void Parser::reset() {
   last_error_.clear();
   g_parser_state.error_buffer.clear();
   g_parser_state.has_error = false;
+  g_parser_state.error_line = 0;
+  g_parser_state.error_column = 0;
+  g_parser_state.error_end_line = 0;
+  g_parser_state.error_end_column = 0;
 }
 
 // ============================================================
