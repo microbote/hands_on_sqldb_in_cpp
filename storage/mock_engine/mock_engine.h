@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "storage/kv_engine/kv_engine.h"
@@ -108,6 +109,8 @@ public:
   void clear();
   size_t size() const;
   void dump() const;
+  // 取一份数据拷贝（连接开事务时当快照用：Mock 用拷贝模拟 leveldb 的版本视图）
+  std::map<Key, ByteValue> data_snapshot() const;
   // 故障注入：置 true 后所有批量写入都失败（用来测"提交失败不留痕"）
   // 也用于确认"批量写入是原子的"：失败时一条 op 都不落。
   void set_fail_writes(bool fail) { fail_writes_ = fail; }
@@ -138,8 +141,9 @@ public:
       : store_(std::move(store)) {}
   // 连接带着未提交的事务析构 = 回滚，并且必须把写槽还回去
   ~MockEngine() override {
-    if (tx_ != nullptr) {
-      tx_.reset();
+    tx_.reset();
+    snapshot_.reset();
+    if (write_slot_) {
       store_->release_write_slot(this);
     }
   }
@@ -167,6 +171,10 @@ public:
   Status commit_transaction() override;
   Status rollback_transaction() override;
   bool in_transaction() const override { return tx_ != nullptr; }
+  Status acquire_write_slot() override;
+  void release_write_slot() override;
+  bool has_write_slot() const override;
+  bool has_snapshot() const override { return snapshot_.has_value(); }
 
   // ----- 管理 -----
   void flush() override { store_->flush(); }
@@ -180,8 +188,16 @@ public:
   void set_fail_writes(bool fail) { store_->set_fail_writes(fail); }
 
 private:
+  // 当前读视图：快照（若在只读事务里）或 Store 的最新数据
+  bool in_snapshot() const { return snapshot_.has_value(); }
+  // 第一次写之前确保拿到写槽（拿不到 -> Busy）
+  Status ensure_write_slot();
+
   std::shared_ptr<MockStore> store_;
   std::unique_ptr<TxBuffer> tx_; // 本连接的事务缓冲（非空 = 事务进行中）
+  // 事务快照：begin 时拷一份（Mock 是测试双，表小；语义与 leveldb 一致）
+  std::optional<std::map<Key, ByteValue>> snapshot_;
+  bool write_slot_ = false; // 本连接是否持有写槽
 };
 
 } // namespace kv

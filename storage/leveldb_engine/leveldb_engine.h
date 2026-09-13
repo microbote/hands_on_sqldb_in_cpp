@@ -87,18 +87,30 @@ public:
   bool write_slot_held() const override;
 
   // ----- 连接用的原语（都不看事务缓冲；锁在内部）-----
-  Status get(const Key &key, ByteValue *value) const;
+  // snapshot 非空 = 读那个版本（事务的一致读视图）
+  Status get(const Key &key, ByteValue *value,
+             const leveldb::Snapshot *snapshot = nullptr) const;
   Status put(const Key &key, const ByteValue &value);
   Status remove(const Key &key);
-  bool exists(const Key &key) const;
+  bool exists(const Key &key,
+              const leveldb::Snapshot *snapshot = nullptr) const;
   Status get_batch(const std::vector<Key> &keys, MissingKeyPolicy policy,
-                   std::vector<std::optional<ByteValue>> *values) const;
+                   std::vector<std::optional<ByteValue>> *values,
+                   const leveldb::Snapshot *snapshot = nullptr) const;
   Status write_batch(const WriteBatch &batch);
-  std::unique_ptr<Iterator> new_iterator(const KeyRange &range);
+  std::unique_ptr<Iterator>
+  new_iterator(const KeyRange &range,
+               const leveldb::Snapshot *snapshot = nullptr);
 
   // ----- 写槽（悲观单写者）-----
   Status acquire_write_slot(const void *owner);
   Status release_write_slot(const void *owner);
+
+  // ----- 快照（事务的一致读视图）-----
+  // leveldb 的 Snapshot 会钉住旧版本（阻止 compaction 回收）——必须在事务
+  // 结束/连接析构时释放；close() 时若还有活跃快照会返回 Busy。
+  const leveldb::Snapshot *acquire_snapshot();
+  void release_snapshot(const leveldb::Snapshot *snapshot);
 
   // 活跃迭代器的登记/注销（close 时不允许还有活跃迭代器）
   void unregister_iterator(leveldb::Iterator *it);
@@ -113,6 +125,7 @@ private:
   mutable std::mutex mutex_;
   std::atomic<bool> is_open_{false};
   const void *write_owner_ = nullptr; // 写槽持有者（连接指针）
+  size_t snapshot_count_ = 0;         // 活跃快照数（close 时要为 0）
   std::unordered_set<leveldb::Iterator *> active_iterators_;
 };
 
@@ -125,8 +138,12 @@ public:
       : store_(std::move(store)) {}
   // 连接带着未提交的事务析构 = 回滚，并且必须把写槽还回去
   ~LevelDBEngine() override {
-    if (tx_ != nullptr) {
-      tx_.reset();
+    tx_.reset();
+    if (snapshot_ != nullptr) {
+      store_->release_snapshot(snapshot_);
+      snapshot_ = nullptr;
+    }
+    if (write_slot_) {
       store_->release_write_slot(this);
     }
   }
@@ -153,6 +170,10 @@ public:
   Status commit_transaction() override;
   Status rollback_transaction() override;
   bool in_transaction() const override { return tx_ != nullptr; }
+  Status acquire_write_slot() override;
+  void release_write_slot() override;
+  bool has_write_slot() const override { return write_slot_; }
+  bool has_snapshot() const override { return snapshot_ != nullptr; }
 
   // ----- 管理 -----
   void flush() override { store_->flush(); }
@@ -160,8 +181,13 @@ public:
   std::string name() const override { return "LevelDBEngine"; }
 
 private:
+  // 第一次写之前确保拿到写槽（拿不到 -> Busy）；拿到写槽会放掉快照
+  Status ensure_write_slot();
+
   std::shared_ptr<LevelDBStore> store_;
   std::unique_ptr<TxBuffer> tx_; // 本连接的事务缓冲（非空 = 事务进行中）
+  const leveldb::Snapshot *snapshot_ = nullptr; // 事务的一致读视图
+  bool write_slot_ = false;                     // 本连接是否持有写槽
 };
 
 } // namespace kv

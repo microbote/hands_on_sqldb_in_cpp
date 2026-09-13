@@ -129,15 +129,17 @@ Range deletes (`remove_range`) are not expanded: DB keys are tested with
 
 | Item | Our choice |
 |---|---|
-| Concurrency | **multiple connections + pessimistic single writer**: one store per process, N connections (= N sessions); only one write transaction at a time, a second connection's `begin` returns `Status::Busy` |
+| Concurrency | **multiple connections + pessimistic single writer**: one store per process, N connections (= N sessions); only one **write** transaction at a time, so a second connection's **write** (or `acquire_write_slot()`) returns `Status::Busy` (`BEGIN` itself never conflicts) |
 | Isolation | no dirty reads (uncommitted data is not in the DB); commits become visible atomically; with a single writer write-write conflicts cannot happen |
 | Readers | **never block, never wait for locks**: they read the committed state; one scan is internally consistent (see above) |
-| Repeatable read | a write transaction is trivially repeatable (single writer: nobody else can commit during it). A future **read-only** repeatable-read transaction would use either "hold a shared read lock until the end of the transaction" or a `leveldb::Snapshot` — see section 7 |
+| Repeatable read (read-only tx) | **`BEGIN` takes a snapshot** (`leveldb::GetSnapshot()` / a copy of the Mock data): every read in the transaction sees the version as of BEGIN, and the transaction does **not** hold the write slot — readers never block writers |
+| Repeatable read (write tx) | acquiring the write slot **releases the snapshot**: the slot guarantees nobody else can commit, so "latest committed + own buffer" is itself a frozen view (repeatable read still holds), and the write path's existence checks must see the **latest** state — otherwise a key committed by someone else would be silently overwritten |
 | Conflict detection | **none** (not needed with a single writer). Multiple writers would need "read set + validation at commit" |
 | Missing keys | `get`/`exists`/`remove` behave **identically on both engines**: `get` -> `NotFound`, `remove` of a missing key -> `NotFound` (leveldb's `Delete` returns OK natively, so `LevelDBStore::remove` looks first). Deletes **inside a transaction** are idempotent (they are buffered ops); deletes outside are immediate |
 | Failed commit | the buffer is **kept** so the caller can retry or roll back (same on LevelDB and Mock) |
 | Transaction size cap | `TxBuffer::kDefaultLimit` = 64MB; beyond that `commit` returns `InvalidArgument` |
-| Explicit transactions | `BEGIN / COMMIT / ROLLBACK` (aliases `START TRANSACTION` / `END` / `ABORT`): **grammar-level keywords** (`transaction_stmt` in `parser/sql.y`), with execution and session state in the session (the autocommit guard yields inside an explicit transaction) |
+| Explicit transactions | `BEGIN / COMMIT / ROLLBACK` (aliases `START TRANSACTION` / `END` / `ABORT`): **grammar-level keywords** (`transaction_stmt` in `parser/sql.y`), with execution and session state in the session (the autocommit guard yields inside an explicit transaction). `BEGIN` only takes the snapshot; the **first write statement** takes the write slot (`Busy` if taken, which aborts the transaction) |
+| Snapshot cost | a leveldb `Snapshot` **pins old versions** (compaction cannot drop them) -> a long transaction means space amplification. Snapshots are therefore released on `COMMIT/ROLLBACK`, on connection destruction and via `store->close()` (which returns `Busy` while snapshots are alive). The Mock snapshot is a data copy and has no such cost |
 | Statement failure inside a transaction | the transaction is marked aborted: later statements fail and only `ROLLBACK` is accepted; `COMMIT` in that state actually rolls back and reports it (Postgres style) |
 | Validation-time errors | do **not** abort the transaction (nothing was written yet — MySQL style) |
 
@@ -156,7 +158,7 @@ Range deletes (`remove_range`) are not expanded: DB keys are tested with
 ## 5. Tests
 
 `tests/test_storage` (19 cases, storage layer; every case runs on both engines)
-plus `tests/test_tx` (23 cases):
+plus `tests/test_tx` (25 cases):
 
 - buffered writes are invisible to the DB (`size()` bypasses the buffer) and
   visible after commit;
@@ -175,11 +177,14 @@ plus `tests/test_tx` (23 cases):
 - the merge iterator: newly inserted keys show up in forward/reverse scans,
   overwritten keys use the new value, deleted keys disappear, and
   `seek`/`seek_to_last`/`prev` also see the overlay;
-- **`Connections`** (5 cases, both engines): per-connection transaction
-  buffers, commits visible across connections, a second writer getting `Busy`
-  while readers keep reading, scans unaffected by another connection's commit,
-  forward/reverse scans matching on both engines, and a connection dying with
-  an open transaction = rollback + write slot released.
+- **`Connections`** (7 cases, both engines): per-connection transaction
+  buffers, commits visible across connections, a second connection being able
+  to `BEGIN` (taking a snapshot) but getting `Busy` on its first write while
+  readers keep reading, scans unaffected by another connection's commit,
+  forward/reverse scans matching on both engines, a connection dying with an
+  open transaction = rollback + write slot released, **a snapshot giving a
+  read-only transaction repeatable read without holding the write slot**, and
+  **writing releasing the snapshot** so existence checks see the latest state.
 
 ## 6. Pitfalls hit along the way (all covered by tests)
 
@@ -213,10 +218,11 @@ plus `tests/test_tx` (23 cases):
      transaction reasons about it). That is hard to solve without **snapshot
      reads**, so row locks must land together with "multiple writers + snapshot
      reads", never half of it.
-3. Read-only repeatable read: pick one — "read transaction holds a shared read
-   lock until the end" (no MVCC, but commits wait for readers) or
-   `leveldb::Snapshot` (readers never block commits, at the cost of version
-   management and snapshot lifetime).
+3. ~~Read-only repeatable read~~ **implemented with `leveldb::Snapshot`**
+   (readers never block commits): `BEGIN` takes the snapshot, writing releases
+   it, and the Mock engine mirrors the semantics with a data copy. Still
+   missing: snapshot export (`SET EXPORT_SNAPSHOT`) and a timeout/warning for
+   long-lived snapshots.
 4. Large transactions (over 64MB) spilling to disk; this LevelDB build has no
    `DeleteRange`, so range deletes are expanded per key at commit time
    (atomicity unchanged, memory proportional to the key count).

@@ -23,6 +23,19 @@ inline std::shared_ptr<kv::MockEngine> open_engine() {
   return std::static_pointer_cast<kv::MockEngine>(store->connect());
 }
 
+// 两条连接（= 两个 session）共享**同一份**存储：测多连接 / 快照语义用。
+// 用法：第一个 session 负责建库建表（bootstrap），第二个立刻能看到。
+inline std::pair<std::shared_ptr<kv::MockEngine>,
+                 std::shared_ptr<kv::MockEngine>>
+open_two_engines() {
+  kv::DatabaseOptions options;
+  options.path = "mock://session-test-multi";
+  auto store = kv::open_store(kv::EngineType::MOCK, options);
+  auto first = std::static_pointer_cast<kv::MockEngine>(store->connect());
+  auto second = std::static_pointer_cast<kv::MockEngine>(store->connect());
+  return {std::move(first), std::move(second)};
+}
+
 // 跑一条 SQL；失败时把错误信息写进 error（测试里断言用）
 inline std::unique_ptr<exec::ResultCursor>
 run(session::Session &session, const std::string &sql,
@@ -114,6 +127,14 @@ inline ExplainRun explain(session::Session &session, const std::string &sql) {
   }
   outcome.ok = true;
   return outcome;
+}
+
+// 让一条连接指向指定数据库。USE 是**会话状态**（不落 KV），
+// 所以共享同一份存储的两条连接要各自 USE 一次。
+inline bool use_database(session::Session &session,
+                         const std::string &db = "shop") {
+  session::SessionError error;
+  return run(session, "USE " + db, &error) != nullptr;
 }
 
 // 建库 + 建表 + 塞数据（id = 1..count, name = "userN", age = id*10）

@@ -304,6 +304,12 @@ Status LevelDBStore::close() {
       return Status::Busy; // ✅ 返回错误，让调用者处理
     }
   }
+  // 活跃快照同样不许：leveldb 的 Snapshot 钉着旧版本，提前释放会 use-after-free
+  if (snapshot_count_ > 0) {
+    std::cerr << "⚠️  ERROR: Cannot close DB, " << snapshot_count_
+              << " snapshots still active!" << std::endl;
+    return Status::Busy;
+  }
 
   is_open_ = false;
   write_owner_ = nullptr; // 存储关了，写槽一并失效
@@ -334,7 +340,8 @@ LevelDBStore::~LevelDBStore() {
 }
 
 // ----- 单条操作（不看事务缓冲：那是连接的事）-----
-Status LevelDBStore::get(const Key &key, ByteValue *value) const {
+Status LevelDBStore::get(const Key &key, ByteValue *value,
+                         const leveldb::Snapshot *snapshot) const {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -347,6 +354,7 @@ Status LevelDBStore::get(const Key &key, ByteValue *value) const {
 
   leveldb::ReadOptions options;
   options.verify_checksums = true;
+  options.snapshot = snapshot; // 非空 = 读那个版本（事务快照）
 
   std::string val;
   leveldb::Status status = db_->Get(options, key, &val);
@@ -431,7 +439,8 @@ Status LevelDBStore::remove(const Key &key) {
   return Status::OK;
 }
 
-bool LevelDBStore::exists(const Key &key) const {
+bool LevelDBStore::exists(const Key &key,
+                          const leveldb::Snapshot *snapshot) const {
   if (!is_open_) {
     return false;
   }
@@ -443,6 +452,7 @@ bool LevelDBStore::exists(const Key &key) const {
   }
 
   leveldb::ReadOptions options;
+  options.snapshot = snapshot;
   std::string value;
   leveldb::Status status = db_->Get(options, key, &value);
 
@@ -450,9 +460,10 @@ bool LevelDBStore::exists(const Key &key) const {
 }
 
 // ----- 批量操作 -----
-Status
-LevelDBStore::get_batch(const std::vector<Key> &keys, MissingKeyPolicy policy,
-                        std::vector<std::optional<ByteValue>> *values) const {
+Status LevelDBStore::get_batch(const std::vector<Key> &keys,
+                               MissingKeyPolicy policy,
+                               std::vector<std::optional<ByteValue>> *values,
+                               const leveldb::Snapshot *snapshot) const {
   if (!is_open_) {
     return Status::InternalError;
   }
@@ -472,6 +483,7 @@ LevelDBStore::get_batch(const std::vector<Key> &keys, MissingKeyPolicy policy,
 
   leveldb::ReadOptions options;
   options.verify_checksums = true;
+  options.snapshot = snapshot;
 
   for (const auto &key : keys) {
     std::string val;
@@ -562,7 +574,9 @@ Status LevelDBStore::apply_batch_locked(const WriteBatch &batch) {
 }
 
 // ----- 迭代器（底座：leveldb 的迭代器创建时就钉住当时的版本）-----
-std::unique_ptr<Iterator> LevelDBStore::new_iterator(const KeyRange &range) {
+std::unique_ptr<Iterator>
+LevelDBStore::new_iterator(const KeyRange &range,
+                           const leveldb::Snapshot *snapshot) {
   if (!is_open_) {
     return nullptr;
   }
@@ -575,9 +589,36 @@ std::unique_ptr<Iterator> LevelDBStore::new_iterator(const KeyRange &range) {
 
   leveldb::ReadOptions options;
   options.verify_checksums = true;
+  options.snapshot = snapshot; // 非空 = 迭代那个版本（事务快照）
   leveldb::Iterator *it = db_->NewIterator(options);
   this->active_iterators_.insert(it);
   return std::make_unique<LevelDBIterator>(this, it, range);
+}
+
+// ----- 快照（事务的一致读视图）-----
+const leveldb::Snapshot *LevelDBStore::acquire_snapshot() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_open_ || !db_) {
+    return nullptr;
+  }
+  const leveldb::Snapshot *snapshot = db_->GetSnapshot();
+  if (snapshot != nullptr) {
+    ++snapshot_count_;
+  }
+  return snapshot;
+}
+
+void LevelDBStore::release_snapshot(const leveldb::Snapshot *snapshot) {
+  if (snapshot == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (db_) {
+    db_->ReleaseSnapshot(snapshot);
+  }
+  if (snapshot_count_ > 0) {
+    --snapshot_count_;
+  }
 }
 
 // ----- 写槽（悲观单写者）-----
@@ -672,7 +713,7 @@ Status LevelDBEngine::get(const Key &key, ByteValue *value) {
       return Status::OK;
     }
   }
-  return store_->get(key, value);
+  return store_->get(key, value, snapshot_); // 快照非空 = 一致读视图
 }
 
 Status LevelDBEngine::put(const Key &key, const ByteValue &value) {
@@ -680,6 +721,10 @@ Status LevelDBEngine::put(const Key &key, const ByteValue &value) {
     return Status::InternalError;
   }
   if (tx_ != nullptr) {
+    const Status slot = ensure_write_slot();
+    if (slot != Status::OK) {
+      return slot; // 别人在写 -> Busy（悲观单写者）
+    }
     tx_->put(key, value);
     return Status::OK;
   }
@@ -698,6 +743,10 @@ Status LevelDBEngine::remove(const Key &key) {
     return Status::InternalError;
   }
   if (tx_ != nullptr) {
+    const Status slot = ensure_write_slot();
+    if (slot != Status::OK) {
+      return slot;
+    }
     tx_->remove(key);
     return Status::OK;
   }
@@ -720,7 +769,7 @@ bool LevelDBEngine::exists(const Key &key) {
       return op.has_value();
     }
   }
-  return store_->exists(key);
+  return store_->exists(key, snapshot_);
 }
 
 Status LevelDBEngine::get_batch(const std::vector<Key> &keys,
@@ -734,7 +783,7 @@ Status LevelDBEngine::get_batch(const std::vector<Key> &keys,
   }
   // 事务里逐键走"连接视角"（缓冲优先），和单键 get 保持一致
   if (tx_ == nullptr) {
-    return store_->get_batch(keys, policy, values);
+    return store_->get_batch(keys, policy, values, snapshot_);
   }
 
   values->clear();
@@ -774,6 +823,10 @@ Status LevelDBEngine::write_batch(const WriteBatch &batch) {
     store_->release_write_slot(this);
     return status;
   }
+  const Status slot = ensure_write_slot();
+  if (slot != Status::OK) {
+    return slot;
+  }
   for (const auto &op : batch.ops()) {
     switch (op.type) {
     case WriteBatch::OpType::kPut:
@@ -796,7 +849,8 @@ std::unique_ptr<Iterator> LevelDBEngine::new_iterator(const KeyRange &range) {
   if (!store_->is_open()) {
     return nullptr;
   }
-  auto inner = store_->new_iterator(range); // leveldb 迭代器（自带版本固定）
+  // leveldb 迭代器：带快照 = 事务的一致读视图；不带 = 创建那一刻的版本
+  auto inner = store_->new_iterator(range, snapshot_);
   if (inner == nullptr) {
     return nullptr;
   }
@@ -815,12 +869,47 @@ Status LevelDBEngine::begin_transaction() {
   if (tx_ != nullptr) {
     return Status::Busy; // 同一条连接重复 begin
   }
+  // 开事务 = 取快照（一致读视图）；写槽等第一次写的时候再抢
+  snapshot_ = store_->acquire_snapshot();
+  if (snapshot_ == nullptr) {
+    return Status::InternalError;
+  }
+  tx_ = std::make_unique<TxBuffer>();
+  return Status::OK;
+}
+
+Status LevelDBEngine::acquire_write_slot() {
+  if (write_slot_) {
+    return Status::OK; // 本连接已经持有
+  }
+  if (!store_->is_open()) {
+    return Status::InternalError;
+  }
   const Status acquired = store_->acquire_write_slot(this);
   if (acquired != Status::OK) {
     return acquired; // 另一条连接正在写 -> Busy（悲观单写者）
   }
-  tx_ = std::make_unique<TxBuffer>();
+  write_slot_ = true;
+  // 拿到写槽就放掉快照：写槽保证没有别人能提交，"最新已提交 + 自己的缓冲"
+  // 本身就是冻结视图（可重复读仍然成立）；而写路径的存在性检查必须看最新
+  // 状态，否则会把别人刚提交的同一个主键静默覆盖。
+  if (snapshot_ != nullptr) {
+    store_->release_snapshot(snapshot_);
+    snapshot_ = nullptr;
+  }
   return Status::OK;
+}
+
+Status LevelDBEngine::ensure_write_slot() {
+  return write_slot_ ? Status::OK : acquire_write_slot();
+}
+
+void LevelDBEngine::release_write_slot() {
+  if (!write_slot_) {
+    return;
+  }
+  store_->release_write_slot(this);
+  write_slot_ = false;
 }
 
 Status LevelDBEngine::commit_transaction() {
@@ -843,7 +932,14 @@ Status LevelDBEngine::commit_transaction() {
     return status;       // 写槽也还握着（事务没结束）
   }
   tx_.reset();
-  store_->release_write_slot(this);
+  if (snapshot_ != nullptr) {
+    store_->release_snapshot(snapshot_);
+    snapshot_ = nullptr;
+  }
+  if (write_slot_) {
+    store_->release_write_slot(this);
+    write_slot_ = false;
+  }
   return Status::OK;
 }
 
@@ -855,7 +951,14 @@ Status LevelDBEngine::rollback_transaction() {
     return Status::NotFound;
   }
   tx_.reset(); // DB 从没被动过：这就是完整的回滚
-  store_->release_write_slot(this);
+  if (snapshot_ != nullptr) {
+    store_->release_snapshot(snapshot_);
+    snapshot_ = nullptr;
+  }
+  if (write_slot_) {
+    store_->release_write_slot(this);
+    write_slot_ = false;
+  }
   return Status::OK;
 }
 

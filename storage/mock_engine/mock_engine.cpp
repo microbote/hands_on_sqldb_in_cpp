@@ -10,6 +10,21 @@ namespace kv {
 
 namespace {
 
+// 把一份 key->value 数据在区间内物化成行（Mock 的"版本视图"就是一份拷贝）
+std::vector<KVPair> materialize(const std::map<Key, ByteValue> &data,
+                                const KeyRange &range) {
+  std::vector<KVPair> rows;
+  auto it = range.start ? data.lower_bound(*range.start) : data.begin();
+  while (it != data.end()) {
+    if (range.end && it->first >= *range.end) {
+      break;
+    }
+    rows.push_back(KVPair{it->first, it->second});
+    ++it;
+  }
+  return rows;
+}
+
 // rows 是升序的键数组：第一个 >= key 的下标 / 第一个 > key 的下标
 size_t lower_bound_index(const std::vector<KVPair> &rows, const Key &key) {
   auto it = std::lower_bound(
@@ -336,16 +351,13 @@ std::unique_ptr<Iterator> MockStore::new_iterator(const KeyRange &range) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  std::vector<KVPair> rows;
-  auto it = range.start ? data_.lower_bound(*range.start) : data_.begin();
-  while (it != data_.end()) {
-    if (range.end && it->first >= *range.end) {
-      break;
-    }
-    rows.push_back(KVPair{it->first, it->second});
-    ++it;
-  }
+  std::vector<KVPair> rows = materialize(data_, range);
   return std::make_unique<MockIterator>(std::move(rows), range);
+}
+
+std::map<Key, ByteValue> MockStore::data_snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return data_;
 }
 
 // ----- 管理 -----
@@ -398,6 +410,17 @@ Status MockEngine::get(const Key &key, ByteValue *value) {
       return Status::OK;
     }
   }
+  // 只读事务：读快照（begin 那一刻的版本）
+  if (in_snapshot()) {
+    auto it = snapshot_->find(key);
+    if (it == snapshot_->end()) {
+      return Status::NotFound;
+    }
+    if (value) {
+      *value = it->second;
+    }
+    return Status::OK;
+  }
   return store_->get(key, value);
 }
 
@@ -406,6 +429,10 @@ Status MockEngine::put(const Key &key, const ByteValue &value) {
     return Status::InternalError;
   }
   if (tx_ != nullptr) {
+    const Status slot = ensure_write_slot();
+    if (slot != Status::OK) {
+      return slot; // 别人在写 -> Busy（悲观单写者）
+    }
     tx_->put(key, value);
     return Status::OK;
   }
@@ -425,6 +452,10 @@ Status MockEngine::remove(const Key &key) {
     return Status::InternalError;
   }
   if (tx_ != nullptr) {
+    const Status slot = ensure_write_slot();
+    if (slot != Status::OK) {
+      return slot;
+    }
     tx_->remove(key);
     return Status::OK; // 事务里删不存在的 key 也算成功（提交时是幂等的）
   }
@@ -446,6 +477,9 @@ bool MockEngine::exists(const Key &key) {
     if (op.covered()) {
       return op.has_value();
     }
+  }
+  if (in_snapshot()) {
+    return snapshot_->find(key) != snapshot_->end();
   }
   return store_->exists(key);
 }
@@ -501,6 +535,10 @@ Status MockEngine::write_batch(const WriteBatch &batch) {
     store_->release_write_slot(this);
     return status;
   }
+  const Status slot = ensure_write_slot();
+  if (slot != Status::OK) {
+    return slot;
+  }
   for (const auto &op : batch.ops()) {
     switch (op.type) {
     case WriteBatch::OpType::kPut:
@@ -523,7 +561,14 @@ std::unique_ptr<Iterator> MockEngine::new_iterator(const KeyRange &range) {
   if (!store_->is_open()) {
     return nullptr;
   }
-  auto inner = store_->new_iterator(range); // 物化底座（创建时固定版本）
+  // 只读事务：底座从快照物化；否则从 Store 物化（都是创建时固定版本）
+  std::unique_ptr<Iterator> inner;
+  if (in_snapshot()) {
+    inner =
+        std::make_unique<MockIterator>(materialize(*snapshot_, range), range);
+  } else {
+    inner = store_->new_iterator(range);
+  }
   if (inner == nullptr) {
     return nullptr;
   }
@@ -542,12 +587,43 @@ Status MockEngine::begin_transaction() {
   if (tx_ != nullptr) {
     return Status::Busy; // 同一条连接重复 begin
   }
+  // 开事务 = 取快照（一致读视图）；写槽等第一次写的时候再抢
+  snapshot_ = store_->data_snapshot();
+  tx_ = std::make_unique<TxBuffer>();
+  return Status::OK;
+}
+
+Status MockEngine::acquire_write_slot() {
+  if (write_slot_) {
+    return Status::OK; // 本连接已经持有
+  }
+  if (!store_->is_open()) {
+    return Status::InternalError;
+  }
   const Status acquired = store_->acquire_write_slot(this);
   if (acquired != Status::OK) {
     return acquired; // 另一条连接正在写 -> Busy（悲观单写者）
   }
-  tx_ = std::make_unique<TxBuffer>();
+  // 拿到写槽就放掉快照：写槽保证没有别人能提交，"最新已提交 + 自己的缓冲"
+  // 本身就是冻结视图（可重复读仍然成立）；而写路径的存在性检查必须看最新
+  // 状态，否则会把别人刚提交的同一个主键静默覆盖。
+  snapshot_.reset();
+  write_slot_ = true;
   return Status::OK;
+}
+
+bool MockEngine::has_write_slot() const { return write_slot_; }
+
+void MockEngine::release_write_slot() {
+  if (!write_slot_) {
+    return;
+  }
+  store_->release_write_slot(this);
+  write_slot_ = false;
+}
+
+Status MockEngine::ensure_write_slot() {
+  return write_slot_ ? Status::OK : acquire_write_slot();
 }
 
 Status MockEngine::commit_transaction() {
@@ -570,7 +646,11 @@ Status MockEngine::commit_transaction() {
     return status;       // 写槽也还握着（事务还没结束）
   }
   tx_.reset(); // 提交成功：丢弃缓冲
-  store_->release_write_slot(this);
+  snapshot_.reset();
+  if (write_slot_) {
+    store_->release_write_slot(this);
+    write_slot_ = false;
+  }
   return Status::OK;
 }
 
@@ -582,7 +662,11 @@ Status MockEngine::rollback_transaction() {
     return Status::NotFound;
   }
   tx_.reset(); // DB 从没被动过：这就是完整的回滚
-  store_->release_write_slot(this);
+  snapshot_.reset();
+  if (write_slot_) {
+    store_->release_write_slot(this);
+    write_slot_ = false;
+  }
   return Status::OK;
 }
 

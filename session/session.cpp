@@ -345,15 +345,27 @@ Session::execute(const std::string &sql) {
   }
 
   // 写语句 / DDL / USE：整个语句包成一个事务（自动提交）。
-  // 读语句不开事务（不需要原子性，也不该长期占着写锁）。
-  // 守卫在析构时自动回滚 —— 下面任何提前 return 都不会留下半截写。
+  // 读语句不开事务（不需要原子性，也不该占写槽）。
+  //
+  // 写语句要**先拿到写槽**：单写者规则，而且必须在语句自己的读之前拿到 ——
+  // "检查存在性 -> 写入"之间不能有窗口（比如 INSERT 的存在性检查）。
+  // 只读事务/查询不抢写槽，所以读者不会挡住写者。
   const bool own_transaction = !in_transaction_; // 显式事务里让位给事务本身
-  AutoCommit auto_commit((own_transaction && !query.is_select()) ? engine_.get()
-                                                                 : nullptr);
-  if (own_transaction && !query.is_select() && !auto_commit.active()) {
+  const bool is_write_stmt = !query.is_select();
+  if (is_write_stmt && engine_ != nullptr &&
+      engine_->acquire_write_slot() != kv::Status::OK) {
+    return std::unexpected(SessionError(
+        SessionErrorCode::TRANSACTION_ERROR,
+        "another transaction is writing (busy); retry after it commits",
+        statement));
+  }
+
+  AutoCommit auto_commit((own_transaction && is_write_stmt) ? engine_.get()
+                                                            : nullptr);
+  if (own_transaction && is_write_stmt && !auto_commit.active()) {
+    engine_->release_write_slot(); // 事务没开起来：把槽还回去
     return std::unexpected(SessionError(SessionErrorCode::EXECUTE_ERROR,
-                                        "cannot begin transaction (busy?)",
-                                        statement));
+                                        "cannot begin transaction", statement));
   }
   const auto finish =
       [&](std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>

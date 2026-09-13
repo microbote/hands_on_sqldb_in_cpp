@@ -404,11 +404,19 @@ public:
   // ----- 事务（悲观单写者）-----
   //
   // 约定（见 storage/kv_engine/tx_buffer.h）：
+  //   - begin = 开事务**并取快照**（一致读视图）：事务里的读看到"begin 那一刻
+  //     的已提交状态 + 自己的写"，这就是**可重复读**；
+  //   - 写槽（全进程唯一）**不在这里抢**：只读事务不写、也就不挡写者；
+  //     第一次写（put/remove/write_batch）或调用方显式 acquire_write_slot()
+  //     时才申请，拿不到返回 Status::Busy；
+  //   - **拿到写槽时快照会被释放**：写槽保证没有别人能提交，所以"最新已提交
+  //     + 自己的缓冲"本身就是冻结视图（可重复读仍然成立），而且写路径的存在性
+  //     检查必须看**最新**状态 —— 否则会把别人刚提交的同一个主键静默覆盖；
   //   - begin 之后所有 put/remove/write_batch 都进缓冲，DB 不动；
   //   - commit 把缓冲合成一个 WriteBatch 一次写入（sync=true，保证落盘）；
   //   - rollback 直接丢弃缓冲 —— DB 从没被动过，"与原状态一致"是构造性的；
-  //   - 写槽在 **Store** 上（不是连接上）：全进程同一时刻只允许一条连接
-  //     持有写事务，第二条 begin 返回 Status::Busy；
+  //   - 写槽在 **Store** 上（不是连接上）：全进程同一时刻只允许一条连接写，
+  //     第二条连接的**写**返回 Status::Busy；
   //   - 没有显式事务的 put/remove/write_batch 是"自动提交写"：它短暂占用
   //     写槽（会话的写语句本来就包在事务里），所以单写者规则对引擎级调用
   //     同样成立。
@@ -416,6 +424,16 @@ public:
   virtual Status commit_transaction() { return Status::NotSupported; }
   virtual Status rollback_transaction() { return Status::NotSupported; }
   virtual bool in_transaction() const { return false; }
+
+  // 申请写槽：已持有 -> OK；别的连接持有 -> Status::Busy。
+  // 只读事务不必调用（这正是"读者不阻塞写者"的实现方式）。
+  virtual Status acquire_write_slot() { return Status::NotSupported; }
+  // 归还写槽（没持有则什么都不做）。事务的 commit/rollback 会自动归还。
+  virtual void release_write_slot() {}
+  virtual bool has_write_slot() const { return false; }
+
+  // 当前是否有活跃快照（一致读视图）。测试/诊断用。
+  virtual bool has_snapshot() const { return false; }
 
   // ----- 管理 -----
   virtual void flush() = 0;

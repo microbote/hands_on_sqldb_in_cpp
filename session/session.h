@@ -168,7 +168,9 @@ public:
 
   // 显式事务：BEGIN / COMMIT / ROLLBACK（语法层认出来的语句，
   // 见 parser/sql.y 的 transaction_stmt；执行与会话状态在这里）。
-  // 在事务里时，语句的自动提交让位给事务本身（由 COMMIT/ROLLBACK 收尾）。
+  //   - BEGIN 取**快照**（只读事务的可重复读），不抢写槽；
+  //   - 第一条**写**语句才抢写槽（单写者），抢不到报 busy；
+  //   - 在事务里时，语句的自动提交让位给事务本身（由 COMMIT/ROLLBACK 收尾）。
   bool in_transaction() const { return in_transaction_; }
 
   // ---- 元信息查询（元命令用；db 为空表示当前数据库）----

@@ -217,7 +217,8 @@ an error on line 6 of a script reports `line 6`, not `line 2`.
   are reserved words and cannot be used as table or column names.
 - Savepoints (`SAVEPOINT`), `COMMIT AND CHAIN` and isolation-level syntax are
   unsupported (they report a specific reason). Transactions are
-  **pessimistic single writer**: a second connection opening a transaction gets
-  `busy`.
+  **pessimistic single writer**: several connections may hold transactions at
+  once (each with its own snapshot for repeatable read), but only **one can
+  write** — a second connection's write statement reports `busy`.
 - Table widths are computed in bytes, so CJK text is slightly misaligned
   (exact alignment would need East Asian Width).

@@ -116,10 +116,12 @@ TEST(Connections, SecondWriterIsBusyButReadersAreNotBlocked) {
 
     CHECK_EQ(a->begin_transaction(), kv::Status::OK);
     CHECK_EQ(a->put("k", "v2"), kv::Status::OK);
+    CHECK(a->has_write_slot()); // 一写就拿到写槽
     CHECK(store.write_slot_held());
 
-    // 第二个写事务拿不到写槽；自动提交的引擎级写也一样排队
-    CHECK_EQ(b->begin_transaction(), kv::Status::Busy);
+    // 另一条连接**可以开事务**（拿的是快照，不占写槽），但一写就被拒
+    CHECK_EQ(b->begin_transaction(), kv::Status::OK);
+    CHECK(!b->has_write_slot());
     CHECK_EQ(b->put("k", "v3"), kv::Status::Busy);
     CHECK_EQ(b->remove("k"), kv::Status::Busy);
 
@@ -127,14 +129,73 @@ TEST(Connections, SecondWriterIsBusyButReadersAreNotBlocked) {
     CHECK_EQ(read(*b, "k"), std::string("v1"));
     CHECK_EQ(scan_keys(*b).size(), size_t{1});
 
-    // 事务结束（回滚）-> 写槽归还 -> 另一条连接可以写了
+    // a 结束（回滚）-> 写槽归还 -> b 可以写了
     CHECK_EQ(a->rollback_transaction(), kv::Status::OK);
     CHECK(!store.write_slot_held());
     CHECK_EQ(read(*b, "k"), std::string("v1"));
-    CHECK_EQ(b->begin_transaction(), kv::Status::OK);
     CHECK_EQ(b->put("k", "v4"), kv::Status::OK);
     CHECK_EQ(b->commit_transaction(), kv::Status::OK);
     CHECK_EQ(read(*a, "k"), std::string("v4"));
+  });
+}
+
+// 快照 = 只读事务的可重复读：事务里的读永远是 begin 那一刻的版本，
+// 而且**不占写槽**（读者不阻塞写者）。
+TEST(Connections, SnapshotGivesRepeatableReadWithoutBlockingWriters) {
+  run_on_both([](kv::KVStore &store) {
+    auto a = store.connect();
+    auto b = store.connect();
+    CHECK_EQ(a->put("k", "v1"), kv::Status::OK);
+
+    // A 开只读事务：拿快照，不抢写槽
+    CHECK_EQ(a->begin_transaction(), kv::Status::OK);
+    CHECK(a->has_snapshot());
+    CHECK(!a->has_write_slot());
+    CHECK(!store.write_slot_held());
+    CHECK_EQ(read(*a, "k"), std::string("v1"));
+
+    // B 照样能写、能提交（这是选 Snapshot 而不是"读锁持有到结束"的理由）
+    CHECK_EQ(b->begin_transaction(), kv::Status::OK);
+    CHECK_EQ(b->put("k", "v2"), kv::Status::OK);
+    CHECK_EQ(b->commit_transaction(), kv::Status::OK);
+    CHECK_EQ(read(*b, "k"), std::string("v2"));
+
+    // A 依然看到旧版本：点读和扫描都是同一个快照
+    CHECK_EQ(read(*a, "k"), std::string("v1"));
+    CHECK_EQ(scan_keys(*a).size(), size_t{1});
+
+    // 事务结束后看最新版本
+    CHECK_EQ(a->commit_transaction(), kv::Status::OK);
+    CHECK(!a->has_snapshot());
+    CHECK_EQ(read(*a, "k"), std::string("v2"));
+  });
+}
+
+// 一旦事务开始写（拿到写槽），快照会被释放：写路径的存在性检查必须看**最新**
+// 已提交状态，否则会把别人刚提交的同一个主键静默覆盖（重复键）。
+TEST(Connections, WritingReleasesTheSnapshotSoChecksSeeLatest) {
+  run_on_both([](kv::KVStore &store) {
+    auto a = store.connect();
+    auto b = store.connect();
+    CHECK_EQ(a->put("k", "v1"), kv::Status::OK);
+
+    CHECK_EQ(a->begin_transaction(), kv::Status::OK); // A 的快照：只有 "k"
+    CHECK(a->has_snapshot());
+
+    // B 提交一个新 key
+    CHECK_EQ(b->begin_transaction(), kv::Status::OK);
+    CHECK_EQ(b->put("new", "x"), kv::Status::OK);
+    CHECK_EQ(b->commit_transaction(), kv::Status::OK);
+
+    // 只读阶段：A 看不到（快照）
+    CHECK_EQ(read(*a, "new"), std::string("<missing>"));
+
+    // A 一写 -> 拿写槽、释放快照 -> 立刻能看到最新已提交状态
+    CHECK_EQ(a->put("k", "v2"), kv::Status::OK);
+    CHECK(!a->has_snapshot());
+    CHECK_EQ(read(*a, "new"), std::string("x"));
+
+    CHECK_EQ(a->rollback_transaction(), kv::Status::OK);
   });
 }
 

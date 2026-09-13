@@ -1,3 +1,4 @@
+
 # executor 模块
 
 English version: [readme.en.md](readme.en.md)
@@ -15,11 +16,11 @@ executor 只依赖 `planner`（计划树）与 `relation`（Table 视图 + 存�
 
 ## 2. 两个接口，别混
 
-| | `exec::Executor`（框架内部 SPI） | `sql::Cursor`（客户端句柄） |
-|---|---|---|
-| 给谁看 | 执行层内部 | 客户端（CLI / 驱动） |
-| 方法 | `open / next / close / plan` | `next / close` |
-| 谁驱动 | 上层算子拉它 | 客户端反复 `next()` |
+|        | `exec::Executor`（框架内部 SPI）                               | `sql::Cursor`（客户端句柄）                     |
+| ------ | ---------------------------------------------------------------- | ------------------------------------------------- |
+| 给谁看 | 执行层内部                                                       | 客户端（CLI / 驱动）                              |
+| 方法   | `open / next / close / plan`                                   | `next / close`                                  |
+| 谁驱动 | 上层算子拉它                                                     | 客户端反复`next()`                              |
 | 实现者 | `Scan/Filter/Sort/Limit/Project/Update/Delete/Insert Executor` | `relation::TableCursor`、`exec::ResultCursor` |
 
 `ResultCursor` 是**门面**：内部持有根算子，`next()` 转发给根算子 ——
@@ -28,16 +29,16 @@ executor 只依赖 `planner`（计划树）与 `relation`（Table 视图 + 存�
 
 ## 3. 算子与计划节点的对应
 
-| 计划节点 | 算子 | 说明 |
-|---|---|---|
-| `FullScan` / `IndexScan` / `RangeUnion` | `ScanExecutor` | 多区间拼接 + 方向 + 跳点；点查询退化成一次 `Get` |
-| `Filter` | `FilterExecutor` | `where_keeps(evaluate_condition(...))`，只放行 TRUE |
-| `Sort`（TopN） | `SortExecutor` | 无 LIMIT 全量排（超 `row_limit` 报 `MEMORY_LIMIT`）；有 LIMIT 用 n 行堆 |
-| `Limit` | `LimitExecutor` | 跳过 OFFSET、取 LIMIT，取够就不再向上游要数据 |
-| `Project` | `ProjectExecutor` | 按 SELECT 列表裁剪/排序输出列 |
-| `Update` / `Delete` | 写算子 | 从 child 拉一行，改/删一行 |
-| `Insert` | `InsertExecutor` | 行源是语句里的 VALUES |
-| DDL / USE | — | 没有行流：由上层用 `sql::Catalog` 执行（USE 还需要会话状态） |
+| 计划节点                                      | 算子                | 说明                                                                       |
+| --------------------------------------------- | ------------------- | -------------------------------------------------------------------------- |
+| `FullScan` / `IndexScan` / `RangeUnion` | `ScanExecutor`    | 多区间拼接 + 方向 + 跳点；点查询退化成一次`Get`                          |
+| `Filter`                                    | `FilterExecutor`  | `where_keeps(evaluate_condition(...))`，只放行 TRUE                      |
+| `Sort`（TopN）                              | `SortExecutor`    | 无 LIMIT 全量排（超`row_limit` 报 `MEMORY_LIMIT`）；有 LIMIT 用 n 行堆 |
+| `Limit`                                     | `LimitExecutor`   | 跳过 OFFSET、取 LIMIT，取够就不再向上游要数据                              |
+| `Project`                                   | `ProjectExecutor` | 按 SELECT 列表裁剪/排序输出列                                              |
+| `Update` / `Delete`                       | 写算子              | 从 child 拉一行，改/删一行                                                 |
+| `Insert`                                    | `InsertExecutor`  | 行源是语句里的 VALUES                                                      |
+| DDL / USE                                     | —                  | 没有行流：由上层用`sql::Catalog` 执行（USE 还需要会话状态）              |
 
 实现细节：
 

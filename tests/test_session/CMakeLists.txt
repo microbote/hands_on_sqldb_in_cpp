@@ -10,6 +10,7 @@ add_executable(test_session
     test_cost.cpp
     test_transaction.cpp
     test_multi_insert.cpp
+    test_snapshot.cpp
 )
 
 target_link_libraries(test_session PRIVATE
