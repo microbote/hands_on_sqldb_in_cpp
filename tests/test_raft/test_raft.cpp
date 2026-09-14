@@ -1,0 +1,696 @@
+#include <algorithm>
+#include <cstdint>
+#include <deque>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+#include "raft/memory_log_store.h"
+#include "raft/kv_state_machine.h"
+#include "raft/proposal_payload.h"
+#include "raft/raft_node.h"
+#include "storage/kv_engine/kv_factory.h"
+#include "test_framework.h"
+
+#if defined(SQLDB_HAVE_LEVELDB)
+#include "raft/leveldb_request_result_store.h"
+#include "raft/leveldb_log_store.h"
+#endif
+
+namespace {
+
+using raft::NodeId;
+
+class ManualClock final : public raft::Clock {
+public:
+  uint64_t now_ms() const override { return now_; }
+  void advance(uint64_t ms) { now_ += ms; }
+
+private:
+  uint64_t now_ = 0;
+};
+
+class TestNetwork {
+public:
+  struct QueuedMessage {
+    NodeId from;
+    NodeId to;
+    raft::Message message;
+  };
+
+  void bind(NodeId id, raft::RaftNode *node) { nodes_[id] = node; }
+
+  void enqueue(NodeId from, NodeId to, raft::Message message) {
+    messages_.push_back(
+        QueuedMessage{from, to, std::move(message)});
+  }
+
+  void deliver_all(size_t limit = 10000) {
+    while (!messages_.empty() && limit-- > 0) {
+      const QueuedMessage item = std::move(messages_.front());
+      messages_.pop_front();
+      const auto it = nodes_.find(item.to);
+      if (it != nodes_.end()) {
+        it->second->handle_message(item.from, item.message);
+      }
+    }
+    CHECK_TRUE(messages_.empty());
+  }
+
+private:
+  std::map<NodeId, raft::RaftNode *> nodes_;
+  std::deque<QueuedMessage> messages_;
+};
+
+class TestTransport final : public raft::Transport {
+public:
+  TestTransport(NodeId sender, TestNetwork &network)
+      : sender_(sender), network_(network) {}
+
+  void send(NodeId to, const raft::Message &message) override {
+    network_.enqueue(sender_, to, message);
+  }
+
+  void on_message(
+      std::function<void(NodeId, const raft::Message &)>) override {
+    // Tests deliver messages directly through TestNetwork. This keeps message
+    // handling queued rather than re-entering RaftNode inside send().
+  }
+
+private:
+  NodeId sender_;
+  TestNetwork &network_;
+};
+
+class RecordingStateMachine final : public raft::StateMachine {
+public:
+  std::expected<std::string, raft::Error>
+  apply(const raft::LogEntry &entry) override {
+    applied.push_back(entry.data);
+    return entry.data;
+  }
+
+  std::expected<std::string, raft::Error>
+  snapshot(kv::KeyRange) override {
+    return std::string{"snapshot"};
+  }
+
+  std::expected<void, raft::Error> restore(std::string_view) override {
+    return {};
+  }
+
+  bool contains(const std::string &data) const {
+    return std::find(applied.begin(), applied.end(), data) != applied.end();
+  }
+
+  std::vector<std::string> applied;
+};
+
+struct TestNode {
+  raft::MemoryLogStore log;
+  RecordingStateMachine state_machine;
+  std::unique_ptr<TestTransport> transport;
+  std::unique_ptr<raft::RaftNode> node;
+};
+
+class TestCluster {
+public:
+  TestCluster(std::vector<NodeId> ids, uint64_t election_timeout = 100,
+              uint64_t heartbeat = 10)
+      : ids_(std::move(ids)) {
+    for (const NodeId id : ids_) {
+      auto test_node = std::make_unique<TestNode>();
+      test_node->transport = std::make_unique<TestTransport>(id, network_);
+      test_node->node = std::make_unique<raft::RaftNode>(
+          raft::NodeConfig{id, ids_, election_timeout, heartbeat},
+          test_node->log, *test_node->transport,
+          test_node->state_machine, clock_);
+      network_.bind(id, test_node->node.get());
+      nodes_[id] = std::move(test_node);
+    }
+  }
+
+  void start() {
+    for (auto &[id, test_node] : nodes_) {
+      auto result = test_node->node->start();
+      CHECK_TRUE(result.has_value());
+    }
+  }
+
+  void step(uint64_t ms = 10) {
+    clock_.advance(ms);
+    for (auto &[id, test_node] : nodes_) {
+      test_node->node->tick();
+    }
+    network_.deliver_all();
+  }
+
+  raft::RaftNode *leader() const {
+    raft::RaftNode *found = nullptr;
+    for (const auto &[id, test_node] : nodes_) {
+      if (test_node->node->is_leader()) {
+        CHECK_TRUE(found == nullptr);
+        found = test_node->node.get();
+      }
+    }
+    return found;
+  }
+
+  raft::RaftNode *node(NodeId id) const {
+    return nodes_.at(id)->node.get();
+  }
+
+  TestNode &test_node(NodeId id) { return *nodes_.at(id); }
+
+private:
+  std::vector<NodeId> ids_;
+  ManualClock clock_;
+  TestNetwork network_;
+  std::map<NodeId, std::unique_ptr<TestNode>> nodes_;
+};
+
+#if defined(SQLDB_HAVE_LEVELDB)
+
+class TempDirectory {
+public:
+  TempDirectory() {
+    const auto base = std::filesystem::temp_directory_path() /
+                      ("sqldb-raft-test-XXXXXX");
+    std::vector<char> buffer(base.string().begin(), base.string().end());
+    buffer.push_back('\0');
+    if (::mkdtemp(buffer.data()) == nullptr) {
+      return;
+    }
+    path_ = buffer.data();
+    valid_ = true;
+  }
+
+  ~TempDirectory() {
+    if (valid_) {
+      std::error_code ignored;
+      std::filesystem::remove_all(path_, ignored);
+    }
+  }
+
+  const std::string &path() const { return path_; }
+  bool valid() const { return valid_; }
+
+private:
+  std::string path_;
+  bool valid_ = false;
+};
+
+TEST(LevelDBLogStore, PersistsHardStateAndEntries) {
+  TempDirectory directory;
+  CHECK_TRUE(directory.valid());
+
+  {
+    raft::LevelDBLogStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+
+    const raft::HardState hard_state{7, NodeId{3}};
+    CHECK_TRUE(store.save_hard_state(hard_state).has_value());
+    CHECK_TRUE(store.append(raft::LogEntry{1, 5, "one"}).has_value());
+    CHECK_TRUE(store.append(raft::LogEntry{
+                   2, 7, std::string{"two\0with-nul", 12}})
+                   .has_value());
+    CHECK_EQ(store.last_index().value_or(0), uint64_t{2});
+  }
+
+  {
+    raft::LevelDBLogStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+
+    auto hard_state = store.load_hard_state();
+    CHECK_TRUE(hard_state.has_value());
+    CHECK_EQ(hard_state->term, uint64_t{7});
+    CHECK_EQ(hard_state->voted_for, NodeId{3});
+
+    auto first = store.at(1);
+    CHECK_TRUE(first.has_value());
+    CHECK_EQ(first->term, uint64_t{5});
+    CHECK_STREQ(first->data, "one");
+
+    auto second = store.at(2);
+    CHECK_TRUE(second.has_value());
+    CHECK_EQ(second->term, uint64_t{7});
+    const std::string expected_data{"two\0with-nul", 12};
+    CHECK_EQ(second->data, expected_data);
+    CHECK_EQ(store.last_index().value_or(0), uint64_t{2});
+  }
+}
+
+TEST(LevelDBLogStore, TruncatesSuffixDurably) {
+  TempDirectory directory;
+  CHECK_TRUE(directory.valid());
+
+  {
+    raft::LevelDBLogStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+    CHECK_TRUE(store.append(raft::LogEntry{1, 1, "one"}).has_value());
+    CHECK_TRUE(store.append(raft::LogEntry{2, 1, "two"}).has_value());
+    CHECK_TRUE(store.append(raft::LogEntry{3, 2, "three"}).has_value());
+    CHECK_TRUE(store.truncate_suffix(2).has_value());
+    CHECK_EQ(store.last_index().value_or(99), uint64_t{1});
+    CHECK_FALSE(store.at(2).has_value());
+  }
+
+  {
+    raft::LevelDBLogStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+    CHECK_EQ(store.last_index().value_or(99), uint64_t{1});
+    auto first = store.at(1);
+    CHECK_TRUE(first.has_value());
+    CHECK_STREQ(first->data, "one");
+    CHECK_FALSE(store.at(2).has_value());
+    CHECK_TRUE(store.append(raft::LogEntry{2, 3, "replacement"})
+                   .has_value());
+  }
+}
+
+TEST(RaftCore, LevelDBLogStoreRecoversAfterRestart) {
+  TempDirectory directory;
+  CHECK_TRUE(directory.valid());
+
+  {
+    ManualClock clock;
+    TestNetwork network;
+    raft::LevelDBLogStore log;
+    RecordingStateMachine state_machine;
+    TestTransport transport(NodeId{1}, network);
+    raft::RaftNode node(
+        raft::NodeConfig{
+            NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100, 10},
+        log, transport, state_machine, clock);
+
+    CHECK_TRUE(log.open(directory.path()).has_value());
+    CHECK_TRUE(node.start().has_value());
+    clock.advance(200);
+    node.tick();
+
+    CHECK_TRUE(node.is_leader());
+    CHECK_EQ(node.term(), uint64_t{1});
+    CHECK_EQ(node.last_log_index(), uint64_t{1});
+    CHECK_EQ(node.commit_index(), uint64_t{1});
+    auto proposal = node.propose("restart-me");
+    CHECK_TRUE(proposal.has_value());
+    CHECK_TRUE(proposal->committed);
+    CHECK_EQ(node.last_log_index(), uint64_t{2});
+    CHECK_EQ(node.commit_index(), uint64_t{2});
+  }
+
+  {
+    ManualClock clock;
+    TestNetwork network;
+    raft::LevelDBLogStore log;
+    RecordingStateMachine state_machine;
+    TestTransport transport(NodeId{1}, network);
+    raft::RaftNode node(
+        raft::NodeConfig{
+            NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100, 10},
+        log, transport, state_machine, clock);
+
+    CHECK_TRUE(log.open(directory.path()).has_value());
+    CHECK_TRUE(node.start().has_value());
+
+    CHECK_EQ(node.term(), uint64_t{1});
+    CHECK_EQ(node.role(), raft::Role::Follower);
+    CHECK_EQ(node.last_log_index(), uint64_t{2});
+    CHECK_EQ(node.commit_index(), uint64_t{0});
+
+    clock.advance(200);
+    node.tick();
+
+    CHECK_TRUE(node.is_leader());
+    CHECK_EQ(node.term(), uint64_t{2});
+    CHECK_EQ(node.last_log_index(), uint64_t{3}); // new leadership no-op
+    CHECK_EQ(node.commit_index(), uint64_t{3});
+    CHECK_EQ(node.applied_index(), uint64_t{3});
+    CHECK_TRUE(state_machine.contains("restart-me"));
+  }
+}
+
+TEST(LevelDBRequestResultStore, PersistsLatestResultPerClient) {
+  TempDirectory directory;
+  CHECK_TRUE(directory.valid());
+  const std::string result{"result\0binary", 14};
+
+  {
+    raft::LevelDBRequestResultStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+    auto missing = store.find(17, 9);
+    CHECK_TRUE(missing.has_value());
+    CHECK_FALSE(missing->has_value());
+
+    CHECK_TRUE(store.save(17, 9, result).has_value());
+  }
+
+  {
+    raft::LevelDBRequestResultStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+    auto found = store.find(17, 9);
+    CHECK_TRUE(found.has_value());
+    CHECK_TRUE(found->has_value());
+    CHECK_EQ(**found, result);
+
+    CHECK_TRUE(store.save(17, 10, "newer").has_value());
+    auto stale = store.find(17, 9);
+    CHECK_FALSE(stale.has_value());
+    CHECK_EQ(stale.error().code, raft::ErrorCode::InvalidArgument);
+  }
+}
+
+#endif
+
+TEST(RaftCore, SingleNodeElectsAndCommitsImmediately) {
+  TestCluster cluster(std::vector<NodeId>{NodeId{1}});
+  cluster.start();
+
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *leader = cluster.leader();
+  CHECK_NOT_NULL(leader);
+  CHECK_EQ(leader->term(), 1);
+  CHECK_EQ(leader->last_log_index(), 1); // leadership no-op
+  CHECK_EQ(leader->commit_index(), 1);
+  CHECK_EQ(leader->applied_index(), 1);
+
+  auto proposal = leader->propose("value");
+  CHECK_TRUE(proposal.has_value());
+  CHECK_EQ(proposal->index, 2);
+  CHECK_EQ(proposal->term, 1);
+  CHECK_TRUE(proposal->committed);
+  CHECK_EQ(leader->commit_index(), 2);
+  CHECK_EQ(leader->applied_index(), 2);
+  CHECK_TRUE(cluster.test_node(NodeId{1}).state_machine.contains("value"));
+}
+
+TEST(RaftCore, ThreeNodesElectReplicateCommitAndApply) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *leader = cluster.leader();
+  CHECK_NOT_NULL(leader);
+  CHECK_EQ(leader->term(), 1);
+  CHECK_EQ(leader->last_log_index(), 1);
+  CHECK_EQ(leader->commit_index(), 1);
+
+  for (const NodeId id :
+       std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}}) {
+    raft::RaftNode *node = cluster.node(id);
+    CHECK_EQ(node->commit_index(), 1);
+    CHECK_EQ(node->applied_index(), 1);
+    CHECK_EQ(node->leader_hint(), NodeId{1});
+  }
+
+  auto proposal = leader->propose("alpha");
+  CHECK_TRUE(proposal.has_value());
+  CHECK_EQ(proposal->index, 2);
+  CHECK_FALSE(proposal->committed);
+
+  for (int i = 0; i < 10; ++i) {
+    cluster.step();
+  }
+
+  for (const NodeId id :
+       std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}}) {
+    raft::RaftNode *node = cluster.node(id);
+    CHECK_EQ(node->last_log_index(), 2);
+    CHECK_EQ(node->commit_index(), 2);
+    CHECK_EQ(node->applied_index(), 2);
+    CHECK_TRUE(cluster.test_node(id).state_machine.contains("alpha"));
+    CHECK_FALSE(node->last_error().has_value());
+  }
+}
+
+TEST(RaftCore, FollowerRejectsProposal) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *follower = cluster.node(NodeId{2});
+  CHECK_FALSE(follower->is_leader());
+  auto result = follower->propose("not-leader");
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::NotLeader);
+}
+
+TEST(RaftCore, HigherTermStepsLeaderDown) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *old_leader = cluster.leader();
+  CHECK_NOT_NULL(old_leader);
+  old_leader->handle_message(
+      NodeId{3},
+      raft::AppendEntriesRequest{
+          2, NodeId{3}, 0, 0, {}, 0});
+
+  CHECK_FALSE(old_leader->is_leader());
+  CHECK_EQ(old_leader->role(), raft::Role::Follower);
+  CHECK_EQ(old_leader->term(), 2);
+  CHECK_EQ(old_leader->leader_hint(), NodeId{3});
+
+  auto result = old_leader->propose("after-stepdown");
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::NotLeader);
+}
+
+TEST(RaftCore, FollowerTruncatesConflictingSuffix) {
+  ManualClock clock;
+  TestNetwork network;
+  raft::MemoryLogStore log;
+  RecordingStateMachine state_machine;
+
+  CHECK_TRUE(log.append(raft::LogEntry{1, 1, "stale"}).has_value());
+  CHECK_TRUE(
+      log.save_hard_state(raft::HardState{1, NodeId{1}}).has_value());
+
+  TestTransport transport(NodeId{1}, network);
+  raft::RaftNode node(
+      raft::NodeConfig{
+          NodeId{1},
+          std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}},
+          100,
+          10},
+      log, transport, state_machine, clock);
+  CHECK_TRUE(node.start().has_value());
+
+  node.handle_message(
+      NodeId{2},
+      raft::AppendEntriesRequest{
+          2,
+          NodeId{2},
+          0,
+          0,
+          std::vector<raft::LogEntryMessage>{
+              raft::LogEntryMessage{raft::LogEntry{1, 2, "good"}}},
+          1});
+  network.deliver_all();
+
+  CHECK_EQ(node.term(), 2);
+  CHECK_EQ(node.role(), raft::Role::Follower);
+  CHECK_EQ(node.last_log_index(), 1);
+  CHECK_EQ(node.commit_index(), 1);
+  CHECK_EQ(node.applied_index(), 1);
+  auto entry = log.at(1);
+  CHECK_TRUE(entry.has_value());
+  CHECK_EQ(entry->term, 2);
+  CHECK_STREQ(entry->data, "good");
+  CHECK_TRUE(state_machine.contains("good"));
+}
+
+TEST(ProposalPayload, RoundTripsAllWriteBatchOperations) {
+  raft::ProposalPayload payload;
+  payload.client_id = 42;
+  payload.request_id = 99;
+  payload.batch.put(std::string{"key\0one", 7},
+                   std::string{"value\0two", 10});
+  payload.batch.remove("key-two");
+  payload.batch.remove_range("range-a", "range-b");
+
+  const std::string encoded = raft::encode_proposal_payload(payload);
+  auto decoded = raft::decode_proposal_payload(encoded);
+  CHECK_TRUE(decoded.has_value());
+  CHECK_EQ(decoded->client_id, uint64_t{42});
+  CHECK_EQ(decoded->request_id, uint64_t{99});
+  CHECK_EQ(decoded->batch.size(), size_t{3});
+
+  const auto &ops = decoded->batch.ops();
+  CHECK_EQ(ops[0].type, kv::WriteBatch::OpType::kPut);
+  const std::string expected_key{"key\0one", 7};
+  const std::string expected_value{"value\0two", 10};
+  CHECK_EQ(ops[0].data.key, expected_key);
+  CHECK_TRUE(ops[0].data.value.has_value());
+  if (ops[0].data.value.has_value()) {
+    CHECK_EQ(ops[0].data.value.value(), expected_value);
+  }
+  CHECK_EQ(ops[1].type, kv::WriteBatch::OpType::kRemove);
+  CHECK_EQ(ops[1].data.key, std::string{"key-two"});
+  CHECK_EQ(ops[2].type, kv::WriteBatch::OpType::kRemoveRange);
+  CHECK_EQ(ops[2].data.key, std::string{"range-a"});
+  CHECK_EQ(ops[2].range_end, std::string{"range-b"});
+}
+
+TEST(ProposalPayload, RejectsMalformedData) {
+  CHECK_FALSE(raft::decode_proposal_payload("").has_value());
+  CHECK_FALSE(raft::decode_proposal_payload("not-a-payload").has_value());
+
+  raft::ProposalPayload payload;
+  payload.client_id = 1;
+  payload.request_id = 2;
+  payload.batch.put("key", "value");
+  std::string encoded = raft::encode_proposal_payload(payload);
+  CHECK_TRUE(encoded.size() > 5);
+  encoded[7] = 0; // version low byte
+  auto decoded = raft::decode_proposal_payload(encoded);
+  CHECK_FALSE(decoded.has_value());
+  CHECK_EQ(decoded.error().code, raft::ErrorCode::InvalidArgument);
+
+  encoded = raft::encode_proposal_payload(payload);
+  encoded.pop_back();
+  CHECK_FALSE(raft::decode_proposal_payload(encoded).has_value());
+}
+
+std::map<std::string, std::string> collect_range(
+    const std::shared_ptr<kv::KVStore> &store, const kv::KeyRange &range) {
+  std::map<std::string, std::string> result;
+  auto iterator = store->new_iterator(range);
+  if (iterator == nullptr) {
+    return result;
+  }
+  for (iterator->seek_to_first(); iterator->valid(); iterator->next()) {
+    result.emplace(iterator->key(), iterator->value());
+  }
+  return result;
+}
+
+std::shared_ptr<kv::KVStore> open_mock_store() {
+  kv::DatabaseOptions options;
+  options.set_path("raft-kv-state-machine-test");
+  auto store = kv::create_store(kv::EngineType::MOCK);
+  if (store == nullptr || store->open(options) != kv::Status::OK) {
+    return nullptr;
+  }
+  return store;
+}
+
+TEST(KVStateMachine, AppliesPayloadAndDeduplicatesRequestId) {
+  auto local = open_mock_store();
+  CHECK_TRUE(local != nullptr);
+  raft::MemoryRequestResultStore request_results;
+  raft::KVStateMachine state_machine{local, request_results};
+
+  raft::ProposalPayload payload;
+  payload.client_id = 17;
+  payload.request_id = 31;
+  const std::string key{"key\0one", 7};
+  const std::string value{"value\0one", 10};
+  payload.batch.put(key, value);
+  payload.batch.put("key-two", "value-two");
+  payload.batch.remove("removed-key");
+  payload.batch.remove_range("old-a", "old-b");
+
+  const raft::LogEntry entry{1, 1,
+                              raft::encode_proposal_payload(payload)};
+  auto first = state_machine.apply(entry);
+  CHECK_TRUE(first.has_value());
+  CHECK_STREQ(*first, "applied");
+
+  const auto values = collect_range(
+      local, kv::KeyRange::all());
+  CHECK_EQ(values.size(), size_t{2});
+  if (values.size() == 2) {
+    CHECK_EQ(values.at(key), value);
+    CHECK_EQ(values.at("key-two"), std::string{"value-two"});
+  }
+
+  auto duplicate = state_machine.apply(entry);
+  CHECK_TRUE(duplicate.has_value());
+  CHECK_STREQ(*duplicate, "applied");
+}
+
+TEST(KVStateMachine, RejectsMalformedEntryWithoutMutatingKV) {
+  auto local = open_mock_store();
+  CHECK_TRUE(local != nullptr);
+  raft::MemoryRequestResultStore request_results;
+  raft::KVStateMachine state_machine{local, request_results};
+
+  auto result = state_machine.apply(raft::LogEntry{1, 1, "not-a-payload"});
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::InvalidArgument);
+  CHECK_TRUE(collect_range(local, kv::KeyRange::all()).empty());
+}
+
+TEST(KVStateMachine, SnapshotsAndRestoresFiniteRange) {
+  auto source = open_mock_store();
+  CHECK_TRUE(source != nullptr);
+  raft::MemoryRequestResultStore ignored_results;
+  raft::KVStateMachine source_state_machine{source, ignored_results};
+
+  kv::WriteBatch initial;
+  initial.put("range-a", "one");
+  initial.put("range-b", std::string{"two\0three", 9});
+  initial.put("outside", "do-not-copy");
+  CHECK_EQ(source->write_batch(initial), kv::Status::OK);
+
+  const kv::KeyRange range =
+      kv::KeyRange::range("range-a", "range-z");
+  auto snapshot = source_state_machine.snapshot(range);
+  CHECK_TRUE(snapshot.has_value());
+
+  auto target = open_mock_store();
+  CHECK_TRUE(target != nullptr);
+  raft::MemoryRequestResultStore target_results;
+  raft::KVStateMachine target_state_machine{target, target_results};
+
+  kv::WriteBatch stale;
+  stale.put("range-a", "stale");
+  stale.put("range-y", "stale");
+  stale.put("outside", "stale");
+  CHECK_EQ(target->write_batch(stale), kv::Status::OK);
+
+  auto restored =
+      target_state_machine.restore(range, *snapshot);
+  CHECK_TRUE(restored.has_value());
+
+  const auto values = collect_range(target, kv::KeyRange::all());
+  CHECK_EQ(values.size(), size_t{3});
+  if (values.size() == 3) {
+    CHECK_EQ(values.at("range-a"), std::string{"one"});
+    const std::string expected_range_value{"two\0three", 9};
+    CHECK_EQ(values.at("range-b"), expected_range_value);
+    CHECK_EQ(values.at("outside"), std::string{"stale"});
+  }
+}
+
+TEST(KVStateMachine, SnapshotRestoreRejectsInvalidRange) {
+  auto local = open_mock_store();
+  CHECK_TRUE(local != nullptr);
+  raft::MemoryRequestResultStore request_results;
+  raft::KVStateMachine state_machine{local, request_results};
+
+  const std::string snapshot_data{"SQSN"};
+  auto result = state_machine.restore(kv::KeyRange::all(), snapshot_data);
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::InvalidArgument);
+}
+
+} // namespace

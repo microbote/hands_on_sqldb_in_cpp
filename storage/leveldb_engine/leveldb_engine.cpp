@@ -595,6 +595,11 @@ LevelDBStore::new_iterator(const KeyRange &range,
   return std::make_unique<LevelDBIterator>(this, it, range);
 }
 
+std::unique_ptr<Iterator>
+LevelDBStore::new_iterator(const KeyRange &range) {
+  return new_iterator(range, nullptr);
+}
+
 // ----- 快照（事务的一致读视图）-----
 const leveldb::Snapshot *LevelDBStore::acquire_snapshot() {
   std::lock_guard<std::mutex> lock(mutex_);

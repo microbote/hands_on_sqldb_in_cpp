@@ -97,9 +97,9 @@ public:
   bool exists(const Key &key) const;
   Status get_batch(const std::vector<Key> &keys, MissingKeyPolicy policy,
                    std::vector<std::optional<ByteValue>> *values) const;
-  Status write_batch(const WriteBatch &batch);
+  Status write_batch(const WriteBatch &batch) override;
   // 扫描底座：把区间物化成一份快照（不持锁的迭代器）
-  std::unique_ptr<Iterator> new_iterator(const KeyRange &range);
+  std::unique_ptr<Iterator> new_iterator(const KeyRange &range) override;
 
   // ----- 写槽（悲观单写者：同时只允许一条连接持有写事务）-----
   Status acquire_write_slot(const void *owner);

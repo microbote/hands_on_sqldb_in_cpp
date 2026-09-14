@@ -175,6 +175,36 @@ else()
 endif()
 
 # ============================================================
+# Raft core：P0 是线程无关、socket 无关的确定性实现。
+# 它不接入 server 入口，也不认识 SQL；后续 P1 再增加 KV 适配层。
+# ============================================================
+add_library(sql_raft STATIC
+    raft/kv_state_machine.cpp
+    raft/proposal_payload.cpp
+    raft/raft_node.cpp
+)
+
+target_include_directories(sql_raft PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(sql_raft PUBLIC
+    sql_kv
+)
+
+if(LEVELDB_INCLUDE_DIR AND LEVELDB_LIBRARY)
+    target_sources(sql_raft PRIVATE
+        raft/leveldb_request_result_store.cpp
+        raft/leveldb_log_store.cpp
+    )
+    target_include_directories(sql_raft PUBLIC ${LEVELDB_INCLUDE_DIR})
+    target_link_libraries(sql_raft PUBLIC ${LEVELDB_LIBRARY})
+    target_compile_definitions(sql_raft PUBLIC SQLDB_HAVE_LEVELDB=1)
+endif()
+
+target_compile_features(sql_raft PUBLIC cxx_std_23)
+
+# ============================================================
 # relation 关系层：sql::Catalog 的 KV 实现 + Table/Cursor 视图
 # ============================================================
 add_library(sql_relation STATIC

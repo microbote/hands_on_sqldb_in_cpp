@@ -97,7 +97,8 @@ public:
   Status get_batch(const std::vector<Key> &keys, MissingKeyPolicy policy,
                    std::vector<std::optional<ByteValue>> *values,
                    const leveldb::Snapshot *snapshot = nullptr) const;
-  Status write_batch(const WriteBatch &batch);
+  Status write_batch(const WriteBatch &batch) override;
+  std::unique_ptr<Iterator> new_iterator(const KeyRange &range) override;
   std::unique_ptr<Iterator>
   new_iterator(const KeyRange &range,
                const leveldb::Snapshot *snapshot = nullptr);

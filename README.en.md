@@ -93,6 +93,7 @@ when behavior changes.
 | `storage/kv_engine/readme.md` | KVStore/KVEngine, transaction buffer, engine parity |
 | `client/README.md` | both clients (local `sqldb` / remote `sqldb-client`): usage, meta commands, EXPLAIN output |
 | `server/README.md` | the server `sqldb-server`: artifacts (`build/svr/{bin,etc}`), config, **logging**, routing |
+| `raft/DESIGN.md` | **design doc**: the Multi-Raft plan, the two frozen decisions, sharding/transaction rules, phased plan; the P0 core is implemented |
 
 Per-module change logs (design trade-offs and pitfalls) live in
 `tests/test_<module>/codex_check_issues.md`.

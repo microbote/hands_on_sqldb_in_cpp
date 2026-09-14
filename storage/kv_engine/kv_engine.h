@@ -467,6 +467,15 @@ public:
   virtual void flush() = 0;
   virtual std::string stats() const { return ""; }
 
+  // Raft / recovery path: apply a committed batch directly to the storage.
+  // This bypasses a connection's TxBuffer and the global write slot; raft commit
+  // is already the serialization point for a group.
+  virtual Status write_batch(const WriteBatch &batch) = 0;
+
+  // Raft snapshot path: read committed storage without creating a session
+  // connection or transaction snapshot.
+  virtual std::unique_ptr<Iterator> new_iterator(const KeyRange &range) = 0;
+
   // 写槽是否被某条连接持有（测试/诊断用）
   virtual bool write_slot_held() const = 0;
 };
