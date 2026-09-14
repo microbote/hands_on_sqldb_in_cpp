@@ -13,7 +13,7 @@
 
 #include "client/connection.h"
 #include "client/repl.h"
-#include "server/protocol.h"
+#include "common/proto/protocol.h"
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -39,15 +39,15 @@ bool write_all(int fd, const std::string &data) {
 
 // 极简假服务器：只认几条固定语句 + META 请求
 void serve_fake(int fd) {
-  if (!write_all(fd, server::encode_hello(1, 0))) {
+  if (!write_all(fd, common::proto::encode_hello(1, 0))) {
     return;
   }
   std::string in;
   while (true) {
-    server::DecodedFrame frame;
+    common::proto::DecodedFrame frame;
     size_t consumed = 0;
     std::string error;
-    if (!server::try_decode_frame(in, &frame, &consumed, &error)) {
+    if (!common::proto::try_decode_frame(in, &frame, &consumed, &error)) {
       if (!error.empty()) {
         return;
       }
@@ -61,91 +61,91 @@ void serve_fake(int fd) {
     }
     in.erase(0, consumed);
 
-    if (frame.type == server::FrameType::kBye) {
+    if (frame.type == common::proto::FrameType::kBye) {
       return;
     }
-    if (frame.type == server::FrameType::kMeta) {
+    if (frame.type == common::proto::FrameType::kMeta) {
       uint8_t kind = 0;
       std::string arg1;
       std::string arg2;
-      if (!server::decode_meta(frame.payload, &kind, &arg1, &arg2)) {
+      if (!common::proto::decode_meta(frame.payload, &kind, &arg1, &arg2)) {
         return;
       }
       std::string payload;
-      if (static_cast<server::MetaKind>(kind) == server::MetaKind::kDatabases) {
-        std::vector<server::MetaDatabase> dbs(1);
+      if (static_cast<common::proto::MetaKind>(kind) == common::proto::MetaKind::kDatabases) {
+        std::vector<common::proto::MetaDatabase> dbs(1);
         dbs[0].name = "shop";
         dbs[0].table_count = 1;
         dbs[0].is_current = true;
-        payload = server::encode_meta_databases(dbs);
-      } else if (static_cast<server::MetaKind>(kind) ==
-                 server::MetaKind::kTables) {
-        std::vector<server::MetaTable> tables(1);
+        payload = common::proto::encode_meta_databases(dbs);
+      } else if (static_cast<common::proto::MetaKind>(kind) ==
+                 common::proto::MetaKind::kTables) {
+        std::vector<common::proto::MetaTable> tables(1);
         tables[0].name = "users";
         tables[0].column_count = 3;
         tables[0].primary_key = "id";
-        payload = server::encode_meta_tables(tables);
+        payload = common::proto::encode_meta_tables(tables);
       } else {
         sql::TableSchema schema(sql::Identifier(arg2.empty() ? "users" : arg2));
         schema.add_column(sql::Identifier("id"), sql::DataType::INT, true,
                           false);
-        payload = server::encode_meta_schema(schema);
+        payload = common::proto::encode_meta_schema(schema);
       }
-      if (!write_all(fd, server::encode_meta_reply(payload))) {
+      if (!write_all(fd, common::proto::encode_meta_reply(payload))) {
         return;
       }
       continue;
     }
-    if (frame.type != server::FrameType::kQuery) {
+    if (frame.type != common::proto::FrameType::kQuery) {
       return;
     }
     std::string sql;
-    if (!server::decode_query(frame.payload, &sql)) {
+    if (!common::proto::decode_query(frame.payload, &sql)) {
       return;
     }
     if (sql.find("nope") != std::string::npos) {
-      server::ErrorFrame missing;
+      common::proto::ErrorFrame missing;
       missing.message = "table not found: nope (line 1:15)";
       missing.sql = sql;
       missing.begin_line = 1;
       missing.begin_column = 15;
       missing.end_line = 1;
       missing.end_column = 19;
-      if (!write_all(fd, server::encode_error(missing))) {
+      if (!write_all(fd, common::proto::encode_error(missing))) {
         return;
       }
       continue;
     }
     if (sql.find("SELECT") != std::string::npos) {
-      if (!write_all(fd, server::encode_columns({"id", "name"}))) {
+      if (!write_all(fd, common::proto::encode_columns({"id", "name"}))) {
         return;
       }
-      std::vector<server::ProtocolValue> row(2);
+      std::vector<common::proto::ProtocolValue> row(2);
       row[0].text = "1";
       row[1].is_null = true; // NULL 单元格
-      if (!write_all(fd, server::encode_row(row))) {
+      if (!write_all(fd, common::proto::encode_row(row))) {
         return;
       }
       // rows 结果也回 OK（affected = 行数，is_write = false）
-      if (!write_all(fd, server::encode_ok(1, false, false, "shop"))) {
+      if (!write_all(fd, common::proto::encode_ok(1, false, false, "shop"))) {
         return;
       }
       continue;
     }
     if (sql.find("BEGIN") != std::string::npos) {
-      if (!write_all(fd, server::encode_ok(0, /*in_tx=*/true, false, "shop"))) {
+      if (!write_all(fd, common::proto::encode_ok(0, /*in_tx=*/true, false, "shop"))) {
         return;
       }
       continue;
     }
     if (sql.find("ROLLBACK") != std::string::npos) {
-      if (!write_all(fd, server::encode_ok(0, false, false, "shop"))) {
+      if (!write_all(fd, common::proto::encode_ok(0, false, false, "shop"))) {
         return;
       }
       continue;
     }
     // 其它（INSERT/DDL）：写语句，affected = 2
-    if (!write_all(fd, server::encode_ok(2, false, true, "shop"))) {
+    if (!write_all(fd, common::proto::encode_ok(2, false, true, "shop"))) {
       return;
     }
   }
@@ -160,7 +160,7 @@ TEST(FakeServer, WriteAfterServerIsGoneReportsConnectionLost) {
   int fds[2] = {-1, -1};
   CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
   // 握手要读到 HELLO，所以先替"服务器"把它写进管道，再让服务器那端消失
-  CHECK(write_all(fds[0], server::encode_hello(server::kProtocolVersion, 0)));
+  CHECK(write_all(fds[0], common::proto::encode_hello(common::proto::kProtocolVersion, 0)));
   std::string error;
   std::unique_ptr<client::SqlConnection> connection =
       client::make_remote_from_fd(fds[1], &error);

@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#include "server/protocol.h"
+#include "common/proto/protocol.h"
 #include "server/server.h"
 #include "session/session.h"
 #include "storage/kv_engine/kv_factory.h"
@@ -148,37 +148,37 @@ public:
     bool in_transaction = false;
     std::string current_database;
     std::vector<std::string> columns;
-    std::vector<std::vector<server::ProtocolValue>> rows;
+    std::vector<std::vector<common::proto::ProtocolValue>> rows;
     uint64_t affected_rows = 0;
-    server::ErrorFrame error;
+    common::proto::ErrorFrame error;
   };
 
   Response query(const std::string &sql) {
     Response response;
-    CHECK(send_all(server::encode_query(sql)));
+    CHECK(send_all(common::proto::encode_query(sql)));
     while (true) {
       auto frame = next_frame();
       CHECK(frame.has_value());
       if (!frame.has_value()) {
         break;
       }
-      if (frame->type == server::FrameType::kColumns) {
-        CHECK(server::decode_columns(frame->payload, &response.columns));
-      } else if (frame->type == server::FrameType::kRow) {
-        std::vector<server::ProtocolValue> row;
-        CHECK(server::decode_row(frame->payload, &row));
+      if (frame->type == common::proto::FrameType::kColumns) {
+        CHECK(common::proto::decode_columns(frame->payload, &response.columns));
+      } else if (frame->type == common::proto::FrameType::kRow) {
+        std::vector<common::proto::ProtocolValue> row;
+        CHECK(common::proto::decode_row(frame->payload, &row));
         response.rows.push_back(std::move(row));
-      } else if (frame->type == server::FrameType::kOk) {
+      } else if (frame->type == common::proto::FrameType::kOk) {
         uint8_t flags = 0;
         std::string current_db;
-        CHECK(server::decode_ok(frame->payload, &response.affected_rows, &flags,
+        CHECK(common::proto::decode_ok(frame->payload, &response.affected_rows, &flags,
                                 &current_db));
         response.in_transaction = (flags & 1) != 0;
         response.current_database = current_db;
         response.ok = true;
         break;
-      } else if (frame->type == server::FrameType::kError) {
-        CHECK(server::decode_error(frame->payload, &response.error));
+      } else if (frame->type == common::proto::FrameType::kError) {
+        CHECK(common::proto::decode_error(frame->payload, &response.error));
         response.ok = false;
         break;
       } else {
@@ -200,12 +200,12 @@ private:
     auto hello = next_frame();
     CHECK(hello.has_value());
     if (hello.has_value()) {
-      CHECK(hello->type == server::FrameType::kHello);
+      CHECK(hello->type == common::proto::FrameType::kHello);
       uint16_t proto = 0;
       uint16_t version = 0;
       uint32_t caps = 0;
-      CHECK(server::decode_hello(hello->payload, &proto, &version, &caps));
-      CHECK_EQ(proto, server::kProtocolVersion);
+      CHECK(common::proto::decode_hello(hello->payload, &proto, &version, &caps));
+      CHECK_EQ(proto, common::proto::kProtocolVersion);
     }
   }
   bool send_all(const std::string &data) {
@@ -221,12 +221,12 @@ private:
     return true;
   }
 
-  std::optional<server::DecodedFrame> next_frame() {
+  std::optional<common::proto::DecodedFrame> next_frame() {
     while (true) {
-      server::DecodedFrame frame;
+      common::proto::DecodedFrame frame;
       size_t consumed = 0;
       std::string error;
-      if (server::try_decode_frame(in_, &frame, &consumed, &error)) {
+      if (common::proto::try_decode_frame(in_, &frame, &consumed, &error)) {
         in_.erase(0, consumed);
         return frame;
       }

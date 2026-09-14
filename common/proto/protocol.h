@@ -1,6 +1,10 @@
-// server/protocol.h
+// common/proto/protocol.h
 //
 // sqldb 自有协议（M1：文本 + NULL 标志 + 一帧一行）。
+//
+// 放在 common/ 下是因为**两端共用**：server 收帧/回帧、client 发帧/解帧。
+// （原来在 server/protocol.h，客户端为了编解码也得去 include "server/..."，
+// 层次不对，2026-09-14 搬到 common/proto/，命名空间 server -> common::proto。）
 //
 //   frame = [u8 type][u32 payload_len][payload]      （net 序，小端）
 //
@@ -32,7 +36,7 @@
 
 #include "sql_types/schema.h"
 
-namespace server {
+namespace common::proto {
 
 enum class FrameType : uint8_t {
   kHello = 1,
@@ -139,4 +143,4 @@ bool decode_ok(const std::string &payload, uint64_t *affected_rows,
                uint8_t *flags, std::string *current_database);
 bool decode_error(const std::string &payload, ErrorFrame *error);
 
-} // namespace server
+} // namespace common::proto

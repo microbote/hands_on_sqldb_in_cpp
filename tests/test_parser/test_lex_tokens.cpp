@@ -9,6 +9,7 @@ extern "C" {
 #include <parser.tab.h>
 }
 
+#include <cctype>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -139,4 +140,97 @@ TEST(LexTokens, TypesAreReportedAsTypeName) {
     }
   }
   CHECK(saw_type);
+}
+
+// ---------------------------------------------------------------
+// 关键字清单（lex_keywords）：客户端的 TAB 补全数据源。
+//
+// sql.l 里"关键字规则"和"导出清单"是同一文件里的两张表，这条用例保证它们
+// **不会漂移**：清单里的每个词都必须被词法层当成关键字（不是普通标识符），
+// 而且大小写两种拼写落到同一个 token。
+// ---------------------------------------------------------------
+namespace {
+
+// 把单个词喂进词法层，返回它被识别成的 token kind（空输入返回 0）
+int lex_single_kind(const std::string &word) {
+  LexToken *tokens = nullptr;
+  const int count = lex_collect_tokens(word.c_str(), &tokens);
+  int kind = 0;
+  if (count >= 1 && tokens != nullptr) {
+    kind = tokens[0].kind;
+  }
+  std::free(tokens);
+  return kind;
+}
+
+std::string upper_copy(const std::string &text) {
+  std::string out = text;
+  for (char &c : out) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+
+} // namespace
+
+TEST(LexTokens, KeywordListMatchesTheLexerAndIsCaseInsensitive) {
+  const char *const *keywords = nullptr;
+  const int count = lex_keywords(&keywords);
+  CHECK(keywords != nullptr);
+  CHECK(count > 0);
+  if (keywords == nullptr || count <= 0) {
+    return;
+  }
+
+  std::vector<std::string> seen;
+  for (int i = 0; i < count; ++i) {
+    const std::string word = keywords[i];
+    CHECK(!word.empty());
+
+    // 清单本身必须是小写（补全提示、文档都用小写形态）
+    for (const char c : word) {
+      CHECK_FALSE(std::isupper(static_cast<unsigned char>(c)) != 0);
+    }
+    // 不重复
+    for (const std::string &other : seen) {
+      CHECK_NE(word, other);
+    }
+    seen.push_back(word);
+
+    // 每个词都必须是"关键字"，不能退化成标识符（TOK_IDENT 说明规则漏了）
+    const int kind = lex_single_kind(word);
+    CHECK(kind != TOK_IDENT);
+    CHECK(kind != TOK_TYPE_NAME);
+    CHECK(kind != 0);
+
+    // 大小写无关：全大写拼写必须落到同一个 token
+    const int upper_kind = lex_single_kind(upper_copy(word));
+    CHECK_EQ(upper_kind, kind);
+  }
+}
+
+TEST(LexTokens, KeywordListCoversCoreSqlVocabulary) {
+  // 正向清单（每个词都必须出现）——防止有人删规则时顺手删清单里的词。
+  const std::vector<std::string> required = {
+      "select", "from",     "where",   "insert",  "into",   "values",
+      "update", "set",      "delete",  "create",  "drop",   "database",
+      "table",  "order",    "by",      "limit",   "offset", "begin",
+      "commit", "rollback", "explain", "analyze", "null",   "in",
+      "is",     "like",     "and",     "or",      "not",
+  };
+  const char *const *keywords = nullptr;
+  const int count = lex_keywords(&keywords);
+  CHECK(keywords != nullptr);
+  if (keywords == nullptr) {
+    return;
+  }
+  for (const std::string &word : required) {
+    bool found = false;
+    for (int i = 0; i < count; ++i) {
+      if (word == keywords[i]) {
+        found = true;
+      }
+    }
+    CHECK(found);
+  }
 }

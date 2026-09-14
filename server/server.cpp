@@ -7,9 +7,14 @@
 
 #include <fmt/format.h>
 
-#include "protocol.h"
+#include "common/proto/protocol.h"
 
 namespace server {
+
+// 线协议住在 common/proto（客户端与服务器共用）：本文件里的协议符号
+// （FrameType / encode_* / decode_* / MetaKind ...）统一走 common::proto。
+using namespace common::proto;
+
 namespace {
 
 constexpr uint16_t kServerVersion = 1;
@@ -26,6 +31,21 @@ ErrorFrame to_error_frame(const session::SessionError &error) {
   return frame;
 }
 
+// 没传 logger 就按配置建一个。建不出来（log_file 路径不可写）时退回
+// stderr：构造函数没有返回错误的通道，而**入口**会自己 create() 一次把
+// 错误报出来（见 main_server.cpp），所以这里不会静默吞掉配置问题。
+std::shared_ptr<Logger> resolve_logger(const std::shared_ptr<Logger> &given,
+                                       const ServerConfig &config) {
+  if (given != nullptr) {
+    return given;
+  }
+  auto made = Logger::create(config.log_level(), config.log_file());
+  if (made.has_value()) {
+    return *made;
+  }
+  return *Logger::create("info", "");
+}
+
 } // namespace
 
 common::svrkit::TcpServerOptions
@@ -38,15 +58,17 @@ Server::make_transport_options(const ServerConfig &config, Server *owner) {
   return options;
 }
 
-Server::Server(ServerConfig config, std::shared_ptr<kv::KVStore> store)
+Server::Server(ServerConfig config, std::shared_ptr<kv::KVStore> store,
+               std::shared_ptr<Logger> logger)
     : config_(std::move(config)), store_(std::move(store)),
-      transport_(make_transport_options(config_, this),
-                 [this](std::shared_ptr<common::svrkit::TcpConnection>
-                            connection) -> common::svrkit::Task {
-                   return serve_connection(std::move(connection));
-                 }),
-      parse_service_("parse-service"), write_service_("write-service") {
-}
+      logger_(resolve_logger(logger, config_)),
+      transport_(
+          make_transport_options(config_, this),
+          [this](std::shared_ptr<common::svrkit::TcpConnection> connection)
+              -> common::svrkit::Task {
+            return serve_connection(std::move(connection));
+          }),
+      parse_service_("parse-service"), write_service_("write-service") {}
 
 Server::~Server() {
   transport_.stop();
@@ -58,26 +80,13 @@ Server::~Server() {
 }
 
 void Server::log(const char *level, const std::string &message) const {
-  const auto rank = [](const std::string &name) {
-    if (name == "error") {
-      return 0;
-    }
-    if (name == "warn") {
-      return 1;
-    }
-    return name == "info" ? 2 : 3;
-  };
-  if (rank(level) > rank(config_.log_level())) {
-    return;
-  }
-  fmt::print(stderr, "[{}] {}\n", level, message);
+  logger_->log(level, message);
 }
 
 void Server::arm_idle_watchdog(const std::shared_ptr<ConnState> &state,
                                bool in_tx) {
-  const int64_t timeout_ms =
-      in_tx ? config_.idle_in_transaction_timeout_ms()
-            : config_.idle_timeout_ms();
+  const int64_t timeout_ms = in_tx ? config_.idle_in_transaction_timeout_ms()
+                                   : config_.idle_timeout_ms();
   if (timeout_ms <= 0) {
     return; // 0 = 不超时
   }
@@ -99,8 +108,16 @@ std::expected<void, std::string> Server::listen() {
     return std::unexpected("storage is not open");
   }
   const int requested_port = std::stoi(config_.listen_port());
-  return transport_.listen(config_.listen_host(),
-                           static_cast<uint16_t>(requested_port));
+  auto ok = transport_.listen(config_.listen_host(),
+                              static_cast<uint16_t>(requested_port));
+  if (ok.has_value()) {
+    // 日志文件名（空 = stderr）也进日志：一眼能看出"日志到底写哪儿去了"
+    log("info",
+        fmt::format("listening on {} (log_level={}, log_file={})",
+                    config_.listen(), config_.log_level(),
+                    logger_->file().empty() ? "<stderr>" : logger_->file()));
+  }
+  return ok;
 }
 
 void Server::run() {

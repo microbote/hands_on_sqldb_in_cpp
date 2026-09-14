@@ -2,6 +2,7 @@
 #include "repl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iostream>
@@ -11,7 +12,13 @@
 
 #include <fmt/color.h>
 
+#include "parser/lex_tokens.h"
 #include "statement/sql_highlight.h"
+
+#if defined(SQLDB_HAVE_READLINE)
+#include <readline/history.h>
+#include <readline/readline.h>
+#endif
 
 namespace client {
 namespace {
@@ -397,6 +404,135 @@ int run_meta_command(SqlConnection &connection, const std::string &line,
 
 } // namespace
 
+// ============================================================
+// 补全（TAB）
+// ============================================================
+std::vector<std::string> completion_candidates(const std::string &line,
+                                               SqlConnection *connection) {
+  // 补全"当前这个词"：从最后一个空白/标点之后开始
+  size_t begin = line.size();
+  while (begin > 0) {
+    const char c = line[begin - 1];
+    if (std::isspace(static_cast<unsigned char>(c)) != 0 || c == '(' ||
+        c == ',' || c == ';') {
+      break;
+    }
+    --begin;
+  }
+  const std::string prefix = line.substr(begin);
+
+  std::vector<std::string> candidates;
+  if (!prefix.empty() && prefix[0] == '\\') {
+    // 元命令
+    candidates = {"\\l",     "\\dt",      "\\d",       "\\c",  "\\begin",
+                  "\\commit", "\\rollback", "\\?",       "\\q"};
+  } else {
+    // 关键字：来源是 sql.l 的清单（唯一数据源）
+    const char *const *keywords = nullptr;
+    const int count = lex_keywords(&keywords);
+    for (int i = 0; i < count; ++i) {
+      candidates.push_back(keywords[i]);
+    }
+    // 表名（本地连接直接有；远程连接走 META 帧）
+    if (connection != nullptr && connection->supports_metadata()) {
+      for (const auto &table : connection->tables("")) {
+        candidates.push_back(table.name);
+      }
+    }
+  }
+
+  std::vector<std::string> filtered;
+  for (const auto &candidate : candidates) {
+    if (candidate.size() >= prefix.size() &&
+        candidate.compare(0, prefix.size(), prefix) == 0 &&  // 前缀匹配
+        candidate != prefix) {                               // 完全相同的不用补
+      filtered.push_back(candidate);
+    }
+  }
+  std::sort(filtered.begin(), filtered.end());
+  filtered.erase(std::unique(filtered.begin(), filtered.end()), filtered.end());
+  return filtered;
+}
+
+#if defined(SQLDB_HAVE_READLINE)
+namespace {
+
+// readline 的补全回调：用 completion_candidates 生成候选
+struct CompletionContext {
+  SqlConnection *connection = nullptr;
+  std::vector<std::string> matches;
+  size_t next = 0;
+};
+
+CompletionContext *g_completion = nullptr; // readline 的钩子是 C 风格全局
+
+char *completion_generator(const char *text, int state) {
+  if (g_completion == nullptr) {
+    return nullptr;
+  }
+  if (state == 0) {
+    g_completion->matches =
+        completion_candidates(std::string(rl_line_buffer, rl_point),
+                              g_completion->connection);
+    g_completion->next = 0;
+  }
+  if (g_completion->next >= g_completion->matches.size()) {
+    return nullptr;
+  }
+  const std::string &match = g_completion->matches[g_completion->next++];
+  char *result = static_cast<char *>(malloc(match.size() + 1));
+  if (result == nullptr) {
+    return nullptr;
+  }
+  memcpy(result, match.c_str(), match.size() + 1);
+  (void)text; // 候选已经按整行前缀过滤过了
+  return result;
+}
+
+} // namespace
+#endif
+
+LineReader readline_line_reader(SqlConnection *connection,
+                                const std::string &history_path) {
+#if defined(SQLDB_HAVE_READLINE)
+  if (!history_path.empty()) {
+    read_history(history_path.c_str()); // 上次会话的历史
+  }
+  static CompletionContext context;
+  context.connection = connection;
+  g_completion = &context;
+  rl_attempted_completion_function = nullptr;
+  rl_completion_entry_function = completion_generator;
+
+  return [](const std::string &prompt) -> std::optional<std::string> {
+    char *raw = readline(prompt.c_str());
+    if (raw == nullptr) {
+      return std::nullopt;
+    }
+    std::string line = raw;
+    free(raw);
+    if (!line.empty()) {
+      add_history(line.c_str());
+    }
+    return line;
+  };
+#else
+  (void)connection;
+  (void)history_path;
+  return {};
+#endif
+}
+
+void history_flush(const std::string &history_path) {
+#if defined(SQLDB_HAVE_READLINE)
+  if (!history_path.empty()) {
+    write_history(history_path.c_str());
+  }
+#else
+  (void)history_path;
+#endif
+}
+
 int run_text(SqlConnection &connection, const std::string &text,
              const ReplOptions &options) {
   int failures = 0;
@@ -475,7 +611,10 @@ int run(SqlConnection &connection, const ReplOptions &options,
   std::string pending;
   while (true) {
     std::string line;
-    const std::string prompt_text = pending.empty() ? prompt() : "   ... ";
+    // 语句还没结束时用"...（等 ';'）"当续行提示：一眼看出是在等分号，
+    // 而不是"卡住了"。空行可以直接结束当前输入（见下）。
+    const std::string prompt_text =
+        pending.empty() ? prompt() : "   ...  (用 ';' 结束，空行=立即执行) ";
     if (reader) {
       auto read = reader(prompt_text);
       if (!read.has_value()) {
@@ -493,7 +632,15 @@ int run(SqlConnection &connection, const ReplOptions &options,
     if (pending.empty() && is_exit_command(line)) {
       break;
     }
-    if (line.empty() && pending.empty()) {
+    // 空行：没有未完成的语句 -> 什么都不做；有 -> **立即执行**（相当于补一个
+    // 分号）。这样敲错东西时按两次回车就能马上看到报错，不用先补一个 ';'。
+    const bool blank = line.find_first_not_of(" \t\r\n") == std::string::npos;
+    if (blank) {
+      if (pending.empty()) {
+        continue;
+      }
+      run_text(connection, pending + ";", options);
+      pending.clear();
       continue;
     }
     pending += line + "\n";

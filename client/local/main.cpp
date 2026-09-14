@@ -64,6 +64,24 @@ bool parse_options(int argc, char **argv, Options *options) {
     const auto value_of = [&](const std::string &prefix) {
       return arg.substr(prefix.size());
     };
+    // 带值的选项同时支持 "--name value" 与 "--name=value" —— usage 里写的是
+    // 空格形式，只认 '=' 的话用户照文档敲会得到"未知选项"。
+    const auto take_value = [&](const char *name, std::string *out) -> bool {
+      const std::string with_eq = std::string(name) + "=";
+      if (arg == name) {
+        if (i + 1 >= argc) {
+          fmt::print(stderr, "{} 需要一个参数\n", name);
+          return false;
+        }
+        *out = argv[++i];
+        return true;
+      }
+      if (arg.starts_with(with_eq)) {
+        *out = arg.substr(with_eq.size());
+        return true;
+      }
+      return false;
+    };
     if (arg == "-h" || arg == "--help") {
       print_usage(argv[0]);
       std::exit(0);
@@ -83,10 +101,14 @@ bool parse_options(int argc, char **argv, Options *options) {
       options->command = argv[++i];
     } else if (arg.starts_with("--execute=")) {
       options->command = value_of("--execute=");
-    } else if (arg.starts_with("--engine=")) {
-      options->engine = value_of("--engine=");
-    } else if (arg.starts_with("--path=")) {
-      options->path = value_of("--path=");
+    } else if (arg == "--engine" || arg.starts_with("--engine=")) {
+      if (!take_value("--engine", &options->engine)) {
+        return false;
+      }
+    } else if (arg == "--path" || arg.starts_with("--path=")) {
+      if (!take_value("--path", &options->path)) {
+        return false;
+      }
     } else if (!arg.empty() && arg[0] == '-') {
       fmt::print(stderr, "未知选项：{}\n", arg);
       return false;
@@ -137,26 +159,13 @@ bool is_stdout_terminal() {
 #endif
 }
 
-// 把 readline 包成 REPL 的"逐行读取"钩子（没有 readline 时返回空 -> REPL 读
-// stdin）
-client::LineReader make_line_reader() {
-#if defined(SQLDB_HAVE_READLINE)
-  return [](const std::string &prompt) -> std::optional<std::string> {
-    char *raw = readline(prompt.c_str());
-    if (raw == nullptr) {
-      fmt::print("\n");
-      return std::nullopt;
-    }
-    std::string line = raw;
-    free(raw);
-    if (!line.empty()) {
-      add_history(line.c_str());
-    }
-    return line;
-  };
-#else
-  return {};
-#endif
+// readline 的历史文件（没有 readline 时由 client 层 no-op）
+std::string history_path() {
+  const char *home = std::getenv("HOME");
+  if (home == nullptr || *home == '\0') {
+    return {};
+  }
+  return std::string(home) + "/.sqldb_history";
 }
 
 } // namespace
@@ -207,7 +216,10 @@ int main(int argc, char **argv) {
        is_interactive_terminal());
   if (interactive) {
     repl_options.interactive = true;
-    failures += client::run(*connection, repl_options, make_line_reader());
+    const std::string history = history_path();
+    auto reader = client::readline_line_reader(connection.get(), history);
+    failures += client::run(*connection, repl_options, reader);
+    client::history_flush(history);
   } else if (options.command.empty() && options.scripts.empty()) {
     // 非交互（管道输入）：把 stdin 当成脚本
     std::string content;

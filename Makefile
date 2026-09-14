@@ -13,6 +13,10 @@
 
 BUILD_DIR = build
 JOBS      ?= 4
+# 用 CMakePresets 里的 llvm-debug（clang++-mp-23 + libc++）。**不要**退回
+# 裸 `cmake -S . -B build`：那会用 /usr/bin/c++（Apple clang），工具链和
+# 下面这些预设标志都对不上，编出来的二进制行为和测试结果不一致。
+PRESET    ?= llvm-debug
 
 .PHONY: all configure build sqldb cli client server test storage-test svrkit-test server-test tx-test session-test \
         executor-test relation-test planner-test statement-test parser-test \
@@ -21,7 +25,7 @@ JOBS      ?= 4
 all: build
 
 configure:
-	cmake -S . -B $(BUILD_DIR)
+	cmake --preset $(PRESET)
 
 build: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS)
@@ -33,10 +37,12 @@ sqldb: configure
 # 兼容老命令
 cli: sqldb
 
-# 服务器：build/sqldb-server --config=<file>（见 server/ 与 tests/test_server/）
+# 服务器：产出 build/svr/{bin,etc} 两件套（见 server/ 与 tests/test_server/）
 server: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS) --target sqldb-server
-	@echo "✅ $(BUILD_DIR)/sqldb-server 可用（--config=<file>）"
+	@echo "✅ $(BUILD_DIR)/svr/bin/sqldb-server 可用"
+	@echo "   默认配置：$(BUILD_DIR)/svr/etc/sqldb-server.conf（带注释）"
+	@echo "   启动：./$(BUILD_DIR)/svr/bin/sqldb-server --config=./$(BUILD_DIR)/svr/etc/sqldb-server.conf"
 
 # 通用协程服务器框架（common/net + common/svrkit）
 svrkit-test: configure

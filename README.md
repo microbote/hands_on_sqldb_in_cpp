@@ -89,6 +89,7 @@ id  name
 | `executor/readme.md` | Volcano 算子、结果游标、EXPLAIN 统计 |
 | `storage/kv_engine/readme.md` | KVStore/KVEngine、事务缓冲、两引擎一致性 |
 | `client/README.md` | 两个客户端（本地 `sqldb` / 远程 `sqldb-client`）的用法、元命令、EXPLAIN 输出 |
+| `server/README.md` | 服务端 `sqldb-server`：产物目录（`build/svr/{bin,etc}`）、配置、**日志**、路由 |
 
 各模块的改动记录（含设计取舍与踩坑）在各测试目录的
 `tests/test_<模块>/codex_check_issues.md`。

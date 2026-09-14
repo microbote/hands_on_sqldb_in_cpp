@@ -88,6 +88,7 @@ public:
   // 0 = 不超时（事务挂着不动会把 leveldb 旧版本钉住，危险项）
   int64_t idle_in_transaction_timeout_ms() const;
   std::string log_level() const; // error | warn | info | debug
+  std::string log_file() const;  // 追加写的日志文件；空 = stderr
   // server.listen 的派生量（listen 非法时返回空 —— validate 会先拦下）
   std::string listen_host() const;
   std::string listen_port() const;
@@ -98,11 +99,12 @@ public:
   bool create_if_missing() const;
 
   // [execution]
-  size_t read_threads() const;     // 只读协程跑在几条线程上
-  size_t read_queue_max() const;   // 读服务队列上限
-  size_t write_queue_max() const;  // 写/解析服务队列上限
-  size_t max_result_rows() const;  // 单条语句最多回多少行
-  int64_t statement_timeout_ms() const; // 0 = 不限（要 M3 协作检查点才能真打断）
+  size_t read_threads() const;    // 只读协程跑在几条线程上
+  size_t read_queue_max() const;  // 读服务队列上限
+  size_t write_queue_max() const; // 写/解析服务队列上限
+  size_t max_result_rows() const; // 单条语句最多回多少行
+  int64_t
+  statement_timeout_ms() const; // 0 = 不限（要 M3 协作检查点才能真打断）
 
   // [session]
   std::string default_database() const; // 新连接自动 USE（空 = 不 USE）

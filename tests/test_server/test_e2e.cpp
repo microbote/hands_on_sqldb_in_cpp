@@ -39,11 +39,11 @@ bool started_or_skip(srvtest::RunningServer &server) {
 // ---- 多线程测试用的"裸"客户端助手 ----
 // 不用 srvtest::Client：它的 CHECK 会碰测试框架的全局计数器，不是线程安全的。
 
-bool raw_next_frame(int fd, std::string &in, server::DecodedFrame *frame) {
+bool raw_next_frame(int fd, std::string &in, common::proto::DecodedFrame *frame) {
   while (true) {
     size_t consumed = 0;
     std::string error;
-    if (server::try_decode_frame(in, frame, &consumed, &error)) {
+    if (common::proto::try_decode_frame(in, frame, &consumed, &error)) {
       in.erase(0, consumed);
       return true;
     }
@@ -75,9 +75,9 @@ int raw_connect(int port) {
   timeval timeout{5, 0};
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
   std::string in;
-  server::DecodedFrame hello;
+  common::proto::DecodedFrame hello;
   if (!raw_next_frame(fd, in, &hello) ||
-      hello.type != server::FrameType::kHello) {
+      hello.type != common::proto::FrameType::kHello) {
     ::close(fd);
     return -1;
   }
@@ -86,7 +86,7 @@ int raw_connect(int port) {
 
 // 跑一条语句，返回结果行数；任何环节出错返回 -1
 int raw_row_count(int fd, std::string &in, const std::string &sql) {
-  const std::string out = server::encode_query(sql);
+  const std::string out = common::proto::encode_query(sql);
   size_t sent = 0;
   while (sent < out.size()) {
     const ssize_t wrote = ::write(fd, out.data() + sent, out.size() - sent);
@@ -97,15 +97,15 @@ int raw_row_count(int fd, std::string &in, const std::string &sql) {
   }
   int rows = 0;
   while (true) {
-    server::DecodedFrame frame;
+    common::proto::DecodedFrame frame;
     if (!raw_next_frame(fd, in, &frame)) {
       return -1;
     }
-    if (frame.type == server::FrameType::kRow) {
+    if (frame.type == common::proto::FrameType::kRow) {
       ++rows;
-    } else if (frame.type == server::FrameType::kOk) {
+    } else if (frame.type == common::proto::FrameType::kOk) {
       return rows;
-    } else if (frame.type == server::FrameType::kError) {
+    } else if (frame.type == common::proto::FrameType::kError) {
       return -1;
     }
   }

@@ -13,10 +13,11 @@
 // 工具 —— 只定义在这一个 .cpp 里，调用点看到的是 ServerConfig 的方法，
 // 看不到宏。
 // ============================================================
-#define CFG_STR(cfg, field, ...) \
+#define CFG_STR(cfg, field, ...)                                               \
   (cfg).get_string(#field __VA_OPT__(, ) __VA_ARGS__)
-#define CFG_INT(cfg, field, ...) (cfg).get_int(#field __VA_OPT__(, ) __VA_ARGS__)
-#define CFG_BOOL(cfg, field, ...) \
+#define CFG_INT(cfg, field, ...)                                               \
+  (cfg).get_int(#field __VA_OPT__(, ) __VA_ARGS__)
+#define CFG_BOOL(cfg, field, ...)                                              \
   (cfg).get_bool(#field __VA_OPT__(, ) __VA_ARGS__)
 
 namespace server {
@@ -32,6 +33,7 @@ max_connections = 256
 idle_timeout_ms = 300000
 idle_in_transaction_timeout_ms = 30000
 log_level = info
+log_file =
 
 [storage]
 engine = leveldb
@@ -114,8 +116,8 @@ std::string type_error(std::string_view dotted, const sql::Value &value,
 }
 
 // "a.b" → ("a", "b")；没有点 → ("", 整个)
-std::pair<std::string_view, std::string_view> split_key(
-    std::string_view dotted) {
+std::pair<std::string_view, std::string_view>
+split_key(std::string_view dotted) {
   const size_t dot = dotted.find('.');
   if (dot == std::string_view::npos) {
     return {{}, dotted};
@@ -298,8 +300,8 @@ std::expected<void, std::string> Config::validate() const {
     return std::unexpected("config key '" + std::string(dotted) +
                            "': must be " + joined);
   };
-  if (auto ok = check_enum("server.log_level",
-                           {"error", "warn", "info", "debug"});
+  if (auto ok =
+          check_enum("server.log_level", {"error", "warn", "info", "debug"});
       !ok.has_value()) {
     return ok;
   }
@@ -336,7 +338,9 @@ std::expected<void, std::string> ServerConfig::validate() const {
   return generic_.validate();
 }
 
-std::string ServerConfig::listen() const { return CFG_STR(generic_, server.listen); }
+std::string ServerConfig::listen() const {
+  return CFG_STR(generic_, server.listen);
+}
 
 size_t ServerConfig::max_connections() const {
   return static_cast<size_t>(CFG_INT(generic_, server.max_connections));
@@ -354,6 +358,10 @@ std::string ServerConfig::log_level() const {
   return CFG_STR(generic_, server.log_level);
 }
 
+std::string ServerConfig::log_file() const {
+  return CFG_STR(generic_, server.log_file);
+}
+
 std::string ServerConfig::listen_host() const {
   const std::string listen = CFG_STR(generic_, server.listen);
   const size_t colon = listen.rfind(':');
@@ -363,13 +371,16 @@ std::string ServerConfig::listen_host() const {
 std::string ServerConfig::listen_port() const {
   const std::string listen = CFG_STR(generic_, server.listen);
   const size_t colon = listen.rfind(':');
-  return colon == std::string::npos ? std::string()
-                                    : listen.substr(colon + 1);
+  return colon == std::string::npos ? std::string() : listen.substr(colon + 1);
 }
 
-std::string ServerConfig::engine() const { return CFG_STR(generic_, storage.engine); }
+std::string ServerConfig::engine() const {
+  return CFG_STR(generic_, storage.engine);
+}
 
-std::string ServerConfig::path() const { return CFG_STR(generic_, storage.path); }
+std::string ServerConfig::path() const {
+  return CFG_STR(generic_, storage.path);
+}
 
 bool ServerConfig::create_if_missing() const {
   return CFG_BOOL(generic_, storage.create_if_missing);

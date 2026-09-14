@@ -92,6 +92,7 @@ when behavior changes.
 | `executor/readme.md` | Volcano operators, result cursor, EXPLAIN stats |
 | `storage/kv_engine/readme.md` | KVStore/KVEngine, transaction buffer, engine parity |
 | `client/README.md` | both clients (local `sqldb` / remote `sqldb-client`): usage, meta commands, EXPLAIN output |
+| `server/README.md` | the server `sqldb-server`: artifacts (`build/svr/{bin,etc}`), config, **logging**, routing |
 
 Per-module change logs (design trade-offs and pitfalls) live in
 `tests/test_<module>/codex_check_issues.md`.

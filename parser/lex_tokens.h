@@ -33,6 +33,11 @@ typedef struct LexToken {
 // 收集 sql 的全部词法 token；返回 token 个数，失败返回 -1。
 int lex_collect_tokens(const char *sql, LexToken **out);
 
+// 全部**保留关键字**（拼写与上面规则同一份来源，见 sql.l 的注释）。
+// 用途：客户端的自动补全、文档生成等。返回个数，*out 指向一个以 NULL
+// 结尾的静态数组（调用方不要 free）。
+int lex_keywords(const char *const **out);
+
 #ifdef __cplusplus
 }
 #endif

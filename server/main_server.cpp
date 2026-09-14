@@ -1,9 +1,13 @@
 // server/main_server.cpp —— sqldb-server 入口
 //
-//   sqldb-server [--config=path] [--listen=host:port]
+//   sqldb-server [--config=path] [--listen=host:port] [-h|--help]
 //
 // 流程：读配置 → 打开存储（一份 KVStore）→ 建 Server（监听 + 服务线程）→
 // 跑事件循环；SIGINT/SIGTERM 触发优雅退出（停 accept → 停服务线程 → 关存储）。
+//
+// 日志：级别由 `[server] log_level` 决定，去处由 `[server] log_file` 决定
+// （空 = stderr）。两者都在这里**启动期**定下来，日志文件打不开直接退出，
+// 免得服务跑起来了却"以为在记日志"。
 #include <csignal>
 #include <cstdio>
 #include <string>
@@ -11,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "config.h"
+#include "logger.h"
 #include "server.h"
 #include "storage/kv_engine/kv_factory.h"
 
@@ -23,6 +28,30 @@ void on_signal(int) {
     // 只 write 一根管道：异步信号安全；真正的收尾在事件循环里做
     g_server->request_shutdown();
   }
+}
+
+void print_usage(const char *program) {
+  fmt::print("用法: {} [--config=PATH] [--listen=HOST:PORT]\n", program);
+  fmt::print("\n选项:\n");
+  fmt::print(
+      "  --config=PATH        配置文件（.ini，见下）；不传则用内置默认值\n");
+  fmt::print(
+      "  --listen=HOST:PORT   覆盖配置里的 server.listen（临时起服务用）\n");
+  fmt::print("  -h, --help           显示这份帮助\n");
+  fmt::print("\n配置文件：[section] + key = value，'#'/';' 开头是注释，\n");
+  fmt::print("未知 section 合法（留给别的组件）。带注释的**默认配置**在\n");
+  fmt::print("  build/svr/etc/sqldb-server.conf\n");
+  fmt::print("（构建时从 server/etc/sqldb-server.conf 复制过来）\n");
+  fmt::print("\n日志:\n");
+  fmt::print(
+      "  [server] log_level = error|warn|info|debug（默认 info，是上限）\n");
+  fmt::print("  [server] log_file  = 日志文件路径（空 = 写 stderr）\n");
+  fmt::print("  行格式：[YYYY-MM-DD HH:MM:SS.mmm] [level] message\n");
+  fmt::print(
+      "  文件以 append 方式打开，每条日志一次 write() —— 追加是原子的。\n");
+  fmt::print("\n例:\n");
+  fmt::print("  {} --config=build/svr/etc/sqldb-server.conf\n", program);
+  fmt::print("  # 想看 debug：配置里写 log_level = debug（或另存一份改）\n");
 }
 
 std::string arg_value(int argc, char **argv, const std::string &name,
@@ -40,6 +69,13 @@ std::string arg_value(int argc, char **argv, const std::string &name,
 } // namespace
 
 int main(int argc, char **argv) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-h" || arg == "--help") {
+      print_usage(argv[0]);
+      return 0;
+    }
+  }
   const std::string config_path = arg_value(argc, argv, "--config", "");
   auto config = config_path.empty() ? server::parse_config(std::string())
                                     : server::load_config(config_path);
@@ -71,7 +107,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  server::Server server(*config, store);
+  // 日志接收端：level 非法 / 文件打不开都在这里拦下（启动期失败，别静默）
+  auto logger = server::Logger::create(config->log_level(), config->log_file());
+  if (!logger.has_value()) {
+    fmt::print(stderr, "日志初始化失败: {}\n", logger.error());
+    return 2;
+  }
+
+  server::Server server(*config, store, *logger);
   if (auto ok = server.listen(); !ok.has_value()) {
     fmt::print(stderr, "监听失败: {}\n", ok.error());
     return 1;
@@ -82,6 +125,10 @@ int main(int argc, char **argv) {
 
   fmt::print(stderr, "sqldb-server 正在监听 {} (engine={}, path={})\n",
              config->listen(), engine, config->path());
+  if (!config->log_file().empty()) {
+    fmt::print(stderr, "日志级别 {} -> {}\n", config->log_level(),
+               config->log_file());
+  }
   server.run();
 
   // 收尾：连接都退出了才能关存储（还有活跃快照时 close() 会返回 Busy）

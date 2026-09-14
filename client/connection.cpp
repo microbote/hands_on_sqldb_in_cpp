@@ -8,7 +8,7 @@
 
 #include "common/net/socket.h"
 #include "common/net/socket_util.h"
-#include "server/protocol.h"
+#include "common/proto/protocol.h"
 #include "session/session.h"
 
 namespace client {
@@ -130,7 +130,7 @@ public:
 
   Outcome execute(const std::string &sql) override {
     Outcome outcome;
-    if (!send_all(server::encode_query(sql))) {
+    if (!send_all(common::proto::encode_query(sql))) {
       return connection_lost(outcome);
     }
     while (true) {
@@ -139,14 +139,14 @@ public:
         return connection_lost(outcome);
       }
       switch (frame->type) {
-      case server::FrameType::kColumns:
-        if (!server::decode_columns(frame->payload, &outcome.columns)) {
+      case common::proto::FrameType::kColumns:
+        if (!common::proto::decode_columns(frame->payload, &outcome.columns)) {
           return connection_lost(outcome);
         }
         break;
-      case server::FrameType::kRow: {
-        std::vector<server::ProtocolValue> row;
-        if (!server::decode_row(frame->payload, &row)) {
+      case common::proto::FrameType::kRow: {
+        std::vector<common::proto::ProtocolValue> row;
+        if (!common::proto::decode_row(frame->payload, &row)) {
           return connection_lost(outcome);
         }
         std::vector<Cell> cells;
@@ -160,10 +160,10 @@ public:
         outcome.rows.push_back(std::move(cells));
         break;
       }
-      case server::FrameType::kOk: {
+      case common::proto::FrameType::kOk: {
         uint8_t flags = 0;
         std::string current_db;
-        if (!server::decode_ok(frame->payload, &outcome.affected_rows, &flags,
+        if (!common::proto::decode_ok(frame->payload, &outcome.affected_rows, &flags,
                                &current_db)) {
           return connection_lost(outcome);
         }
@@ -175,9 +175,9 @@ public:
         outcome.ok = true;
         return outcome;
       }
-      case server::FrameType::kError: {
-        server::ErrorFrame error;
-        if (!server::decode_error(frame->payload, &error)) {
+      case common::proto::FrameType::kError: {
+        common::proto::ErrorFrame error;
+        if (!common::proto::decode_error(frame->payload, &error)) {
           return connection_lost(outcome);
         }
         outcome.ok = false;
@@ -202,13 +202,13 @@ public:
 
   std::vector<DatabaseMeta> databases() override {
     const std::optional<std::string> payload =
-        meta_request(server::MetaKind::kDatabases, "", "");
+        meta_request(common::proto::MetaKind::kDatabases, "", "");
     std::vector<DatabaseMeta> out;
     if (!payload.has_value()) {
       return out;
     }
-    std::vector<server::MetaDatabase> decoded;
-    if (!server::decode_meta_databases(*payload, &decoded)) {
+    std::vector<common::proto::MetaDatabase> decoded;
+    if (!common::proto::decode_meta_databases(*payload, &decoded)) {
       return out;
     }
     for (auto &db : decoded) {
@@ -224,13 +224,13 @@ public:
 
   std::vector<TableMeta> tables(const std::string &db) override {
     const std::optional<std::string> payload =
-        meta_request(server::MetaKind::kTables, db, "");
+        meta_request(common::proto::MetaKind::kTables, db, "");
     std::vector<TableMeta> out;
     if (!payload.has_value()) {
       return out;
     }
-    std::vector<server::MetaTable> decoded;
-    if (!server::decode_meta_tables(*payload, &decoded)) {
+    std::vector<common::proto::MetaTable> decoded;
+    if (!common::proto::decode_meta_tables(*payload, &decoded)) {
       return out;
     }
     for (auto &table : decoded) {
@@ -249,12 +249,12 @@ public:
   std::optional<sql::TableSchema> table_schema(const std::string &table,
                                                const std::string &db) override {
     const std::optional<std::string> payload =
-        meta_request(server::MetaKind::kSchema, db, table);
+        meta_request(common::proto::MetaKind::kSchema, db, table);
     if (!payload.has_value()) {
       return std::nullopt;
     }
     sql::TableSchema schema;
-    if (!server::decode_meta_schema(*payload, &schema)) {
+    if (!common::proto::decode_meta_schema(*payload, &schema)) {
       return std::nullopt;
     }
     return schema;
@@ -266,27 +266,27 @@ public:
   // 否则第一条语句会把 HELLO 当成"不该出现的帧"而报连接断开。
   bool handshake() {
     auto frame = next_frame();
-    if (!frame.has_value() || frame->type != server::FrameType::kHello) {
+    if (!frame.has_value() || frame->type != common::proto::FrameType::kHello) {
       return false;
     }
     uint16_t proto = 0;
     uint16_t server_version = 0;
     uint32_t capabilities = 0;
-    if (!server::decode_hello(frame->payload, &proto, &server_version,
+    if (!common::proto::decode_hello(frame->payload, &proto, &server_version,
                               &capabilities)) {
       return false;
     }
     protocol_version_ = proto;
     server_version_ = server_version;
-    return proto == server::kProtocolVersion;
+    return proto == common::proto::kProtocolVersion;
   }
 
 private:
   // 发一个 META 请求并等回复；表不存在等错误返回 nullopt
-  std::optional<std::string> meta_request(server::MetaKind kind,
+  std::optional<std::string> meta_request(common::proto::MetaKind kind,
                                           const std::string &arg1,
                                           const std::string &arg2) {
-    if (!send_all(server::encode_meta(kind, arg1, arg2))) {
+    if (!send_all(common::proto::encode_meta(kind, arg1, arg2))) {
       return std::nullopt;
     }
     while (true) {
@@ -294,14 +294,14 @@ private:
       if (!frame.has_value()) {
         return std::nullopt;
       }
-      if (frame->type == server::FrameType::kMetaReply) {
+      if (frame->type == common::proto::FrameType::kMetaReply) {
         std::string payload;
-        if (!server::decode_meta_reply(frame->payload, &payload)) {
+        if (!common::proto::decode_meta_reply(frame->payload, &payload)) {
           return std::nullopt;
         }
         return payload;
       }
-      if (frame->type == server::FrameType::kError) {
+      if (frame->type == common::proto::FrameType::kError) {
         return std::nullopt;
       }
       return std::nullopt; // 不该出现的帧
@@ -319,12 +319,12 @@ private:
     return socket_.send_all(data);
   }
 
-  std::optional<server::DecodedFrame> next_frame() {
+  std::optional<common::proto::DecodedFrame> next_frame() {
     while (true) {
-      server::DecodedFrame frame;
+      common::proto::DecodedFrame frame;
       size_t consumed = 0;
       std::string error;
-      if (server::try_decode_frame(in_, &frame, &consumed, &error)) {
+      if (common::proto::try_decode_frame(in_, &frame, &consumed, &error)) {
         in_.erase(0, consumed);
         return frame;
       }

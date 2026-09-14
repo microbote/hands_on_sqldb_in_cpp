@@ -474,3 +474,41 @@ fatal flex scanner internal error--end of buffer missed   ← 每次必崩
 四种 BEGIN 写法、`COMMIT|END`、`ROLLBACK|ABORT`、`WORK` 后缀、大小写、
 节点打印与 span、不支持形式的报错文案、`BEGINNER` 不是关键字。
 test_parser：70 → **77 用例**，`-Wall -Wextra` 0 告警。
+
+---
+
+## 关键字清单导出：`lex_keywords()`（给客户端 TAB 补全）
+
+需求：客户端的自动补全要有**唯一数据源**，不能在 REPL 里再抄一份关键字
+清单（两处维护必然漂移）。
+
+### 实现
+
+`parser/sql.l` 的用户代码段新增：
+
+```c
+static const char* const kLexKeywords[] = { "select", "from", ... , NULL };
+int lex_keywords(const char* const** out);   /* 声明在 parser/lex_tokens.h */
+```
+
+和关键字**规则表**在同一个文件里——改关键字时"两张表一起改"。返回的数组是
+静态的、以 `NULL` 结尾，调用方**不要 free**。补全侧消费点：
+`client::completion_candidates()`（`client/repl.cpp`）。
+
+### 为什么不做成"从 `sql.y` 的 `%token` 表自动导出"
+
+`%token` 只有**符号名**（`TOK_SELECT`），拿不到**拼写**（`select`）；拼写只
+存在于 `sql.l` 的规则里。所以清单只能和 `sql.l` 同源（这也是之前定的
+"来源单一在 sql.l"）。
+
+### 测试（防漂移）
+
+`tests/test_parser/test_lex_tokens.cpp` 新增两条：
+
+| 用例 | 断言 |
+|------|------|
+| `LexTokens.KeywordListMatchesTheLexerAndIsCaseInsensitive` | 清单里每个词：① 全是小写；② 不重复；③ 词法层必须识别成**关键字**（不是 `TOK_IDENT`/`TOK_TYPE_NAME`）；④ **全大写拼写落到同一个 token**（顺带把"大小写无关"钉死） |
+| `LexTokens.KeywordListCoversCoreSqlVocabulary` | 核心词汇（select/from/where/insert/.../begin/commit/rollback/explain/analyze/null/in/is/like 等）必须都在清单里——防止有人删规则时顺手删清单里的词 |
+
+这样"清单里多/少一个词"和"大小写不生效"两类问题都会在 `test_parser` 直接变红，
+不用等客户端发现。`test_parser`：86 → **88 用例 / 2072 断言 / 0 失败**。

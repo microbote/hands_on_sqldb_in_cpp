@@ -8,6 +8,7 @@ find_package(Threads REQUIRED)
 add_executable(test_server
     main.cpp
     test_config.cpp
+    test_logger.cpp
     test_protocol.cpp
     test_e2e.cpp
     test_client.cpp
@@ -21,5 +22,10 @@ target_link_libraries(test_server PRIVATE
     test_fwk
     Threads::Threads
 )
+
+# 源码树路径：用来直接读 server/etc/sqldb-server.conf，跟内置默认值逐键比对
+# （示例配置飘了要在测试里变红，而不是等人照着改出问题）
+target_compile_definitions(test_server PRIVATE
+    SQLDB_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 add_test(NAME test_server COMMAND test_server)

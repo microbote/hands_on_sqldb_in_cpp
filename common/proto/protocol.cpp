@@ -1,9 +1,9 @@
-// server/protocol.cpp
-#include "protocol.h"
+// common/proto/protocol.cpp
+#include "common/proto/protocol.h"
 
 #include <cstring>
 
-namespace server {
+namespace common::proto {
 namespace {
 
 void put_u16(std::string *out, uint16_t value) {
@@ -389,4 +389,4 @@ bool decode_error(const std::string &payload, ErrorFrame *error) {
          get_u32(payload, &pos, &error->end_column);
 }
 
-} // namespace server
+} // namespace common::proto

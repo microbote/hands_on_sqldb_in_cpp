@@ -26,21 +26,21 @@
 #include <thread>
 
 #include "client/connection.h"
-#include "server/protocol.h"
+#include "common/proto/protocol.h"
 #include "server/server.h"
 #include "storage/kv_engine/kv_factory.h"
 
 namespace {
 
 // 直接从 fd 上读一帧（带超时）：测试里手动跟服务器对话时用
-bool read_frame(int fd, server::DecodedFrame *out, int timeout_ms) {
+bool read_frame(int fd, common::proto::DecodedFrame *out, int timeout_ms) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   std::string buffer;
   while (true) {
     size_t consumed = 0;
     std::string error;
-    if (server::try_decode_frame(buffer, out, &consumed, &error)) {
+    if (common::proto::try_decode_frame(buffer, out, &consumed, &error)) {
       return true;
     }
     if (!error.empty()) {
@@ -207,18 +207,18 @@ TEST(ServerLifecycle, IdleTimeoutSendsErrorFrameOnItsOwn) {
   fixture.attach_and_run();
   CHECK(fixture.peer_fd >= 0);
 
-  server::DecodedFrame hello;
+  common::proto::DecodedFrame hello;
   CHECK(read_frame(fixture.peer_fd, &hello, 2000));
   CHECK_EQ(static_cast<int>(hello.type),
-           static_cast<int>(server::FrameType::kHello));
+           static_cast<int>(common::proto::FrameType::kHello));
 
   // 从这里开始一个字都不发：等服务器自己回 ERROR
-  server::DecodedFrame frame;
+  common::proto::DecodedFrame frame;
   CHECK(read_frame(fixture.peer_fd, &frame, 3000));
   CHECK_EQ(static_cast<int>(frame.type),
-           static_cast<int>(server::FrameType::kError));
-  server::ErrorFrame error;
-  CHECK(server::decode_error(frame.payload, &error));
+           static_cast<int>(common::proto::FrameType::kError));
+  common::proto::ErrorFrame error;
+  CHECK(common::proto::decode_error(frame.payload, &error));
   CHECK(error.message.find("idle") != std::string::npos);
   CHECK_EQ(fixture.server->metrics().idle_timeouts.load(), uint64_t{1});
 }

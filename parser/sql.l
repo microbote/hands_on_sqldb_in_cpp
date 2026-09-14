@@ -217,6 +217,40 @@ static char* sql_unescape_string(const char* body, size_t len) {
 /* 解析器调用的入口：转发到 flex 生成的 lex_yylex */
 int yylex(void) { return lex_yylex(); }
 
+/* ============================================================
+   保留关键字清单（供客户端补全/文档用）
+
+   **唯一数据源仍然是无处不在的规则表**：这张数组只是把上面的关键字拼写
+   列出来，改关键字时"同一个文件里两张表一起改"（tests/test_parser 里有一条
+   用例逐词验证"清单里的每个词确实被词法层当成关键字"，漏改会红）。
+   数组以 NULL 结尾。
+   ============================================================ */
+static const char* const kLexKeywords[] = {
+    "select", "from", "where",
+    "and", "or", "not",
+    "insert", "into", "values", "update", "set", "delete",
+    "order", "by", "asc", "ascending", "desc", "descending",
+    "limit", "offset",
+    "use", "create", "drop", "database", "table", "primary", "key",
+    "begin", "start", "transaction", "work",
+    "commit", "rollback", "end", "abort",
+    "explain", "analyze",
+    "null", "true", "false",
+    "in", "is", "like",
+    NULL,
+};
+
+int lex_keywords(const char* const** out) {
+  int count = 0;
+  while (kLexKeywords[count] != NULL) {
+    ++count;
+  }
+  if (out != NULL) {
+    *out = kLexKeywords;
+  }
+  return count;
+}
+
 int lex_collect_tokens(const char* sql, LexToken** out) {
     size_t sql_len;
     char* base;

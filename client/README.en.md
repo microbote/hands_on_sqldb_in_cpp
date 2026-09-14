@@ -53,6 +53,146 @@ Options:
 Type `exit` / `quit` / `\q` to leave interactive mode. Statements may span
 multiple lines; nothing runs until `;`.
 
+## Quick start (demos)
+
+### 1. Local client: create db -> create table -> insert -> query
+
+```console
+$ ./build/sqldb                  # leveldb by default; falls back to in-memory mock
+sqldb 命令行（local；输入 exit / quit / \q 退出）
+(none)> CREATE DATABASE shop;
+OK
+(none)> \c shop
+现在连接的是数据库 "shop"
+shop> CREATE TABLE users (
+   ...  (用 ';' 结束，空行=立即执行)   id INT PRIMARY KEY,
+   ...  (用 ';' 结束，空行=立即执行)   name VARCHAR(32) NOT NULL,
+   ...  (用 ';' 结束，空行=立即执行)   age INT
+   ...  (用 ';' 结束，空行=立即执行) );
+OK
+shop> INSERT INTO users (id, name, age) VALUES (1, 'alice', 30), (2, 'bob', 25);
+OK, 2 rows affected
+shop> SELECT id, name, age FROM users ORDER BY id;
+id  name   age
+--  -----  ---
+1   alice  30
+2   bob    25
+(2 rows)
+```
+
+Multi-line input: until a `;` shows up the prompt turns into
+`   ...  (用 ';' 结束，空行=立即执行)`. **An empty line means "run it now"**
+(it stands in for the missing `;`), so a typo never leaves you stuck in the
+continuation prompt — two Enters and you see the error.
+
+### 2. Metadata: `\l` / `\dt` / `\d`
+
+```console
+shop> \l
+Database  Tables  Created
+--------  ------  -------------------
+* shop    1       2026-09-14 12:11:16
+
+shop> \dt
+Table  Rows  Columns  Primary key  Created              Last write
+-----  ----  -------  -----------  -------------------  -------------------
+users  2     3        id           2026-09-14 12:11:16  2026-09-14 12:11:16
+
+shop> \d users
+Table "users"
++--------+---------------+----------+--------------+
+| Column| Type         | Nullable| Constraint  |
+|--------|---------------|----------|--------------|
+| id    | INT          | NO      | PRIMARY KEY |
+| name  | VARCHAR(32)  | NO      | NOT NULL    |
+| age   | INT          | YES     |             |
++--------+---------------+----------+--------------+
+统计：rows=2  columns=3  primary key=id
+      created=2026-09-14 12:11:16  last write=2026-09-14 12:11:16
+```
+
+### 3. Transactions: `BEGIN` -> write -> `COMMIT` / `ROLLBACK`
+
+The prompt gets a `*` while a transaction is open:
+
+```console
+shop> BEGIN;
+OK
+shop*> INSERT INTO users (id, name, age) VALUES (3, 'carol', 35);
+OK, 1 row affected
+shop*> SELECT id, name FROM users ORDER BY id;   -- sees your own uncommitted insert
+shop*> ROLLBACK;                                 -- or COMMIT
+OK
+shop> SELECT id FROM users ORDER BY id;          -- gone, as if it never happened
+```
+
+Meta-command shells work too: `\begin` / `\commit` / `\rollback`.
+
+### 4. Plan only: `EXPLAIN` (does not execute)
+
+```console
+shop> EXPLAIN SELECT id, name FROM users WHERE age >= 30 ORDER BY id DESC LIMIT 2;
+QUERY PLAN
+-----------------------------------------------------------------
+Project([id, name])  [cost=0.0..2.5]
+  Limit(limit=2 offset=0)  [cost=0.0..1.0]
+    Filter(age >= 30)  [cost=0.0..6.0]
+      FullScan(users pk=id INT, desc)  [cost=0.0..3.0]
+(4 rows)
+```
+
+`EXPLAIN ANALYZE SELECT ...` really runs the query and reports actual rows and
+time per operator (write statements are rejected — they would change data).
+
+`[cost=start..total]` comes from the planner's cost model (a **placeholder**
+for now, but it already makes real decisions: `WHERE id IN (1,3,5)` falls back
+to `FullScan + Filter` on a **small** table because 3 point lookups cost more
+than scanning 3 rows; only a big table turns it into `RangeUnion`).
+
+### 5. Remote: start the server, connect with `sqldb-client`
+
+```bash
+# terminal 1: start the server (artifacts live under build/svr/, config is commented)
+./build/svr/bin/sqldb-server --config=./build/svr/etc/sqldb-server.conf
+
+# terminal 2: remote client (same REPL / meta commands / EXPLAIN)
+$ ./build/sqldb-client --host 127.0.0.1 --port 5433
+remote(127.0.0.1:5433)> \l
+remote(127.0.0.1:5433)> SELECT id, name FROM users;
+```
+
+Server logging: `[server] log_level` (default `info`; set `debug` for more) plus
+`log_file` (empty = stderr). Lines look like `[time] [level] message` and the
+file is append-only. See `server/README.md`.
+
+### 6. Scripts and non-interactive use
+
+```bash
+./build/sqldb -e "SELECT * FROM users"      # one statement, then exit
+./build/sqldb demo.sql                      # run a script file (repeatable)
+echo "SELECT * FROM users;" | ./build/sqldb # piped input is a script
+cat demo.sql | ./build/sqldb --echo-sql     # echo each statement (highlighted)
+```
+
+In scripts an error reports the **absolute line number in the file** (the CLI
+maps spans), not "statement #N".
+
+### 7. Interactive keys (readline)
+
+| Key | Action |
+|-----|--------|
+| `Up` / `Down` | command history (history files below) |
+| `Left` / `Right` | move in the line; `Backspace` / `Delete` edit |
+| `Ctrl-A` / `Ctrl-E` | jump to start / end of line |
+| `Ctrl-R` | reverse search history |
+| `Tab` | completion: SQL keywords (from `sql.l`) + current-db table names; `\` completes meta commands |
+| `Ctrl-C` | abandon the current line |
+| `Ctrl-D` | exit (on an empty line) |
+
+History files: `~/.sqldb_history` (local), `~/.sqldb_client_history` (remote) —
+loaded at startup, saved on exit. The completion list is lowercase (same source
+as `sql.l`); input itself is case-insensitive.
+
 ## Meta commands
 
 A line starting with a backslash is a meta command (it stands alone and does not
@@ -145,18 +285,25 @@ DDL/USE/transaction statements have no plan and report `NOT_SUPPORTED`:
 shop> EXPLAIN SELECT id, name FROM users WHERE age >= 30 ORDER BY id DESC LIMIT 2;
 QUERY PLAN
 -----------------------------------------------------------------
-Project([id, name])
-  Limit(limit=2 offset=0)
-    Filter(age >= 30)
-      FullScan(users pk=id INT, desc)
+Project([id, name])  [cost=0.0..2.5]
+  Limit(limit=2 offset=0)  [cost=0.0..1.0]
+    Filter(age >= 30)  [cost=0.0..6.0]
+      FullScan(users pk=id INT, desc)  [cost=0.0..3.0]
 (4 rows)
 
 shop> EXPLAIN SELECT * FROM users WHERE id IN (1, 3, 5);
 QUERY PLAN
 -------------------------------------------------------------------------
-RangeUnion(users pk=id INT, [[1, 1], [3, 3], [5, 5]], asc)
+RangeUnion(users pk=id INT, [[1, 1], [3, 3], [5, 5]], asc)  [cost=30.0..33.0]
 (1 row)
 ```
+
+The trailing `[cost=start..total]` on each line is the planner's cost model
+estimate, and it **really drives decisions** (it is a placeholder for now).
+The `IN` example above needs a big enough table: on a small table "3 point
+lookups" costs more than "scan 3 rows", so the cost model deliberately falls
+back to `FullScan + Filter` (correctness is unaffected, you just lose one
+index optimization).
 
 How to read a plan (matching the planner's contract):
 
@@ -179,11 +326,11 @@ are rejected):
 shop> EXPLAIN ANALYZE SELECT id FROM users WHERE age >= 30 ORDER BY age LIMIT 2;
 QUERY PLAN
 --------------------------------------------------------------------------
-Project([id])  [rows=2 time=94us]
-  Limit(limit=2 offset=0)  [rows=2 time=90us]
-    TopN(order_by=[age ASC] n=2)  [rows=2 time=92us]
-      Filter(age >= 30)  [rows=2 time=75us]
-        FullScan(users pk=id INT, asc)  [rows=3 time=69us]
+Project([id])  [rows=2 time=98us cost=10.8..13.3]
+  Limit(limit=2 offset=0)  [rows=2 time=93us cost=10.8..11.8]
+    TopN(order_by=[age ASC] n=2)  [rows=2 time=95us cost=10.8..11.8]
+      Filter(age >= 30)  [rows=2 time=75us cost=0.0..6.0]
+        FullScan(users pk=id INT, asc)  [rows=3 time=70us cost=0.0..3.0]
 (2 rows in result)
 (6 rows)
 ```

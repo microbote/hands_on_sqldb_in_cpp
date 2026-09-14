@@ -191,3 +191,124 @@ TEST(RemoteClient, SharedReplRunsAScriptOverTheWire) {
   CHECK(output.find("NULL") != std::string::npos);     // NULL 单元格
   CHECK(output.find("(2 rows)") != std::string::npos); // 两行
 }
+
+// ============================================================
+// TAB 补全：`completion_candidates` 不碰 readline，可以直接单测
+// （readline 只是把它的结果喂给 rl_completion_entry_function）。
+// connection 传 nullptr -> 只出关键字/元命令，不查表名。
+// ============================================================
+namespace {
+
+// 只用来验证补全的"表名来源"：不连任何东西，tables() 返回一个固定表。
+class FakeMetadataConnection : public client::SqlConnection {
+public:
+  client::Outcome execute(const std::string &sql) override {
+    (void)sql;
+    return {};
+  }
+  std::string current_database() const override { return "shop"; }
+  bool in_transaction() const override { return false; }
+  bool supports_metadata() const override { return true; }
+  std::vector<client::TableMeta> tables(const std::string &db) override {
+    (void)db;
+    client::TableMeta table;
+    table.name = "widgets";
+    return {table};
+  }
+  std::string description() const override { return "fake"; }
+};
+
+bool contains(const std::vector<std::string> &list, const std::string &value) {
+  for (const std::string &item : list) {
+    if (item == value) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool is_sorted_unique(const std::vector<std::string> &list) {
+  for (size_t i = 1; i < list.size(); ++i) {
+    if (!(list[i - 1] < list[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
+TEST(ReplCompletion, KeywordPrefixFiltersAndIncludesSqlVocabulary) {
+  const auto candidates = client::completion_candidates("sel", nullptr);
+  CHECK(contains(candidates, "select"));
+  // 前缀过滤：不该出现不以 "sel" 开头的词
+  for (const std::string &item : candidates) {
+    CHECK_EQ(item.compare(0, 3, "sel"), 0);
+  }
+  CHECK(is_sorted_unique(candidates));
+
+  // 空前缀 = 全部关键字（至少覆盖核心词汇），仍然排序去重
+  const auto all = client::completion_candidates("", nullptr);
+  CHECK(is_sorted_unique(all));
+  CHECK(contains(all, "create"));
+  CHECK(contains(all, "database"));
+  CHECK(contains(all, "rollback"));
+
+  // 大小写：readline 的 rl_line_buffer 保留用户输入原样；前缀按字节比较，
+  // 大写前缀当前不补全（提示是列表全小写）——这里固化成"不炸"的行为
+  CHECK(client::completion_candidates("SEL", nullptr).empty());
+}
+
+TEST(ReplCompletion, MetaCommandsAreCompletedSeparately) {
+  const auto candidates = client::completion_candidates("\\d", nullptr);
+  CHECK(contains(candidates, "\\dt"));
+  // "\d" 本身等于前缀，不重复补
+  CHECK_FALSE(contains(candidates, "\\d"));
+  for (const std::string &item : candidates) {
+    CHECK_EQ(item[0], '\\');
+    CHECK_EQ(item.compare(0, 2, "\\d"), 0);
+  }
+
+  const auto all = client::completion_candidates("\\", nullptr);
+  CHECK(contains(all, "\\l"));
+  CHECK(contains(all, "\\c"));
+  CHECK(contains(all, "\\begin"));
+  CHECK(contains(all, "\\commit"));
+  // 元命令列表里不该混入 SQL 关键字
+  CHECK_FALSE(contains(all, "select"));
+}
+
+TEST(ReplCompletion, CompletesOnlyTheCurrentWord) {
+  // 补的是光标前的"当前词"：前面的字符不参与前缀匹配。
+  // '(' 是词边界：这里补的是 "sel"，所以只出 "select"。
+  const auto after_paren =
+      client::completion_candidates("INSERT INTO t VALUES (sel", nullptr);
+  CHECK(contains(after_paren, "select"));
+
+  // 完全相同的词不再补（否则按 TAB 没有任何反馈）
+  CHECK(client::completion_candidates("select", nullptr).empty());
+
+  // 查表名：元信息可用时，当前词也能补出表名（和关键字一起排序去重）
+  FakeMetadataConnection fake;
+  const auto table_prefix =
+      client::completion_candidates("select * from wi", &fake);
+  CHECK(contains(table_prefix, "widgets"));
+  for (const std::string &item : table_prefix) {
+    CHECK_EQ(item.compare(0, 2, "wi"), 0);
+  }
+  CHECK(is_sorted_unique(table_prefix));
+
+  // 没匹配上就返回空（readline 会保持原样）
+  CHECK(client::completion_candidates("select * from zzz", &fake).empty());
+
+  // 换个词以后，前面出现过的表名不再参与（补的是当前词，不是整行）
+  CHECK(client::completion_candidates("select widgets from zz", &fake).empty());
+
+  // 当前词是空的（行尾是空白）：列出全部候选（关键字 + 表名）——这是 TAB
+  // 在空词上的标准行为（"看看有什么可选"）。
+  const auto empty_word =
+      client::completion_candidates("select widgets from ", &fake);
+  CHECK(contains(empty_word, "widgets"));
+  CHECK(contains(empty_word, "select"));
+  CHECK(is_sorted_unique(empty_word));
+}

@@ -22,6 +22,7 @@
 #include "common/svrkit/service.h"
 #include "common/svrkit/tcp_server.h"
 #include "config.h"
+#include "logger.h"
 #include "session/session.h"
 #include "storage/kv_engine/kv_engine.h"
 
@@ -41,7 +42,10 @@ struct Metrics {
 
 class Server {
 public:
-  Server(ServerConfig config, std::shared_ptr<kv::KVStore> store);
+  // logger 为 nullptr 时按配置自己建一个（建不出来就退回 stderr）；
+  // 进程入口想对"日志文件打不开"报错，就自己 `Logger::create()` 再传进来。
+  Server(ServerConfig config, std::shared_ptr<kv::KVStore> store,
+         std::shared_ptr<Logger> logger = nullptr);
   ~Server();
 
   Server(const Server &) = delete;
@@ -94,6 +98,7 @@ private:
 
   ServerConfig config_;
   std::shared_ptr<kv::KVStore> store_;
+  std::shared_ptr<Logger> logger_;
   common::svrkit::TcpServer transport_;
   common::svrkit::ServiceThread parse_service_;
   common::svrkit::ServiceThread write_service_;

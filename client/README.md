@@ -50,6 +50,145 @@ echo "SELECT 1" | ./build/sqldb             # 管道输入当脚本
 
 交互模式里输入 `exit` / `quit` / `\q` 退出；语句可以分多行写，遇到 `;` 才执行。
 
+## 快速上手（demo）
+
+### 1. 本地客户端：建库 → 建表 → 插入 → 查询
+
+```console
+$ ./build/sqldb                  # 默认 leveldb；没编进 leveldb 就退回内存 mock
+sqldb 命令行（local；输入 exit / quit / \q 退出）
+(none)> CREATE DATABASE shop;
+OK
+(none)> \c shop
+现在连接的是数据库 "shop"
+shop> CREATE TABLE users (
+   ...  (用 ';' 结束，空行=立即执行)   id INT PRIMARY KEY,
+   ...  (用 ';' 结束，空行=立即执行)   name VARCHAR(32) NOT NULL,
+   ...  (用 ';' 结束，空行=立即执行)   age INT
+   ...  (用 ';' 结束，空行=立即执行) );
+OK
+shop> INSERT INTO users (id, name, age) VALUES (1, 'alice', 30), (2, 'bob', 25);
+OK, 2 rows affected
+shop> SELECT id, name, age FROM users ORDER BY id;
+id  name   age
+--  -----  ---
+1   alice  30
+2   bob    25
+(2 rows)
+```
+
+多行输入：只要还没出现 `;`，提示符就变成 `   ...  (用 ';' 结束，空行=立即执行)`。
+**空行 = 立即执行**（相当于替你补一个 `;`），所以敲错东西时按两次回车就能马上
+看到报错，不会卡在续行里。
+
+### 2. 看元信息：`\l` / `\dt` / `\d`
+
+```console
+shop> \l
+Database  Tables  Created
+--------  ------  -------------------
+* shop    1       2026-09-14 12:11:16
+
+shop> \dt
+Table  Rows  Columns  Primary key  Created              Last write
+-----  ----  -------  -----------  -------------------  -------------------
+users  2     3        id           2026-09-14 12:11:16  2026-09-14 12:11:16
+
+shop> \d users
+Table "users"
++--------+---------------+----------+--------------+
+| Column| Type         | Nullable| Constraint  |
+|--------|---------------|----------|--------------|
+| id    | INT          | NO      | PRIMARY KEY |
+| name  | VARCHAR(32)  | NO      | NOT NULL    |
+| age   | INT          | YES     |             |
++--------+---------------+----------+--------------+
+统计：rows=2  columns=3  primary key=id
+      created=2026-09-14 12:11:16  last write=2026-09-14 12:11:16
+```
+
+### 3. 事务：`BEGIN` → 改 → `COMMIT` / `ROLLBACK`
+
+进入事务后提示符带 `*`：
+
+```console
+shop> BEGIN;
+OK
+shop*> INSERT INTO users (id, name, age) VALUES (3, 'carol', 35);
+OK, 1 row affected
+shop*> SELECT id, name FROM users ORDER BY id;   -- 事务内看得到自己未提交的插入
+shop*> ROLLBACK;                                 -- 或 COMMIT
+OK
+shop> SELECT id FROM users ORDER BY id;          -- 回滚后就像什么都没发生
+```
+
+也可以用元命令外壳：`\begin` / `\commit` / `\rollback`（等价于上面对应的
+SQL 语句）。
+
+### 4. 只看计划：`EXPLAIN`（不执行）
+
+```console
+shop> EXPLAIN SELECT id, name FROM users WHERE age >= 30 ORDER BY id DESC LIMIT 2;
+QUERY PLAN
+-----------------------------------------------------------------
+Project([id, name])  [cost=0.0..2.5]
+  Limit(limit=2 offset=0)  [cost=0.0..1.0]
+    Filter(age >= 30)  [cost=0.0..6.0]
+      FullScan(users pk=id INT, desc)  [cost=0.0..3.0]
+(4 rows)
+```
+
+加 `ANALYZE` 会真跑一遍并报每个算子的实际行数/耗时：
+`EXPLAIN ANALYZE SELECT ...`（写语句会被拒绝，因为会真改数据）。
+
+每行的 `[cost=起步..总代价]` 来自 planner 的成本模型（现在是个**占位实现**，
+但已经真的参与决策：比如 `WHERE id IN (1,3,5)` 在**小表**上会退回
+`FullScan + Filter`，因为"3 次点查"比"扫 3 行"贵；表大了才会变成
+`RangeUnion`）。
+
+### 5. 远程：起服务器，再用 `sqldb-client` 连它
+
+```bash
+# 终端 1：起服务器（产物在 build/svr/ 下，配置带注释；日志见 server/README.md）
+./build/svr/bin/sqldb-server --config=./build/svr/etc/sqldb-server.conf
+
+# 终端 2：远程客户端（和本地客户端是同一套 REPL/元命令/EXPLAIN）
+$ ./build/sqldb-client --host 127.0.0.1 --port 5433
+remote(127.0.0.1:5433)> \l
+remote(127.0.0.1:5433)> SELECT id, name FROM users;
+```
+
+服务端日志：`[server] log_level`（默认 `info`，可调 `debug`）+ `log_file`
+（空 = stderr）。行格式 `[时间] [级别] 消息`，文件是 append 写。细节见
+`server/README.md`。
+
+### 6. 脚本与非交互用法
+
+```bash
+./build/sqldb -e "SELECT * FROM users"      # 跑一条就退出
+./build/sqldb demo.sql                      # 跑脚本文件（可多个）
+echo "SELECT * FROM users;" | ./build/sqldb # 管道输入当脚本
+cat demo.sql | ./build/sqldb --echo-sql     # 执行前回显（带语法高亮）
+```
+
+脚本里出错会报**文件里的绝对行号**（CLI 会做 span 换算），不是"第几条语句"。
+
+### 7. 交互快捷键（readline）
+
+| 按键            | 作用                                             |
+| --------------- | ------------------------------------------------ |
+| `↑` / `↓`     | 翻命令历史（历史文件见下）                       |
+| `←` / `→`     | 行内移动；`Backspace` / `Delete` 删字符       |
+| `Ctrl-A`/`Ctrl-E` | 跳到行首 / 行尾                             |
+| `Ctrl-R`        | 反向搜索历史                                     |
+| `Tab`           | 补全：SQL 关键字（来源 `sql.l`）+ 当前库表名；`\` 开头补元命令 |
+| `Ctrl-C`        | 放弃当前行，重新输入                             |
+| `Ctrl-D`        | 退出（空行时）                                   |
+
+历史文件：本地 `~/.sqldb_history`，远程 `~/.sqldb_client_history`（每次启动
+load、退出时 save）。补关键字用的大小写形态是小写（和 `sql.l` 的规则同源），
+输入也是大小写无关的。
+
 ## 元命令
 
 反斜杠开头的行是元命令（独占一行，不参与 SQL 语句累积），交互模式和脚本里都能用：
@@ -143,27 +282,30 @@ DDL/USE/事务语句没有计划，会报 `NOT_SUPPORTED`：
 shop> EXPLAIN SELECT id, name FROM users WHERE age >= 30 ORDER BY id DESC LIMIT 2;
 QUERY PLAN
 -----------------------------------------------------------------
-Project([id, name])
-  Limit(limit=2 offset=0)
-    Filter(age >= 30)
-      FullScan(users pk=id INT, desc)
+Project([id, name])  [cost=0.0..2.5]
+  Limit(limit=2 offset=0)  [cost=0.0..1.0]
+    Filter(age >= 30)  [cost=0.0..6.0]
+      FullScan(users pk=id INT, desc)  [cost=0.0..3.0]
 (4 rows)
 
 shop> EXPLAIN SELECT * FROM users WHERE id IN (1, 3, 5);
 QUERY PLAN
 -------------------------------------------------------------------------
-RangeUnion(users pk=id INT, [[1, 1], [3, 3], [5, 5]], asc)
+RangeUnion(users pk=id INT, [[1, 1], [3, 3], [5, 5]], asc)  [cost=30.0..33.0]
 (1 row)
 
 shop> EXPLAIN UPDATE users SET age = 1 WHERE id = 3;
 QUERY PLAN
 --------------------------------------------------------------------
-Update(users pk=id)
-  IndexScan(users pk=id INT, [3, 3], asc)
+Update(users pk=id)  [cost=10.0..11.0]
+  IndexScan(users pk=id INT, [3, 3], asc)  [cost=10.0..11.0]
 (2 rows)
 ```
 
-
+说明：每行末尾的 `[cost=起步..总代价]` 是 planner 的成本模型给出的估算，
+**它真的参与决策**（现在只是占位实现）。上面 `IN` 的例子成立需要表足够大：
+小表上"3 次点查"比"扫 3 行"贵，成本模型会主动退回 `FullScan + Filter`
+（正确性不受影响，只是少了一次索引优化）。
 
 读法（和 planner 的约定一一对应）：
 
@@ -182,11 +324,11 @@ Update(users pk=id)
 shop> EXPLAIN ANALYZE SELECT id FROM users WHERE age >= 30 ORDER BY age LIMIT 2;
 QUERY PLAN
 --------------------------------------------------------------------------
-Project([id])  [rows=2 time=94us]
-  Limit(limit=2 offset=0)  [rows=2 time=90us]
-    TopN(order_by=[age ASC] n=2)  [rows=2 time=92us]
-      Filter(age >= 30)  [rows=2 time=75us]
-        FullScan(users pk=id INT, asc)  [rows=3 time=69us]
+Project([id])  [rows=2 time=98us cost=10.8..13.3]
+  Limit(limit=2 offset=0)  [rows=2 time=93us cost=10.8..11.8]
+    TopN(order_by=[age ASC] n=2)  [rows=2 time=95us cost=10.8..11.8]
+      Filter(age >= 30)  [rows=2 time=75us cost=0.0..6.0]
+        FullScan(users pk=id INT, asc)  [rows=3 time=70us cost=0.0..3.0]
 (2 rows in result)
 (6 rows)
 ```

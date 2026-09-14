@@ -516,3 +516,234 @@ SQL 层仍保留：HELLO/QUERY/META/BYE 协议、空闲/事务空闲看门狗、
 
 后续 Raft 接入点：`common::svrkit::TcpServer` + 自己的协议 handler；重活
 （例如 apply 到状态机）用 `ServiceThread`，不要把状态机写进 svrkit。
+
+## 十一、本轮改动记录（2026-09-14）：客户端体验（协议搬家 / readline / 补全 / 空行）
+
+用户的 7 条反馈，逐条落到下面（1 条查不出来，见第 5 条）。
+
+### 1. 协议搬到 `common/proto/`
+
+`server/protocol.{h,cpp}` -> `common/proto/protocol.{h,cpp}`，命名空间
+`server` -> `common::proto`（和 `common::net` / `common::svrkit` 一致）。
+
+- CMake 库名 `sql_server_protocol` -> **`common_proto`**；
+- `sql_server` 与 `sql_client` 都链接它（协议是**两端共用**的，不属于服务器）；
+- 客户端 `client/connection.cpp` 及 `tests/test_server/*` 全部改用
+  `common::proto::` 限定名；`server/server.cpp` 加 `using namespace common::proto;`。
+
+理由：协议不是"服务器的实现细节"，客户端要编帧/解帧。放在 `common/` 下，
+语义分组才是对的（`common/net` 是字节流、`common/proto` 是 SQL 帧、`common/svrkit`
+是通用服务器框架）。
+
+### 2. 历史上下翻 / backspace / 行编辑
+
+`client/repl.cpp` 新增共用 `client::readline_line_reader(connection, history_path)`
+与 `client::history_flush(path)`：
+
+- 启动 `read_history()`、退出 `write_history()`（本地 `~/.sqldb_history`，
+  远程 `~/.sqldb_client_history`）；
+- 每行非空输入 `add_history()`（空行不进历史，免得 `↑` 全是空行）；
+- 两个前端的本地 readline lambda 删掉，改调共用的那一份。
+
+### 3. readline 实际用的是 Xcode SDK 的 libedit（真 bug，已修）
+
+症状：命令行**能编译、能跑**，但行编辑/历史行为不对。
+
+证据（修之前）：
+
+- `CMakeCache.txt` 里 `READLINE_LIBRARY=.../MacOSX.sdk/usr/lib/libreadline.tbd`；
+- `otool -L build/sqldb` 显示 `/usr/lib/libedit.3.dylib`。
+
+原因：`find_path`/`find_library` 的**默认搜索顺序把 SDK 里的
+`libreadline.tbd`（其实是 libedit 的兼容层）排在显式 `PATHS` 之前**。
+
+修法（`CMakeLists.txt`）：先按 macports/homebrew 的明确路径找
+（`/opt/local`、`/usr/local/opt/readline`、`/opt/homebrew/opt/readline`，
+带 `NO_DEFAULT_PATH`），找不到再退回默认搜索（Linux）。
+
+修之后（实测）：
+
+- `-- readline: /opt/local/lib/libreadline.dylib (include: /opt/local/include)`；
+- `otool -L build/sqldb build/sqldb-client | grep -i readline` ->
+  `/opt/local/lib/libreadline.8.dylib`；
+- pty 里按 `↑` 能翻出上一条、`Backspace` 能删字符（见下面 4/7 的实测）。
+
+**顺带修的坑**：readline 的头目录 + `SQLDB_HAVE_READLINE` 设成 **PRIVATE**
+只给 `sql_client` 自己；之前把 `/opt/local/include` 传成 PUBLIC，会让别的 TU
+也吃到 macports 的头，导致**一堆 fmt weak symbol 链接告警**
+（`... weak symbol cannot be overridden`）。链接仍是 PUBLIC（可执行文件要
+resolve readline 符号）。改完重新链接：0 告警。
+
+### 4. TAB 自动补全
+
+数据源单一在 `parser/sql.l`：
+
+- `sql.l` 新增 `static const char* const kLexKeywords[]` + `int lex_keywords(...)`
+  （`parser/lex_tokens.h` 声明）。**关键字规则和补全清单在同一个文件里**，
+  漏改会被测试抓住（见下）；
+- `client::completion_candidates(line, connection)`：以 `\` 开头的词补**元命令**，
+  否则补**关键字 + 当前库表名**（表名走元信息，本地/远程通吃），按前缀过滤、
+  排序、去重；
+- readline 侧挂 `rl_completion_entry_function`，用 `rl_line_buffer/rl_point`
+  拿"当前词"（所以只补光标前的词，不是整行）。
+
+配套测试（把清单和词法层钉在一起）：
+
+- `tests/test_parser/test_lex_tokens.cpp`：
+  `LexTokens.KeywordListMatchesTheLexerAndIsCaseInsensitive`（清单里每个词都必须
+  被词法层当成关键字、且**大小写两种拼写落到同一个 token**）+ 
+  `LexTokens.KeywordListCoversCoreSqlVocabulary`（核心词汇正向清单）；
+- `tests/test_server/test_client.cpp`（suited `ReplCompletion`，共 3 条）：关键字
+  前缀过滤、元命令单独一路、只补当前词、表名来源（用一个 fake connection）。
+
+### 5. `create database` 报"错误的 token"：**没能复现**（不是词法层的问题）
+
+用户报告：`CREATE DATABASE` 正常，但小写 `create database` 被当成错误 token，
+而 `sql.l` 已经配了大小写无关。
+
+实测（当前 build，全部**正常**）：
+
+- 管道模式：`create database foo; use foo; create table t (...); insert ...;
+  select ...; explain ...; begin/commit; drop ...` 全绿；
+- pty 真交互模式：手敲小写 `create database foo;` / `use foo;` 都 OK；
+- 生成代码层面：`build/parser/lex.yy.c` 里有 flex 生成的大小写等价类
+  （`yy_ec` 表把 `'a'..'z'` 和 `'A'..'Z'` 映射到同一类），`sql.l` 的
+  `%option case-insensitive` 确实生效。
+
+结论：**当前源码 + 当前 build 下无法复现**。最可能是**装了旧二进制**（仓库里
+确实有 9/11 的陈旧产物，例如根目录的 `./test_parser`）。另外顺手发现一个
+**真 bug**（很可能被误认成"错误 token"）：
+
+> `client/local/main.cpp` 与 `client/remote/main.cpp` 的选项解析**只认
+> `--engine=value` 这种 `=` 写法**，而 `--help` 里印的是 `--engine NAME`
+> 这种空格写法。照文档敲 `sqldb --engine mock` 会得到 **"未知选项：--engine"**。
+
+已修：`--engine/--path/--host/--port` 现在**两种写法都收**（带值的选项统一走
+一个 `take_value`：`--name value` 与 `--name=value`）。
+
+如果用户在**干净重建**后仍能复现小写问题，需要原文：完整命令 + 完整报错文本
+（尤其是"错误的 token"这句到底长什么样），才能继续定位。
+
+### 6. 客户端文档补 demo
+
+`client/README.md` / `client/README.en.md` 新增 **"快速上手（demo）"** 一节：
+本地建库建表插查、`\l/\dt/\d` 元信息、事务（`BEGIN`/`ROLLBACK`，提示符带 `*`）、
+`EXPLAIN`、远程（`sqldb-server` + `sqldb-client`）、脚本/管道/`--echo-sql`、
+以及 readline 快捷键表与历史文件位置。
+
+顺带修了**已经过期的 EXPLAIN 示例**：成本模型上线后每个算子后面会带
+`[cost=起步..总代价]`，中英文两版都对不上了；已按**真实输出**更新，并补一句
+说明"`IN` 在小表上会因成本模型退回 `FullScan + Filter`"（这是**设计行为**，
+不是 bug——见 `optimizer.cpp` 里那唯一的成本决策点；100 行的表实测出
+`RangeUnion ... [cost=30.0..33.0]`，3 行的表出 `FullScan+Filter`）。
+
+### 7. 空行/敲错就卡在续行
+
+病根：敲了不带 `;` 的东西（例如 `ls`）会进续行状态 `   ... `，而当时**没有
+合法的退出方式**（只能补一个 `;`）。
+
+修法（`client/repl.cpp::run()`）：**空行 = 立即执行**——
+
+- 没有未完成语句：什么都不做（空回车不再产生任何效果）；
+- 有未完成语句：补一个 `;` 立刻执行，直接看到报错。
+
+续行提示也改清楚：`   ...  (用 ';' 结束，空行=立即执行)`。
+
+pty 实测：空回车无副作用；`ls` + 回车 + 回车 -> 立刻 `syntax error`；
+`select` + 回车 + 回车 -> 立刻报错（都**不再卡住**）。
+
+### 8. 顺带：`make` 也走预设（防止又编出"另一个"二进制）
+
+`Makefile` 的 `configure` 从 `cmake -S . -B build` 改成
+**`cmake --preset llvm-debug`**。原因同上：裸 `cmake -S . -B build` 会挑
+`/usr/bin/c++`（Apple clang），工具链和 `CMakePresets.json` 里那套
+clang++-mp-23 + libc++ 完全对不上——第 5 条那种"源码没问题、二进制行为不对"
+最容易由这种**构建系统分叉**制造出来。
+
+### 验证（都在这台机器上跑过）
+
+- `cmake --preset llvm-debug && cmake --build build -j4`：0 错误 0 告警；
+- `ctest --test-dir build`：**13/13 通过**；
+- `./build/run_tests/test_parser`：**88 用例 / 2072 断言 / 0 失败**；
+- `./build/run_tests/test_server`：**37 用例 / 223 断言 / 0 失败**
+  （真 TCP 用例在沙箱里按既有逻辑 `[skip]`）；
+- `otool -L build/sqldb build/sqldb-client | grep -i readline` ->
+  `/opt/local/lib/libreadline.8.dylib`（不再是 libedit）；
+- pty 实测：小写 DDL、`↑` 翻历史、`Backspace`、`TAB` 补全、空行立即执行。
+
+## 十二、本轮改动记录（2026-09-14）：服务端日志（级别/文件）+ svr 产物目录
+
+起因：用户问"sqldb_server 的日志在哪里看？配置里好像没有日志文件和日志级别"。
+
+**查证结论**：日志**早就有**，但几乎发现不了 —— `[server] log_level` 确实
+存在（默认 `info`，`error|warn|info|debug`，`validate()` 里 `check_enum` 校验），
+但：① 输出目标**硬编码 stderr**，没有文件；② 没有示例配置、没有 `server/`
+README；③ `sqldb-server --help` **是哑的**（只认 `--config=`/`--listen=` 前缀，
+`--help` 被无视直接启动）。另外默认 `info` 时正常运行几乎不打东西（只有退出
+时的 metrics 汇总 + 空闲超时），所以"看起来没日志"。
+
+### 1. 日志：级别过滤 + 单一接收端（新 `server/logger.{h,cpp}`）
+
+抽出 `server::Logger`（`LogLevel` / `parse_log_level` / `Logger::create`）：
+
+- **为什么单独一个类**：`Server::log()` 是从多线程调的（transport 事件循环 +
+  parse/write 服务线程 + 读池），落同一个文件必须串行化；而且抽出来能**在
+  沙箱里单测**（bind 被禁，但日志和网络无关）；
+- `[server] log_file`（新增，默认空）= 日志文件；**空 = stderr**（老行为）；
+- 文件用 `O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC` 打开，**每条日志一次
+  `write()`** —— `O_APPEND` 的"定位到末尾 + 写"由 POSIX 保证原子，所以跨进程
+  追加不插花；进程内再加一把 `std::mutex` 保证整行一起写出；
+- 行格式两种接收端统一：`[YYYY-MM-DD HH:MM:SS.mmm] [level] message`
+  （加了时间戳：日志文件没时间戳基本没法用）；
+- **打开失败 = 启动期报错退出**（`main_server.cpp` 里 `Logger::create` 失败
+  直接 `return 2`），不静默；写失败只丢那一条；
+- `Server` 构造函数多一个可选 `shared_ptr<Logger>` 参数：入口自己 create 以便
+  报错，测试/嵌入方不传就按配置自动建（建不出来退回 stderr）；
+- `listen()` 成功后补一条 `info`：`listening on ... (log_level=..., log_file=...)`
+  —— 日志到底写哪儿去了，日志自己说。
+
+### 2. 产物目录：`build/svr/{bin,etc}`
+
+- `set_target_properties(sqldb-server RUNTIME_OUTPUT_DIRECTORY
+  ${CMAKE_BINARY_DIR}/svr/bin)`；
+- `add_custom_command(... POST_BUILD ... copy_if_different)` 把
+  `server/etc/sqldb-server.conf` 复制到 `build/svr/etc/sqldb-server.conf`
+  （每次构建同步，改源文件重建即生效；COPYONLY 不做变量替换）；
+- 客户端 `sqldb`/`sqldb-client` **留在 `build/` 根下**（它们不是服务端件）；
+- `Makefile` 的 `server` 目标改成打印新路径。
+
+### 3. 默认配置落到源码树：`server/etc/sqldb-server.conf`
+
+带注释、逐字段说明（含 `log_level` 四个级别的含义、`log_file` 的 append 语义）。
+**防漂移**：`tests/test_server/test_config.cpp` 新增
+`Config.SampleConfigMatchesBuiltInDefaults` —— 示例文件里每个键必须在内置
+默认值表里且取值相同，反向每个键也必须在示例里出现（用了 CMake 传的
+`SQLDB_SOURCE_DIR`）。**实测有效**：把示例里 `max_connections` 改成 128，
+这条用例立刻变红。
+
+### 4. `--help` 与日志文档
+
+- `sqldb-server -h|--help`：选项 + 配置位置 + 日志（级别/文件/行格式/append
+  语义）；顺手修了"`--help` 被无视直接启动"；
+- 新增 `server/README.md` + `server/README.en.md`：产物目录、命令行、配置、
+  **日志**（级别表/行格式/写入语义/各级别打了什么）、路由、已知缺口；
+- 根 `README{,.en}.md` 的模块文档表加一行；`client/README{,.en}.md` 的远程
+  demo 改用 `build/svr/bin/sqldb-server` 并指向 `server/README.md`。
+
+### 5. 验证（都在这台机器上跑过）
+
+- `ctest --test-dir build`：**13/13 通过**；`test_server`：**45 用例 / 300 断言
+  / 0 失败**（新增 `Logger` 7 条 + `Config.SampleConfigMatchesBuiltInDefaults`）；
+- 配置层实测：默认配置过校验；`log_level = loud` → 配置错误；`log_file`
+  指向不存在的目录 → `日志初始化失败: cannot open log file ...`（启动期，code 2）；
+- **真 TCP 端到端**（本轮临时申请了 bind 权限）：`sqldb-server
+  --config=/tmp/dbg.conf`（`log_level=debug` + `log_file`）+ `sqldb-client`
+  跑 CREATE DATABASE/TABLE/INSERT/SELECT，日志文件实得：
+  `[..] [info] listening on ...`、`[debug] connection accepted`、
+  `[debug] connection closed: fd=10`、`[info] shutdown: ...`、
+  `[info] stopped: connections=1 statements=5 errors=0 rows=1 ...`；
+- **append 实测**：连起两次服务（同一个 `log_file`），第二次不清空第一次的
+  内容，日志里两条 `listening on`。
+
+**沙箱注意**：`bind()` 被禁 → 之前只能靠单测；本轮用 `require_escalated`
+跑通了真 TCP（`./build/svr/bin/sqldb-server` 已加进允许前缀）。

@@ -281,23 +281,25 @@ target_link_libraries(svrkit PUBLIC
 target_compile_features(svrkit PUBLIC cxx_std_23)
 
 # ============================================================
-# sqldb 服务器协议：server/ 与远程客户端共享，但协议库不依赖服务器框架
+# common/proto：sqldb 的线协议（帧/元信息编解码）
+#
+#   放在 common/ 下是因为**两端都用**：server 收帧/回帧、client 发帧/解帧。
+#   和 common/net、common/svrkit 一样，属于"协议无关/可复用"的那一层。
 # ============================================================
-add_library(sql_server_protocol STATIC
-    server/protocol.cpp
+add_library(common_proto STATIC
+    common/proto/protocol.cpp
 )
 
-target_include_directories(sql_server_protocol PUBLIC
+target_include_directories(common_proto PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/server
 )
 
-target_link_libraries(sql_server_protocol PUBLIC
+target_link_libraries(common_proto PUBLIC
     sql_types
     fmt::fmt
 )
 
-target_compile_features(sql_server_protocol PUBLIC cxx_std_23)
+target_compile_features(common_proto PUBLIC cxx_std_23)
 
 # ============================================================
 # sqldb 服务器应用层：server/ —— SQL 协议 + Session 路由
@@ -305,6 +307,7 @@ target_compile_features(sql_server_protocol PUBLIC cxx_std_23)
 # ============================================================
 add_library(sql_server STATIC
     server/config.cpp
+    server/logger.cpp
     server/server.cpp
 )
 
@@ -316,7 +319,7 @@ target_include_directories(sql_server PUBLIC
 target_link_libraries(sql_server PUBLIC
     sql_session
     sql_kv
-    sql_server_protocol
+    common_proto
     svrkit
     fmt::fmt
 )
@@ -325,6 +328,21 @@ target_compile_features(sql_server PUBLIC cxx_std_23)
 
 add_executable(sqldb-server server/main_server.cpp)
 target_link_libraries(sqldb-server PRIVATE sql_server)
+
+# 服务器以"可发布目录"的形状产出：build/svr/{bin,etc} ——
+#   svr/bin/sqldb-server           可执行
+#   svr/etc/sqldb-server.conf      带注释的默认配置（直接从源码树复制）
+# 客户端的 sqldb / sqldb-client 仍旧留在 build/ 根下（它们不是服务端件）。
+set_target_properties(sqldb-server PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/svr/bin)
+
+# 每次构建都把默认配置同步过去（改源文件后重建即生效；COPYONLY 不做变量替换）
+add_custom_command(TARGET sqldb-server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/svr/etc
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/server/etc/sqldb-server.conf
+            ${CMAKE_BINARY_DIR}/svr/etc/sqldb-server.conf
+    COMMENT "复制默认配置到 svr/etc/sqldb-server.conf")
 
 # ============================================================
 # 客户端层：client/ —— REPL 与 transport 解耦
@@ -344,14 +362,52 @@ target_include_directories(sql_client PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/client
 )
 
+# readline：**行编辑/历史/补全**都靠它。
+#
+# 注意（踩过的坑）：find_path/find_library 的默认搜索顺序会把 macOS SDK 里的
+# `libreadline.tbd`（其实是 libedit 的兼容层）排在前面的 PATHS 之前，
+# 于是编出来的二进制链接的是 /usr/lib/libedit.dylib，历史/补全行为不对。
+# 所以先按 macports/homebrew 的**明确路径**找（NO_DEFAULT_PATH），
+# 找不到再退回系统默认搜索（比如 Linux 上的 libreadline-dev）。
+find_path(READLINE_INCLUDE_DIR
+    NAMES readline/readline.h readline/history.h
+    PATHS /opt/local/include
+          /usr/local/opt/readline/include
+          /opt/homebrew/opt/readline/include
+    NO_DEFAULT_PATH)
+find_library(READLINE_LIBRARY
+    NAMES readline
+    PATHS /opt/local/lib
+          /usr/local/opt/readline/lib
+          /opt/homebrew/opt/readline/lib
+    NO_DEFAULT_PATH)
+if(NOT READLINE_INCLUDE_DIR OR NOT READLINE_LIBRARY)
+    # 退回系统路径（Linux 常见：/usr/include + /usr/lib/libreadline.so）
+    find_path(READLINE_INCLUDE_DIR NAMES readline/readline.h readline/history.h)
+    find_library(READLINE_LIBRARY NAMES readline)
+endif()
+
 target_link_libraries(sql_client PUBLIC
     sql_session
-    sql_server_protocol   # 复用协议编解码，不链接服务器框架
+    common_proto   # 复用协议编解码，不链接服务器框架
     common_net            # 阻塞式 TCP transport
     fmt::fmt
 )
 
 target_compile_features(sql_client PUBLIC cxx_std_23)
+
+if(READLINE_INCLUDE_DIR AND READLINE_LIBRARY)
+    message(STATUS "readline: ${READLINE_LIBRARY} (include: ${READLINE_INCLUDE_DIR})")
+    # 头文件与宏只给 sql_client 自己（只有 repl.cpp 用 readline）：
+    # 把 /opt/local/include 传成 PUBLIC 会让别的 TU 也吃到 macports 的头
+    # （libc++ 可见性不一致 -> fmt 的 weak symbol 链接告警），所以这里 PRIVATE。
+    target_include_directories(sql_client PRIVATE ${READLINE_INCLUDE_DIR})
+    target_compile_definitions(sql_client PRIVATE SQLDB_HAVE_READLINE=1)
+    # 链接必须是 PUBLIC：最终可执行文件（sqldb / sqldb-client）要能 resolve 符号
+    target_link_libraries(sql_client PUBLIC ${READLINE_LIBRARY})
+else()
+    message(STATUS "readline 未找到：交互模式退回 std::getline（无历史/补全）")
+endif()
 
 add_executable(sqldb client/local/main.cpp)
 
@@ -359,25 +415,6 @@ target_link_libraries(sqldb PRIVATE sql_client)
 
 add_executable(sqldb-client client/remote/main.cpp)
 target_link_libraries(sqldb-client PRIVATE sql_client)
-
-if(READLINE_INCLUDE_DIR AND READLINE_LIBRARY)
-    target_include_directories(sqldb-client PRIVATE ${READLINE_INCLUDE_DIR})
-    target_link_libraries(sqldb-client PRIVATE ${READLINE_LIBRARY})
-    target_compile_definitions(sqldb-client PRIVATE SQLDB_HAVE_READLINE=1)
-endif()
-
-# readline：有就用（交互历史/行编辑），没有就退回 std::getline
-find_path(READLINE_INCLUDE_DIR NAMES readline/readline.h
-    PATHS /usr/local/opt/readline/include /opt/homebrew/opt/readline/include)
-find_library(READLINE_LIBRARY NAMES readline
-    PATHS /usr/local/opt/readline/lib /opt/homebrew/opt/readline/lib)
-
-if(READLINE_INCLUDE_DIR AND READLINE_LIBRARY)
-    message(STATUS "readline found: ${READLINE_LIBRARY}")
-    target_include_directories(sqldb PRIVATE ${READLINE_INCLUDE_DIR})
-    target_link_libraries(sqldb PRIVATE ${READLINE_LIBRARY})
-    target_compile_definitions(sqldb PRIVATE SQLDB_HAVE_READLINE=1)
-endif()
 
 # 添加测试子目录
 enable_testing()

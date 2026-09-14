@@ -34,6 +34,8 @@ TEST(Config, DefaultsAreUsable) {
   CHECK_EQ(config->read_threads(), size_t{1});
   CHECK_EQ(config->max_connections(), size_t{256});
   CHECK(config->create_if_missing());
+  CHECK_EQ(config->log_level(), std::string("info"));
+  CHECK(config->log_file().empty()); // 默认写 stderr
 }
 
 TEST(Config, ParsesSectionsAndValues) {
@@ -158,5 +160,50 @@ TEST(Config, MissingFileIsReported) {
   CHECK(!config.has_value());
   if (!config.has_value()) {
     CHECK(config.error().find("cannot open") != std::string::npos);
+  }
+}
+
+// ============================================================
+// 示例配置 = 内置默认值：两份必须逐键相等
+//
+// server/etc/sqldb-server.conf 是给人看的（带注释）同时也是"文档里那份
+// 默认配置"；真正的 schema 是 config.cpp 的内置默认值表。这份用例把它们
+// 钉在一起：改了一边忘了另一边，这里变红 —— 而不是等人照着示例改出问题。
+// 构建产物 build/svr/etc/sqldb-server.conf 就是这个文件复制过去的。
+// ============================================================
+TEST(Config, SampleConfigMatchesBuiltInDefaults) {
+  const std::string path =
+      std::string(SQLDB_SOURCE_DIR) + "/server/etc/sqldb-server.conf";
+  auto sample = server::load_config(path);
+  CHECK(sample.has_value());
+  if (!sample.has_value()) {
+    return;
+  }
+  CHECK(sample->validate().has_value());
+
+  const auto defaults = server::parse_config("");
+  CHECK(defaults.has_value());
+  if (!defaults.has_value()) {
+    return;
+  }
+
+  // 正向：示例里出现的每个键，默认值表里必须有，且取值相同
+  for (const auto &[section, pairs] : sample->generic().table()) {
+    for (const auto &[key, value] : pairs) {
+      const std::string dotted = section + "." + key;
+      const sql::Value *builtin = defaults->generic().find(dotted);
+      CHECK(builtin != nullptr);
+      if (builtin != nullptr) {
+        CHECK(*builtin == value);
+      }
+    }
+  }
+
+  // 反向：默认值表里的每个键，示例文件里都得有（否则示例漏了字段）
+  for (const auto &[section, pairs] : defaults->generic().table()) {
+    for (const auto &[key, value] : pairs) {
+      const std::string dotted = section + "." + key;
+      CHECK(sample->generic().find(dotted) != nullptr);
+    }
   }
 }
