@@ -2,10 +2,14 @@
 
 中文版：[DESIGN.md](DESIGN.md)
 
-**Status: design frozen; the P0 core is implemented (election / log
-replication / commit / apply / LevelDB log persistence / proposal payload
-codec / KV state-machine bridge).** This is an implementation plan, not a
-user guide; responsibilities / interfaces / pitfalls live in `raft/README.md`.
+**Status: design frozen; P0, the P1a adapter and P1b are implemented** (election
+/ log replication / commit / apply / LevelDB persistence / payload codec / KV
+state-machine bridge / `RaftKVStore` + `RaftKVEngine` / ReadIndex barriers /
+per-group write slot / `RaftRuntime` single thread / RPC codec / TCP transport /
+`[raft]` config and the `sqldb-server` wiring). Remaining work is listed in §11
+(snapshot transfer, compaction, leader hints, read-index batching, membership
+changes, P2 multi-group). This is an implementation plan, not a user guide;
+responsibilities / interfaces / pitfalls live in `raft/README.md`.
 
 ## 0. Goal and scope
 
@@ -264,8 +268,23 @@ class MultiRaft {                // routing + many groups
   std::vector<GroupInfo> groups() const;
 };
 
+class RaftRuntime {              // P1b: the only thread allowed to touch RaftNode
+  void start(size_t queue_max);
+  void stop();                   // drain the queue, then join
+  std::expected<void, Error> run(std::function<void()>);        // blocking submit
+  std::expected<Proposal, Error> propose(std::string data);     // blocking submit
+  std::expected<ReadIndex, Error> read_barrier();               // blocking submit
+  bool post_message(NodeId, const Message &);                   // fire and forget
+  bool request_tick();                                          // fire and forget
+};
+
 } // namespace raft
 ```
+
+`message_codec.{h,cpp}` provides the binary RPC frame (versioned, length
+prefixed, with a streaming decoder) and `peers.{h,cpp}` parses the
+`id@host:port` list of `[raft] peers`. Neither touches a socket, so both are
+fully unit-testable inside the sandbox.
 
 ### 4.2 The new SQL-side implementations
 
@@ -294,6 +313,143 @@ Two new `kv::Status` values:
 **The SQL protocol does not change**: `NotLeader` travels over the existing
 ERROR frame.
 
+### 4.3 The P1 adapter: what is implemented (`raft/raft_kv_store.{h,cpp}`)
+
+The single-group version turned the §4.2 sketch into two classes. **P1 has one
+group, so `RaftKVEngine` currently holds a `RaftNode &` directly**; P2 replaces
+that one seam with `MultiRaft::group_for(key)` routing (see §11).
+
+| Type | Responsibility |
+|------|----------------|
+| `RaftKVStore` | implements `kv::KVStore`; `connect()` hands each session a `RaftKVEngine`; `open/close/flush/stats` proxy the local store |
+| `RaftKVEngine` | implements `kv::KVEngine`; reads go through a read-index barrier plus the locally applied state, writes go propose → wait for commit + apply, and an explicit transaction is replicated as one batch at `COMMIT` |
+
+Contract, ordered by importance:
+
+1. **Writes only enter through `connect()`.** `RaftKVStore::write_batch()`
+   returns `NotSupported`: the raw store write path belongs to the state
+   machine (which owns the local store directly). SQL writes must be proposed,
+   or they silently bypass replication. Raw *reads*
+   (`RaftKVStore::new_iterator()`) serve applied local state and are safe to
+   proxy (snapshot generation needs them).
+2. **Every read passes a read-index barrier** (algorithm in §5.2); no leader,
+   or no quorum, maps to `NotLeader` / `Timeout`.
+3. **A transaction is a local snapshot plus the group write slot.**
+   `begin_transaction()` takes a snapshot on the local store (repeatable read);
+   the first write takes the group write slot and then releases the snapshot
+   per §3.2; `COMMIT` encodes `TxBuffer::to_batch()` into **one** proposal. A
+   failed `COMMIT` leaves the transaction open and rollbackable, with no local
+   state mutated.
+4. **Read your own writes**: inside a transaction, `get/exists/get_batch/
+   new_iterator` consult the `TxBuffer` overlay before the applied state, so
+   the engine behaves like the local one.
+5. **An empty transaction `COMMIT` writes no log entry.**
+6. **Idempotency**: every proposal carries `(client_id, request_id)`;
+   `request_id` increases monotonically within a connection and a retry
+   **must reuse the same id** so the state machine can deduplicate.
+7. **A timeout means "unknown outcome", not "not written"**:
+   `Proposal::wait_for()` timing out only says the commit was not observed; the
+   entry may still commit later. Callers retry with the same request id or
+   surface the uncertainty — never assume an error means the write did not
+   happen.
+8. **Every wait is bounded**: both the read barrier and proposal waits use
+   `election_timeout_ms` as their budget. A partitioned old leader never steps
+   down on its own, so an unbounded wait hangs the session
+   (`IsolatedLeaderCannotServeReads` and
+   `IsolatedLeaderFailsReadsAndWritesWithTimeout` cover both paths).
+
+Error mapping:
+
+| raft error | `kv::Status` | Caller behavior |
+|------------|--------------|-----------------|
+| `NotLeader` | `NotLeader` | answer an ERROR frame; P1 reports, it does not forward (§11) |
+| `Timeout` (read barrier / proposal wait) | `Timeout` | reads may be retried; writes must retry with the same request id |
+| `InvalidArgument` / `IOError` / `InternalError` | same name | propagate |
+
+**Threading rules** (P1 must respect these or it is a data race):
+
+- `RaftNode::tick()/handle_message()/propose()/read_barrier()` must all be
+  called on the **same Raft service thread**;
+- `RaftKVEngine` writes block on a completion and therefore **must not block on
+  that thread**;
+- the intended shape is the `RaftRuntime` of §9: session/write threads
+  `SubmitToService` a proposal, and the Raft service thread drives tick /
+  messages / commit / apply and finishes the completion; `Transport::send()`
+  still only enqueues and never re-enters synchronously.
+- Today `raft_kv_store` is a thread-agnostic skin that assumes its caller
+  already serializes access. That holds for the single-threaded tests; the
+  runtime has to exist before this is wired to the server.
+
+### 4.4 P1b: RaftRuntime, transport and the threading model (landed)
+
+Which thread touches what:
+
+| Thread | Owns | How it talks to RaftNode |
+|--------|------|--------------------------|
+| **Raft service thread** (`RaftRuntime`) | the only toucher of `RaftNode`, `StateMachine` and `LogStore` | calls `tick/handle_message/propose/read_barrier` directly |
+| transport receive thread (svrkit Loop) | sockets, frame buffers | only `post_message()`, never `handle_message()` |
+| transport send thread | one long-lived connection per peer | only reads the send queue |
+| SQL session / write service threads | `RaftKVEngine`, `TxBuffer` | blocking submits `propose()/read_barrier()`, then waits on the completion |
+| timer (`Loop::add_timer` or the test fake clock) | nothing | `request_tick()` |
+
+Rules and errors:
+
+- **Blocking submits** (`run/propose/read_barrier`) enqueue a lambda, let the
+  service thread run it, and return; a `Proposal` returned by `propose` is then
+  waited on by the **caller's** thread (§4.3 timeout semantics). The service
+  thread is never blocked by a caller.
+- **Posts** (`post_message/request_tick`) are fire-and-forget; a full queue
+  drops the item and counts it (a dropped tick is fine — the next heartbeat
+  period catches up).
+- A blocking submit issued *from* the service thread returns `Busy` instead of
+  deadlocking; a full queue also returns `Busy`, which the adapter maps to
+  `kv::Status::Busy` (retryable).
+- `stop()` drains queued ticks/messages and only then joins, so messages that
+  were already received are not silently lost; afterwards `running()` is false
+  and further submissions fail.
+
+Timers: production arms `Loop::add_timer(heartbeat_ms, ...)` on a loop that
+only drives timers and calls `request_tick()` (`add_timer` is one-shot, so the
+callback re-arms); tests inject a fake clock and post ticks manually, so
+elections and heartbeats stay deterministic.
+
+**Transport topology** (`raft/tcp_transport.{h,cpp}`): every node dials every
+peer, and the receive side uses `svrkit::TcpServer`, so a pair of nodes has
+**two** connections (one per direction). That looks wasteful, but it buys "each
+fd is owned by exactly one thread":
+
+- outbound sockets belong to the sender thread (blocking connect/write), so
+  `send()` only enqueues and never has to hop onto another thread's loop;
+- inbound sockets belong to the `TcpServer` loop (non-blocking reads), and
+  decoded frames are only handed to `RaftRuntime::post()` — they never touch
+  `RaftNode`;
+- the dialer sends a one-frame **handshake** (`u8 kind + u64 node id`) so the
+  acceptor learns who connected (svrkit does not expose the peer address).
+
+On a write failure the unsent bytes are **kept** and resent after a reconnect
+with backoff: Raft RPCs already tolerate duplicates (AppendEntries is retried),
+so the transport is **at-least-once**, not exactly-once. A full outbound queue
+or a rejected post drops the frame and counts it.
+
+**Server wiring** (`server/raft_bootstrap.{h,cpp}` + `main_server.cpp`):
+local KVStore → `LevelDBLogStore(<log_path>/log)` →
+`LevelDBRequestResultStore(<log_path>/request_results)` → `KVStateMachine` →
+`RaftTcpTransport` → `RaftNode` → `RaftRuntime` → listen + inbound thread +
+heartbeat timer → `RaftKVStore`; shutdown is the reverse (timer → transport →
+runtime → stores). With `raft.enabled = false` (the default) the startup path is
+exactly as before.
+
+Two implementation details worth remembering:
+
+- **A single-member group never listens**: no peer can connect, so skipping the
+  listener lets single-node raft run anywhere (including sandboxes that deny
+  bind); `RaftBootstrap::Options::bind_listener` is the explicit test knob.
+- **`client_id` carries a per-process random salt**: the idempotency table is
+  durable and the state machine skips a proposal whose `(client_id,
+  request_id)` it has already applied. A plain counter repeats after a restart,
+  so the first new write after a restart could be mistaken for a replay and
+  silently do nothing.
+
 ## 5. Read/write paths
 
 ### 5.1 Writes (`COMMIT` / autocommit statements)
@@ -314,9 +470,32 @@ statement executes -> WriteBatch (already exists)
 ### 5.2 Reads
 
 - **P1: reads and writes both go to the leader**;
-- a read on the leader must first pass a **read-index** barrier: record the
-  `commit_index` at request time and wait for `applied_index >= it` before
-  reading locally — otherwise a just-committed write may not be visible;
+- a read on the leader must first pass a **ReadIndex** barrier (implemented
+  algorithm):
+  1. record the `commit_index` at request time as the **read target**;
+  2. immediately start a heartbeat round (AppendEntries) and number it `R`;
+  3. only consider leadership valid once a majority has acknowledged a round
+     that started **at or after this request** (`peer_acked_round >= R`);
+  4. wait for `applied_index >= read target`, then read the locally applied
+     state.
+- **Why steps 2/3 cannot be skipped**: a partitioned old leader still believes
+  it leads. Reusing earlier acks, or waiting only for the no-op that committed
+  at election time, lets it keep serving stale reads — the "stale leader" trap
+  in §10. Only rounds started after the read request count, so late replies to
+  older rounds are never accepted as proof. To make that rule executable, the
+  AppendEntries request carries its round and the response echoes it: the
+  leader only credits `response.round` into `peer_acked_round`, so a late reply
+  to an older round simply does not match the new round number.
+- **Why the current-term no-op is not the criterion**: the no-op proves
+  leadership only once, right after the election; a later partition produces no
+  new no-op, so waiting for it means trusting an expired proof forever. The
+  no-op stays for its real job: letting a new leader safely commit entries
+  inherited from a previous term.
+- **Cost and follow-up**: today every read (and every key) costs a full
+  heartbeat round. Batching a statement's or transaction's reads into one
+  confirmation needs a time bound — a lease (with clock assumptions) or an
+  injected clock. See §11.
+- no quorum within one `election_timeout_ms` maps to `Timeout`;
 - follower read / lease is a P3 concern (out of scope).
 
 ### 5.3 Idempotency
@@ -348,9 +527,27 @@ peers   = 1@127.0.0.1:5434,2@127.0.0.1:5435,3@127.0.0.1:5436
 election_timeout_ms = 1000
 heartbeat_ms        = 100
 log_path            = ./sql_db_raft_log     # separate LevelDB for the raft log
-# static shards (hand-written until P3, then owned by the _meta group)
-shard.0 = ,+                                 # [empty, +∞) = everything
 ```
+
+**Landed** (`server/config.{h,cpp}`): all of these keys live in the built-in
+default table (`enabled = false` by default, so the startup path is unchanged
+when raft is off) and `ServerConfig` exposes `raft_enabled()/raft_node_id()/
+raft_peers()/raft_listen{,_host,_port}()/raft_election_timeout_ms()/
+raft_heartbeat_ms()/raft_log_path()`.
+
+`validate()` rules:
+
+- `heartbeat_ms < election_timeout_ms` (checked whether raft is on or off);
+- a non-empty `peers` is always parsed: `<node_id>@<host>:<port>`, id >= 1, port
+  in 1..65535, unique ids and unique endpoints (checked **even while disabled**,
+  so a typo cannot hide until the day raft is switched on);
+- with `enabled = true` it additionally requires a non-empty `peers`, `node_id`
+  present in `peers`, `listen` shaped like `host:port`, and a non-empty
+  `log_path`.
+
+Static shards (`shard.N = <start>,<end>`) are not implemented yet: P1 has a
+single group, and P2 introduces the static range table with `@system/*` pinned
+to group 0 (§2.2).
 
 ## 8. Reuse checklist (don't rebuild what exists)
 
@@ -370,16 +567,23 @@ internal traffic.
 
 ## 9. Phased plan
 
-| Phase | Content | Verification |
-|-------|---------|--------------|
-| **P0** | raft core: election / log replication / commit / apply / snapshot; **in-proc transport + injectable fake clock** | unit tests: happy path, partitions, dropped messages, reordering, restart, single-node → three-node. **Fully green inside the sandbox** (no sockets) |
-| **P1** | single group wired into SQL: `RaftKVStore` + static placement (1 node → 3 nodes) + leader-only reads/writes + read-index + idempotency id | `test_raft` + end-to-end: SQL on raft; kill the leader and watch a new one take over |
-| **P2** | many groups: shard per table; `@system/*` in group 0; independent leader per group; **reject cross-group write transactions + `strict`/`loose` modes + the `CLIENT_OPTIONS` frame** (§3.3/§3.4) | two tables write concurrently without blocking each other; a cross-group write transaction fails clearly; under `--cross-group-read=loose` `BEGIN; SELECT a; SELECT b; COMMIT` runs, under `strict` (default) it errors |
-| **P3** | `_meta` group owns placement, **table-level split/merge**, membership changes, follower read / lease | needs its own design (not in this document) |
+| Phase | Content | Verification | Status |
+|-------|---------|--------------|--------|
+| **P0** | raft core: election / log replication / commit / apply / snapshot; **in-proc transport + injectable fake clock** | unit tests: happy path, partitions, dropped messages, reordering, restart, single-node → three-node. **Fully green inside the sandbox** (no sockets) | landed |
+| **P1a** | single-group adapter: `RaftKVStore` / `RaftKVEngine`, **ReadIndex barrier**, per-group write slot, proposal idempotency id, timeout and error mapping | the `RaftKVAdapter` suite in `test_raft` (single-node read/write, transactions, rollback, write slot; three-node replication; follower `NotLeader`; partitioned-leader timeout) | landed |
+| **P1b** | `RaftRuntime` threading model (`ServiceThread` driving tick/messages/apply), RPC codec, `[raft]` config, production transport (svrkit on its own port), server entry wiring, leader hint back to the client | end-to-end: SQL on raft; kill the leader and watch a new one take over | landed (single-node restart persistence and a three-node real-socket election/replication test; leader hints are still open) |
+| **P2** | many groups: shard per table; `@system/*` in group 0; independent leader per group; **reject cross-group write transactions + `strict`/`loose` modes + the `CLIENT_OPTIONS` frame** (§3.3/§3.4) | two tables write concurrently without blocking each other; a cross-group write transaction fails clearly; under `--cross-group-read=loose` `BEGIN; SELECT a; SELECT b; COMMIT` runs, under `strict` (default) it errors | not started |
+| **P3** | `_meta` group owns placement, **table-level split/merge**, membership changes, follower read / lease | needs its own design (not in this document) | not started |
 
 **Start with P0**: it does not touch SQL, is deterministically testable, and
 stays green inside the sandbox. The three interfaces P0 freezes (`LogStore`,
 `StateMachine`, `Transport`) determine how smoothly P1 wires into SQL.
+
+P1 is split into a/b because everything in P1a is verifiable with **one thread
+and the in-proc transport** (done today), while P1b introduces threads and
+thereby turns `RaftNode`'s "single caller thread" assumption into a hard
+constraint that has to be designed together with the runtime. The adapter must
+not be wired into the server before that runtime exists.
 
 ## 10. Pitfalls (by severity)
 
@@ -412,6 +616,43 @@ stays green inside the sandbox. The three interfaces P0 freezes (`LogStore`,
     enforcement point is `RaftKVEngine` (only it knows the group boundaries).
     Deciding in the SQL layer would miss the `@system/*` routing table and would
     duplicate the "which groups have I touched" state.
+11. **ReadIndex must be confirmed by a heartbeat round started *after* the read
+    request.** Reusing earlier acks, or waiting only for the election-time
+    no-op, lets a partitioned old leader serve stale reads. Test:
+    `IsolatedLeaderCannotServeReads`.
+12. **Every cross-thread wait needs a deadline.** A partitioned old leader never
+    steps down, so `wait()` without a timeout hangs the session forever. Test:
+    `IsolatedLeaderFailsReadsAndWritesWithTimeout`.
+13. **A proposal timeout is not a failed write**: the entry may commit later.
+    Retries must reuse the same `(client_id, request_id)` so the state machine
+    deduplicates; otherwise one timeout plus retry executes the write twice.
+14. **`RaftKVStore::write_batch()` must stay rejected** (`NotSupported`).
+    Keeping a raw write path around propose is a silent local-write backdoor
+    into a replicated store.
+15. **The adapter must not spawn threads, and must not block on the Raft
+    service thread waiting for a proposal.** See the threading rules in §4.3;
+    this is the first rule to get violated when wiring the server.
+16. **The transport thread may only `post_message()`, never
+    `handle_message()`.** Handling a frame inline means the network thread and
+    the Raft service thread both touch `RaftNode`, and it pushes slow disk/apply
+    backpressure onto the network thread.
+17. **`[raft] enabled = true` must fail loudly until the wiring exists.**
+    Config validation passing does not mean replication is on; silently falling
+    back to local writes is the worst kind of bug (the user believes the write
+    was replicated).
+    (The wiring exists now; keep this rule for future partial integration —
+    failing startup beats pretending.)
+18. **One connection per direction in the transport**: do not "save" an fd by
+    making the receive thread write on another thread's loop; that breaks the
+    "each fd has exactly one owning thread" invariant, and cross-thread socket
+    writes are the hardest races to debug.
+19. **`client_id` must be unique across restarts** (a per-process random salt
+    today). The idempotency table is durable, and a repeated id makes the first
+    new write after a restart look like a replay and silently skip it — the
+    symptom is "the write reported OK but the value did not change".
+20. **Startup order matters**: `RaftNode::start()` (which installs the transport
+    callback) must happen before the inbound thread starts, or the first
+    messages are dropped because the callback is not registered yet.
 
 ## 11. Open questions
 
@@ -429,3 +670,28 @@ stays green inside the sandbox. The three interfaces P0 freezes (`LogStore`,
 - After table-level split/merge, the "one transaction, one group" rule must be
   revisited (a table spanning two groups makes it a cross-group transaction
   again).
+- **ReadIndex batching / lease**: every key currently costs one confirmation
+  round, which shows up as read amplification. Batching it per statement needs
+  a time bound (lease + clock assumptions, or an injected clock); this is the
+  first performance task after P1b.
+- **Structured errors**: `NotLeader` needs a leader hint and
+  `CrossGroupTransaction` needs both group ids, but today there is only the
+  `kv::Status` enum. Either widen the error type (`StatusInfo`) or add fields to
+  the ERROR frame.
+- **`RaftRuntime` details**: "one service thread + blocking submits + posts" is
+  settled (§4.4); still open is whether apply gets its own thread (today apply
+  runs on the service thread, so a slow `remove_range` delays heartbeats) and
+  whether the proposal queue should be split per group.
+- **Transport operations**: reconnect is "backoff + resend unsent bytes"; there
+  is no keepalive/half-open detection (a wedged peer is only noticed when a
+  write fails) and no load testing of the connection count (N×(N-1) today).
+  Whether to multiplex is a question for real measurements.
+- **`NotLeader` leader hints and retries**: clients currently only see the
+  `NotLeader` text error, with no hint and no server-side forwarding.
+- **Configurable proposal deadline**: it borrows `election_timeout_ms` today;
+  eventually there should be a dedicated `raft.proposal_timeout_ms`, with read
+  and write timeouts distinguished.
+- **Atomicity of affected rows / apply results with idempotency results**:
+  `apply_result` is currently the constant `"applied"`. Making it real affected
+  rows requires persisting it atomically with the request result, or a restart
+  replay returns a different value.

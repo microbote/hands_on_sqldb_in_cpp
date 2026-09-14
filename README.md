@@ -90,7 +90,7 @@ id  name
 | `storage/kv_engine/readme.md` | KVStore/KVEngine、事务缓冲、两引擎一致性 |
 | `client/README.md` | 两个客户端（本地 `sqldb` / 远程 `sqldb-client`）的用法、元命令、EXPLAIN 输出 |
 | `server/README.md` | 服务端 `sqldb-server`：产物目录（`build/svr/{bin,etc}`）、配置、**日志**、路由 |
-| `raft/DESIGN.md` | **设计文档**：sqldb 的 Multi-Raft 方案、两条已拍板决定、分片/事务规则、分阶段计划；P0 core 已落地 |
+| `raft/DESIGN.md` | **设计文档**：sqldb 的 Multi-Raft 方案、两条已拍板决定、分片/事务规则、分阶段计划；P0 core + P1（单 group 打通 SQL，含 TCP transport 与 server 接线）已落地 |
 
 各模块的改动记录（含设计取舍与踩坑）在各测试目录的
 `tests/test_<模块>/codex_check_issues.md`。

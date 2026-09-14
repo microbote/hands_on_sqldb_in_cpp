@@ -36,6 +36,8 @@ enum class Status {
   TransactionConflict,
   Busy,
   Timeout,
+  NotLeader,
+  CrossGroupTransaction,
 };
 
 inline const char *status_to_string(Status s) {
@@ -60,6 +62,10 @@ inline const char *status_to_string(Status s) {
     return "Busy";
   case Status::Timeout:
     return "Timeout";
+  case Status::NotLeader:
+    return "NotLeader";
+  case Status::CrossGroupTransaction:
+    return "CrossGroupTransaction";
   default:
     return "Unknown";
   }

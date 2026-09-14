@@ -2,9 +2,13 @@
 
 English version: [DESIGN.en.md](DESIGN.en.md)
 
-**状态：设计已定稿；P0 core 已落地（选举 / 日志复制 / commit / apply /
-LevelDB 日志持久化 / proposal payload 编解码 / KV 状态机桥接）。**
-本文件是实施方案，不是使用说明；职责/接口/踩坑见 `raft/README.md`。
+**状态：设计已定稿；P0 core、P1a 适配层、P1b 运行时/传输/接线都已落地**
+（选举 / 日志复制 / commit / apply / LevelDB 持久化 / payload 编解码 /
+KV 状态机桥接 / `RaftKVStore` + `RaftKVEngine` / ReadIndex 读屏障 / 组内写槽 /
+`RaftRuntime` 单线程服务 / RPC 编解码 / TCP transport / `[raft]` 配置与
+`sqldb-server` 接线）。剩余工作见 §11（快照传输、compaction、leader hint、
+read-index 合并、成员变更、P2 多 group）。本文件是实施方案，不是使用说明；
+职责/接口/踩坑见 `raft/README.md`。
 
 ## 0. 目标与范围
 
@@ -230,8 +234,22 @@ class MultiRaft {                // 路由 + 多组管理
   std::vector<GroupInfo> groups() const;
 };
 
+class RaftRuntime {              // P1b 已落地：RaftNode 的唯一宿主线程
+  void start(size_t queue_max);
+  void stop();                   // 先把队列跑完再 join
+  std::expected<void, Error> run(std::function<void()>);        // 阻塞提交
+  std::expected<Proposal, Error> propose(std::string data);     // 阻塞提交
+  std::expected<ReadIndex, Error> read_barrier();               // 阻塞提交
+  bool post_message(NodeId, const Message &);                   // 投递
+  bool request_tick();                                          // 投递
+};
+
 } // namespace raft
 ```
+
+`message_codec.{h,cpp}` 提供 RPC 的二进制帧（带版本、长度前缀、流式解码器），
+`peers.{h,cpp}` 解析 `[raft] peers` 的 `id@host:port` 列表。两者都不碰 socket，
+所以在沙箱里可以完整单测。
 
 ### 4.2 SQL 侧的新实现
 
@@ -256,6 +274,121 @@ class RaftKVEngine : public kv::KVEngine {
 
 **SQL 协议不需要改**：`NotLeader` 走现有的 ERROR 帧通道。
 
+### 4.3 P1 适配层：已实现的契约（`raft/raft_kv_store.{h,cpp}`）
+
+单 group 版本把 §4.2 的草图落成了两个类。**P1 只有一个 group，所以
+`RaftKVEngine` 现在直接持有 `RaftNode &`**；P2 才把这一处换成
+`MultiRaft::group_for(key)` 路由（见 §11）。
+
+| 类型 | 职责 |
+|------|------|
+| `RaftKVStore` | 实现 `kv::KVStore`；`connect()` 给每个 session 一条 `RaftKVEngine`，`open/close/flush/stats` 代理本地 store |
+| `RaftKVEngine` | 实现 `kv::KVEngine`；读走 read-index + 本地已 apply 状态，写走 propose → 等 commit + apply，显式事务在 `COMMIT` 时整批复制 |
+
+契约（按重要性排序）：
+
+1. **写只能经 `connect()` 进入**。`RaftKVStore::write_batch()` 返回
+   `NotSupported`：raw store 写路径是留给状态机 apply 的（它直接持有本地
+   store），SQL 写必须走 propose，否则就是绕过复制的本地写。反过来，
+   `RaftKVStore::new_iterator()` 读到的是本地已 apply 状态，只读且安全，
+   直接代理（快照生成等内部用途需要它）。
+2. **读前必须过 read-index**（算法见 §5.2）；不是 leader、或等不到 quorum，
+   分别返回 `NotLeader` / `Timeout`。
+3. **事务 = 本地快照 + 组内写槽**：`begin_transaction()` 在本地 store 上取
+   快照（可重复读）；第一次写时抢本组写槽，抢到就按 §3.2 的规则释放快照；
+   `COMMIT` 把 `TxBuffer::to_batch()` 整体编码成**一条** proposal。
+   `COMMIT` 失败时事务保持打开、可回滚，本地状态不被污染。
+4. **读自己的写**：事务内 `get/exists/get_batch/new_iterator` 先看
+   `TxBuffer` 覆盖层，再看本地已 apply 状态 —— 与本地引擎的语义一致。
+5. **空事务 `COMMIT` 不产生日志**：没有 op 时直接结束事务。
+6. **幂等**：每条 proposal 带 `(client_id, request_id)`；`request_id` 在一条
+   连接内单调递增，客户端重试**必须复用同一个 id**，状态机按它去重。
+7. **超时 = 结果未知，不是"没写进去"**：`Proposal::wait_for()` 超时只说明
+   没等到 commit，该条目仍可能随后被提交。调用方要么用同一个 request id
+   重试，要么把不确定暴露给用户；不能假定"报错 = 没生效"。
+8. **等待都有上限**：读屏障与 proposal 等待都取
+   `election_timeout_ms` 作为预算。分区里的旧 leader 不会因为选不出新主而
+   自己降级，没有上限就会把 session 挂死（`IsolatedLeaderCannotServeReads`
+   与 `IsolatedLeaderFailsReadsAndWritesWithTimeout` 覆盖这两条路径）。
+
+错误映射：
+
+| raft 错误 | `kv::Status` | 调用方行为 |
+|-----------|--------------|------------|
+| `NotLeader` | `NotLeader` | 回 ERROR 帧；P1 只报错，不代转（§11） |
+| `Timeout`（读屏障 / proposal 等待） | `Timeout` | 读可重试；写必须用同一 request id 重试 |
+| `InvalidArgument` / `IOError` / `InternalError` | 同名 | 透传 |
+
+**线程规则**（P1 落地时必须遵守，否则就是数据竞争）：
+
+- `RaftNode::tick()/handle_message()/propose()/read_barrier()` 必须在**同一个
+  Raft 服务线程**上调用；
+- `RaftKVEngine` 的写会阻塞等 completion，**不能在这个线程上等**；
+- 正确形状是 §9 的 `RaftRuntime`：session/write 线程把 proposal
+  `SubmitToService` 进去，Raft 服务线程驱动 tick / 消息 / commit / apply 并
+  完成 completion；`Transport::send()` 继续只排队，不得同步重入。
+- 今天 `raft_kv_store` 是"线程无关的一层皮"：它假定调用方已经串行化。
+  单节点 / 单线程测试成立，接 server 前必须先有 runtime。
+
+### 4.4 P1b：RaftRuntime、transport 与线程模型（已落地）
+
+线程划分（谁碰什么）：
+
+| 线程 | 碰什么 | 怎么和 RaftNode 打交道 |
+|------|--------|------------------------|
+| **Raft 服务线程**（`RaftRuntime`） | `RaftNode`、`StateMachine`、`LogStore` 的**唯一**访问者 | 直接调用（`tick/handle_message/propose/read_barrier`） |
+| transport 接收线程（svrkit Loop） | socket、分帧缓冲 | 只 `post_message()`，**不**直接 `handle_message()` |
+| transport 发送线程 | 每 peer 一条长连接 | 只读传输队列，不碰 Raft 状态 |
+| SQL session / 写服务线程 | `RaftKVEngine`、`TxBuffer` | 阻塞提交 `propose()/read_barrier()`，然后等 completion |
+| 定时器（`Loop::add_timer` 或测试的假时钟） | 无 | `request_tick()` |
+
+规则与错误：
+
+- **阻塞提交**（`run/propose/read_barrier`）把 lambda 排进服务队列，等服务线程
+  跑完再返回；`propose` 返回的 `Proposal` 之后由调用方在**自己的线程**上等
+  completion（§4.3 的超时语义）。服务线程从不被调用方阻塞。
+- **投递**（`post_message/request_tick`）是 fire-and-forget，队列满就丢并计数
+  （tick 丢一条没关系，下一个心跳周期会补）。
+- 在服务线程上发起阻塞提交会**返回 `Busy` 而不是死锁**；队列满也返回 `Busy`，
+  适配层映射成 `kv::Status::Busy`（可重试）。
+- `stop()` 先把队列里已入队的 tick / 消息跑完再 join，保证关停期间不丢已接收
+  的消息；之后 `running() == false`，再提交直接失败。
+
+定时器：生产用 `Loop::add_timer(heartbeat_ms, ...)` 在一个只有定时器的 Loop 上
+周期性地 `request_tick()`（`add_timer` 是一次性的，回调里重新挂下一次）；
+测试注入假时钟 + 手动 `request_tick()`，因此选举/心跳仍然是确定性的。
+
+**transport 拓扑**（`raft/tcp_transport.{h,cpp}`）：每个节点向每个 peer 建一条
+出站连接，接收侧用 `svrkit::TcpServer`，所以一对节点之间有**两条**连接（每个
+方向一条）。看起来浪费，换来的是"每条 fd 只被一条线程拥有"：
+
+- 出站 socket 归发送线程（阻塞 connect/write），`send()` 只需要入队，永远不必
+  跳到别人的事件循环上写；
+- 入站 socket 归 `TcpServer` 的 Loop（非阻塞读），解帧后只做
+  `RaftRuntime::post()`，不碰 `RaftNode`；
+- 拨号方先发一帧**握手**（`u8 kind + u64 node id`），接收方据此知道对端是谁
+  —— svrkit 不暴露对端地址，握手比拿地址更省事。
+
+写失败时**保留未写完的字节**并在退避后重连重发：Raft RPC 本身允许重复
+（AppendEntries 会重发），因此 transport 的语义是**至少一次**而不是精确一次。
+出站队列满、接收侧 post 被拒 → 丢帧并计数。
+
+**server 接线**（`server/raft_bootstrap.{h,cpp}` + `main_server.cpp`）：
+本地 KVStore → `LevelDBLogStore(<log_path>/log)` →
+`LevelDBRequestResultStore(<log_path>/request_results)` → `KVStateMachine` →
+`RaftTcpTransport` → `RaftNode` → `RaftRuntime` → listen + 入站线程 + 心跳定时器
+→ `RaftKVStore`；关闭顺序反过来（定时器 → transport → runtime → stores）。
+`raft.enabled = false`（默认）时启动路径与以前完全一致。
+
+两个值得记住的实现细节：
+
+- **单成员组不监听**：没有 peer 连得进来，跳过 listen 让单节点 raft 也能在
+  任何环境（包括禁 bind 的沙箱）跑起来；`RaftBootstrap::Options::bind_listener`
+  是给测试用的显式开关。
+- **`client_id` 带每进程随机盐**：幂等结果表是持久的，而状态机会跳过
+  `(client_id, request_id)` 命中过的 proposal。纯自增计数在进程重启后会重复，
+  于是"重启后的第一条新写"可能被当成旧请求的重放而**静默不生效**。
+
 ## 5. 读写路径
 
 ### 5.1 写（`COMMIT` / 自动提交语句）
@@ -276,8 +409,25 @@ statement 执行完 -> WriteBatch（已有）
 ### 5.2 读
 
 - **P1：读写都走 leader**；
-- leader 上的读必须先过 **read-index**：记下请求时刻的 `commit_index`，等
-  `applied_index >= 该值` 再读本地 —— 否则刚提交的写可能读不到；
+- leader 上的读必须先过 **ReadIndex**（已实现算法）：
+  1. 记下请求时刻的 `commit_index` 作为**读目标**；
+  2. 立刻发起一轮 heartbeat（AppendEntries），并给这一轮编号 `R`；
+  3. 只有当多数派确认了**不早于本次请求发起的那一轮**
+     （`peer_acked_round >= R`）时，才认为领导权仍然有效；
+  4. 等 `applied_index >= 读目标` 后，读本地已 apply 状态。
+- **为什么第 2/3 步不能省**：旧 leader 被分区后仍然认为自己是 leader。若复
+  用历史 ack、或只等一次"刚当选时的 no-op 已提交"，分区之后它就会继续放行
+  读，返回过期数据 —— 这就是 §10 里"stale leader 读"那条坑。回执只对
+  "发起时间晚于读请求"的那一轮计数，所以迟到的老回执不能当证据。为了让这条
+  规则可执行，AppendEntries 的**请求带轮号、响应原样回显**：leader 只把
+  `response.round` 记进 `peer_acked_round`，迟到的旧轮回执自然对不上新轮号。
+- **为什么不用"当前 term 的 no-op 已提交"当判据**：no-op 只在当选那一刻证明
+  一次领导权；之后的分区不会产生新 no-op，等它等于永远信任一张过期的证明。
+  no-op 仍然要保留，它的作用是让新 leader 能安全提交**上一个 term** 的日志。
+- **代价与后续优化**：现在是"每次读、每个 key 都要一整轮 heartbeat"。把同一
+  条语句 / 一个事务里的多个读合并成一次确认（read-index batching）需要时间
+  上界，要么用 lease（需要时钟假设），要么注入时钟，见 §11。
+- 等不到多数派 → 一整个 `election_timeout_ms` 之后返回 `Timeout`；
 - P3 才考虑 follower read / lease（不在范围内）。
 
 ### 5.3 幂等
@@ -306,9 +456,23 @@ peers   = 1@127.0.0.1:5434,2@127.0.0.1:5435,3@127.0.0.1:5436
 election_timeout_ms = 1000
 heartbeat_ms        = 100
 log_path            = ./sql_db_raft_log     # 单独的 LevelDB 存 raft 日志
-# 静态分片（P3 之前手写；之后交给 _meta group）
-shard.0 = ,+                                 # [空, +∞) = 全部
 ```
+
+**已落地**（`server/config.{h,cpp}`）：上面这些键都在内置默认值表里（默认
+`enabled = false`，因此不开 raft 时启动路径与以前完全一致），`ServerConfig`
+提供 `raft_enabled()/raft_node_id()/raft_peers()/raft_listen{,_host,_port}()/
+raft_election_timeout_ms()/raft_heartbeat_ms()/raft_log_path()`。
+
+`validate()` 的规则：
+
+- `heartbeat_ms < election_timeout_ms`（开着关着都检查）；
+- `peers` 只要非空就解析：`<node_id>@<host>:<port>`，id ≥ 1、端口 1..65535、
+  id 与 host:port 都不能重复（**关闭状态也查**，免得拼错藏到打开那天）；
+- `enabled = true` 时额外要求：`peers` 非空、`node_id` 出现在 `peers` 里、
+  `listen` 形如 `host:port`、`log_path` 非空。
+
+静态分片（`shard.N = <start>,<end>`）还没做：P1 只有一个 group，P2 再引入
+静态 range 表并**写死 `@system/*` 落 0 号组**（§2.2）。
 
 ## 8. 复用清单（不重造轮子）
 
@@ -326,15 +490,20 @@ shard.0 = ,+                                 # [空, +∞) = 全部
 
 ## 9. 分阶段计划
 
-| 阶段 | 内容 | 验证方式 |
-|------|------|----------|
-| **P0** | raft 核心：选举 / 日志复制 / 提交 / apply / 快照；**in-proc transport + 可注入假时钟** | 单测：正常路径、分区、丢消息、乱序、重启、单节点→三节点。**沙箱内可全绿**（不碰 socket） |
-| **P1** | 单 group 打通 SQL：`RaftKVStore` + 静态 placement（1 节点 → 3 节点）+ leader-only 读写 + read-index + 幂等 id | `test_raft` + 端到端：SQL 跑在 raft 上，杀掉 leader 后能重新选主并继续 |
-| **P2** | 多 group：按表分片；`@system/*` 落 0 号组；每 group 独立 leader；**写事务跨组拒绝 + `strict`/`loose` 模式 + `CLIENT_OPTIONS` 帧**（§3.3/§3.4） | 两表并发写互不阻塞；写事务跨组报明确错误；`--cross-group-read=loose` 下 `BEGIN; SELECT a; SELECT b; COMMIT` 能跑，`strict`（默认）下报错 |
-| **P3** | `_meta` group 管 placement、**表级 split/merge**、成员变更、follower read / lease | 需另行设计（本文档不含） |
+| 阶段 | 内容 | 验证方式 | 状态 |
+|------|------|----------|------|
+| **P0** | raft 核心：选举 / 日志复制 / 提交 / apply / 快照；**in-proc transport + 可注入假时钟** | 单测：正常路径、分区、丢消息、乱序、重启、单节点→三节点。**沙箱内可全绿**（不碰 socket） | 已落地 |
+| **P1a** | 单 group 适配层：`RaftKVStore` / `RaftKVEngine`、**ReadIndex 读屏障**、组内写槽、proposal 幂等 id、超时与错误映射 | `test_raft` 的 `RaftKVAdapter` 套件（单节点读写/事务/回滚/写槽、三节点复制、follower `NotLeader`、分区 leader 超时） | 已落地 |
+| **P1b** | RaftRuntime 线程模型（`ServiceThread` 驱动 tick/消息/apply）、RPC 编解码、`[raft]` 配置、生产 transport（svrkit 独立端口）、server 入口接线、leader hint 回客户端 | 端到端：SQL 跑在 raft 上，杀掉 leader 后能重新选主并继续 | 已落地（单节点重启持久化 + 三节点真实 socket 选举/复制都有测试；leader hint 未做） |
+| **P2** | 多 group：按表分片；`@system/*` 落 0 号组；每 group 独立 leader；**写事务跨组拒绝 + `strict`/`loose` 模式 + `CLIENT_OPTIONS` 帧**（§3.3/§3.4） | 两表并发写互不阻塞；写事务跨组报明确错误；`--cross-group-read=loose` 下 `BEGIN; SELECT a; SELECT b; COMMIT` 能跑，`strict`（默认）下报错 | 未开始 |
+| **P3** | `_meta` group 管 placement、**表级 split/merge**、成员变更、follower read / lease | 需另行设计（本文档不含） | 未开始 |
 
 **从 P0 开始**：它不碰 SQL、能确定性测试、沙箱里也能全绿，而且 P0 定下的
 `LogStore` / `StateMachine` / `Transport` 三个接口决定 P1 顺不顺。
+
+P1 拆成 a/b 两段的理由：a 段的接口和语义能在**单线程 + in-proc transport**
+下全部验证完（今天已经做到）；b 段一引入线程，`RaftNode` 的"单线程调用"
+前提就变成硬约束，必须和 runtime 一起设计，不能先把 adapter 接进 server。
 
 ## 10. 坑（按危险程度）
 
@@ -358,6 +527,32 @@ shard.0 = ,+                                 # [空, +∞) = 全部
 10. **跨组检查要在语句执行前做**，且强制点在 `RaftKVEngine`（它才知道 group
     边界）；放到 SQL 层去判断会漏掉 `@system/*` 那张路由表，也会让"读过哪些
     group"这种状态多存一份。
+11. **ReadIndex 必须用"读请求之后发起的那一轮 heartbeat"确认领导权**。
+    复用历史回执、或只等"当选时的 no-op 提交"，都会让被分区的旧 leader
+    继续放行读（stale read）。测试：`IsolatedLeaderCannotServeReads`。
+12. **所有跨线程等待都必须有上限**。分区里的旧 leader 不会自己降级，
+    `wait()` 无超时 = session 永久挂死。测试：
+    `IsolatedLeaderFailsReadsAndWritesWithTimeout`。
+13. **proposal 超时 ≠ 写入失败**：日志条目可能稍后提交。重试必须复用同一个
+    `(client_id, request_id)`，靠状态机去重；否则一次超时重试就会重复执行。
+14. **`RaftKVStore::write_batch()` 必须拒绝**（`NotSupported`）。留一条绕过
+    propose 的 raw 写路径，就等于给复制留了一个静默的本地写后门。
+15. **adapter 不能自己起线程，也不能在 Raft 服务线程上阻塞等待 proposal**。
+    见 §4.3 的线程规则；这条在接 server 时最先被违反。
+16. **transport 线程只能 `post_message()`，不能直接 `handle_message()`**。
+    收到帧就内联处理 = 网络线程和 Raft 服务线程同时碰 `RaftNode`，而且会把
+    慢盘/慢 apply 反压到网络线程上。
+17. **`[raft] enabled = true` 在没有接线时必须报错退出**。配置解析通过不代表
+    复制真的生效；静默降级成"只写本地"是最坏的一种 bug（用户以为写被复制了）。
+    （接线已落地，这条现在只约束"部分接线"的未来改动：宁可启动失败。）
+18. **transport 的每个方向各一条连接**：不要为了省 fd 去让接收线程在别人的
+    Loop 上写 —— 那会把"每条 fd 单线程拥有"这条不变量打破，跨线程写 socket
+    是最难查的一类竞态。
+19. **`client_id` 必须跨重启唯一**（现在用进程随机盐）。幂等结果表是持久的，
+    id 重复会让重启后的新写被当成旧请求重放而静默跳过 —— 表现为"写返回成功但
+    数据没变"。
+20. **启动顺序不能反**：`RaftNode::start()`（装 transport 回调）必须发生在
+    inbound 线程启动之前，否则第一批消息会因为回调还没装好而丢掉。
 
 ## 11. 未决 / 后续
 
@@ -372,3 +567,22 @@ shard.0 = ,+                                 # [空, +∞) = 全部
 - P3 的 follower read / lease 是否需要，取决于读放大是否成为瓶颈。
 - 表级 split/merge 之后，"一个事务只碰一个 group"的规则要重新审视
   （同一个表跨两个 group 就重新变成跨组事务了）。
+- **read-index 合并 / lease**：现在每个 key 一次确认，读放大明显。合并成
+  "每条语句一次"需要时间上界（lease + 时钟假设，或注入时钟），
+  是 P1b 之后性能相关的第一件事。
+- **结构化错误**：`NotLeader` 需要带 leader hint，`CrossGroupTransaction`
+  需要带两个 group id，但现在只有 `kv::Status` 枚举。要么扩错误类型
+  （`StatusInfo`），要么在 ERROR 帧里另带字段。
+- **`RaftRuntime` 的细节**：已确定"一个服务线程 + 阻塞提交 + 投递"三条规则
+  （§4.4）；还没定的是 apply 是否单独一条线程（现在 apply 就在服务线程上，
+  `remove_range` 这类慢操作会把心跳挡住），以及 proposal 队列要不要按组拆分。
+- **transport 的运维语义**：断线重连是"退避 + 重发未写字节"，没有实现连接
+  保活/半开检测（对端进程僵死时只能靠写失败发现），也没有压测过 N 较大时的
+  连接数（现在是 N×(N-1) 条）；要不要做多路复用留到有实测需求时再定。
+- **`NotLeader` 的 leader hint 与重试**：现在客户端只看到
+  `NotLeader` 文本错误，没有 hint，也没有 server 代转。
+- **proposal 等待上限可配置**：现在借用 `election_timeout_ms`，将来应该有
+  独立的 `raft.proposal_timeout_ms`，并区分"读超时"和"写超时"。
+- **affected rows / apply 结果与幂等结果的原子性**：现在 `apply_result` 固定是
+  `"applied"`；一旦要做成真实 affected rows，就得和 request result 一起原子
+  落盘，否则重启重放会给出不一致的返回值。

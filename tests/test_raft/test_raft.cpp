@@ -1,6 +1,6 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
-#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -8,10 +8,11 @@
 #include <vector>
 #include <unistd.h>
 
-#include "raft/memory_log_store.h"
 #include "raft/kv_state_machine.h"
+#include "raft/memory_log_store.h"
 #include "raft/proposal_payload.h"
 #include "raft/raft_node.h"
+#include "raft_test_net.h"
 #include "storage/kv_engine/kv_factory.h"
 #include "test_framework.h"
 
@@ -23,67 +24,9 @@
 namespace {
 
 using raft::NodeId;
-
-class ManualClock final : public raft::Clock {
-public:
-  uint64_t now_ms() const override { return now_; }
-  void advance(uint64_t ms) { now_ += ms; }
-
-private:
-  uint64_t now_ = 0;
-};
-
-class TestNetwork {
-public:
-  struct QueuedMessage {
-    NodeId from;
-    NodeId to;
-    raft::Message message;
-  };
-
-  void bind(NodeId id, raft::RaftNode *node) { nodes_[id] = node; }
-
-  void enqueue(NodeId from, NodeId to, raft::Message message) {
-    messages_.push_back(
-        QueuedMessage{from, to, std::move(message)});
-  }
-
-  void deliver_all(size_t limit = 10000) {
-    while (!messages_.empty() && limit-- > 0) {
-      const QueuedMessage item = std::move(messages_.front());
-      messages_.pop_front();
-      const auto it = nodes_.find(item.to);
-      if (it != nodes_.end()) {
-        it->second->handle_message(item.from, item.message);
-      }
-    }
-    CHECK_TRUE(messages_.empty());
-  }
-
-private:
-  std::map<NodeId, raft::RaftNode *> nodes_;
-  std::deque<QueuedMessage> messages_;
-};
-
-class TestTransport final : public raft::Transport {
-public:
-  TestTransport(NodeId sender, TestNetwork &network)
-      : sender_(sender), network_(network) {}
-
-  void send(NodeId to, const raft::Message &message) override {
-    network_.enqueue(sender_, to, message);
-  }
-
-  void on_message(
-      std::function<void(NodeId, const raft::Message &)>) override {
-    // Tests deliver messages directly through TestNetwork. This keeps message
-    // handling queued rather than re-entering RaftNode inside send().
-  }
-
-private:
-  NodeId sender_;
-  TestNetwork &network_;
-};
+using raft_test::ManualClock;
+using raft_test::TestNetwork;
+using raft_test::TestTransport;
 
 class RecordingStateMachine final : public raft::StateMachine {
 public:
@@ -148,6 +91,19 @@ public:
     network_.deliver_all();
   }
 
+  void tick_one(NodeId id, uint64_t ms = 10) {
+    clock_.advance(ms);
+    nodes_.at(id)->node->tick();
+  }
+
+  void deliver_messages() { network_.deliver_all(); }
+
+  void block(NodeId id) { network_.block(id); }
+  void unblock(NodeId id) { network_.unblock(id); }
+  void hold(NodeId from, NodeId to) { network_.hold(from, to); }
+  size_t held_count() const { return network_.held_count(); }
+  void release_held(size_t count = 1) { network_.release_held(count); }
+
   raft::RaftNode *leader() const {
     raft::RaftNode *found = nullptr;
     for (const auto &[id, test_node] : nodes_) {
@@ -179,7 +135,10 @@ public:
   TempDirectory() {
     const auto base = std::filesystem::temp_directory_path() /
                       ("sqldb-raft-test-XXXXXX");
-    std::vector<char> buffer(base.string().begin(), base.string().end());
+    // Keep one string: begin()/end() from two different temporaries would be
+    // unrelated iterators (libc++ turns that into length_error("vector")).
+    const std::string base_string = base.string();
+    std::vector<char> buffer(base_string.begin(), base_string.end());
     buffer.push_back('\0');
     if (::mkdtemp(buffer.data()) == nullptr) {
       return;
@@ -417,10 +376,19 @@ TEST(RaftCore, ThreeNodesElectReplicateCommitAndApply) {
   CHECK_TRUE(proposal.has_value());
   CHECK_EQ(proposal->index, 2);
   CHECK_FALSE(proposal->committed);
+  CHECK_FALSE(proposal->done());
+  auto timeout = proposal->wait_for(std::chrono::milliseconds{1});
+  CHECK_FALSE(timeout.has_value());
+  CHECK_EQ(timeout.error().code, raft::ErrorCode::Timeout);
 
   for (int i = 0; i < 10; ++i) {
     cluster.step();
   }
+
+  auto committed = proposal->wait();
+  CHECK_TRUE(committed.has_value());
+  CHECK_TRUE(committed->committed);
+  CHECK_STREQ(committed->apply_result, "alpha");
 
   for (const NodeId id :
        std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}}) {
@@ -431,6 +399,234 @@ TEST(RaftCore, ThreeNodesElectReplicateCommitAndApply) {
     CHECK_TRUE(cluster.test_node(id).state_machine.contains("alpha"));
     CHECK_FALSE(node->last_error().has_value());
   }
+}
+
+TEST(RaftCore, ProposalWaitsThroughLeadershipLoss) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *leader = cluster.leader();
+  CHECK_NOT_NULL(leader);
+  auto proposal = leader->propose("lost");
+  CHECK_TRUE(proposal.has_value());
+  CHECK_FALSE(proposal->done());
+
+  leader->handle_message(
+      NodeId{3},
+      raft::AppendEntriesRequest{
+          leader->term() + 1, NodeId{3}, 0, 0, {}, 0});
+
+  auto result = proposal->wait_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::NotLeader);
+}
+
+TEST(RaftCore, ProposalReportsStateMachineFailure) {
+  class FailingStateMachine final : public raft::StateMachine {
+  public:
+    std::expected<std::string, raft::Error>
+    apply(const raft::LogEntry &entry) override {
+      if (entry.data.empty()) {
+        return std::string{"noop"};
+      }
+      return std::unexpected(
+          raft::Error{raft::ErrorCode::IOError, "injected apply failure"});
+    }
+
+    std::expected<std::string, raft::Error>
+    snapshot(kv::KeyRange) override {
+      return std::string{};
+    }
+
+    std::expected<void, raft::Error> restore(std::string_view) override {
+      return {};
+    }
+  };
+
+  ManualClock clock;
+  TestNetwork network;
+  raft::MemoryLogStore log;
+  FailingStateMachine state_machine;
+  TestTransport transport(NodeId{1}, network);
+  raft::RaftNode node(
+      raft::NodeConfig{
+          NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100, 10},
+      log, transport, state_machine, clock);
+  CHECK_TRUE(node.start().has_value());
+  clock.advance(200);
+  node.tick();
+  CHECK_TRUE(node.is_leader());
+
+  auto proposal = node.propose("will-fail");
+  CHECK_TRUE(proposal.has_value());
+  auto result = proposal->wait_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::IOError);
+  CHECK_STREQ(result.error().message, "injected apply failure");
+}
+
+TEST(RaftCore, ReadBarrierWaitsForQuorumConfirmation) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+
+  for (int i = 0; i < 15; ++i) {
+    cluster.tick_one(NodeId{1});
+  }
+
+  raft::RaftNode *leader = cluster.node(NodeId{1});
+  leader->handle_message(
+      NodeId{2}, raft::RequestVoteResponse{leader->term(), true});
+  leader->handle_message(
+      NodeId{3}, raft::RequestVoteResponse{leader->term(), true});
+  CHECK_TRUE(leader->is_leader());
+
+  // A fresh leader has not committed anything yet: the read index is the
+  // commit index at request time, and serving it still requires a heartbeat
+  // round that starts after the request.
+  auto read_index = leader->read_barrier();
+  CHECK_TRUE(read_index.has_value());
+  CHECK_EQ(read_index->index, uint64_t{0});
+  CHECK_FALSE(read_index->done());
+
+  auto timeout = read_index->wait_for(std::chrono::milliseconds{1});
+  CHECK_FALSE(timeout.has_value());
+  CHECK_EQ(timeout.error().code, raft::ErrorCode::Timeout);
+
+  cluster.deliver_messages();
+  auto ready = read_index->wait_for(std::chrono::milliseconds{100});
+  CHECK_TRUE(ready.has_value());
+  CHECK_EQ(ready->index, uint64_t{0});
+}
+
+TEST(RaftCore, ReadBarrierIsImmediateOnSingleNode) {
+  TestCluster cluster(std::vector<NodeId>{NodeId{1}});
+  cluster.start();
+  cluster.step(200);
+  CHECK_TRUE(cluster.node(NodeId{1})->is_leader());
+
+  auto read_index = cluster.node(NodeId{1})->read_barrier();
+  CHECK_TRUE(read_index.has_value());
+  CHECK_TRUE(read_index->done());
+  CHECK_EQ(read_index->index, cluster.node(NodeId{1})->commit_index());
+}
+
+TEST(RaftCore, ReadBarrierIgnoresStaleAcknowledgements) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *leader = cluster.leader();
+  CHECK_NOT_NULL(leader);
+  const NodeId leader_id = leader->node_id();
+
+  std::vector<NodeId> followers;
+  for (const NodeId id : std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}}) {
+    if (id != leader_id) {
+      followers.push_back(id);
+    }
+  }
+  // Delay both followers' responses: their requests are delivered, their
+  // acknowledgements are parked for a later replay.
+  for (const NodeId id : followers) {
+    cluster.hold(id, leader_id);
+  }
+
+  auto first = leader->read_barrier();
+  CHECK_TRUE(first.has_value());
+  cluster.deliver_messages();
+  CHECK_EQ(cluster.held_count(), size_t{2});
+  CHECK_FALSE(first->done());
+
+  auto second = leader->read_barrier();
+  CHECK_TRUE(second.has_value());
+  cluster.deliver_messages();
+  CHECK_EQ(cluster.held_count(), size_t{4});
+  CHECK_FALSE(second->done());
+
+  // Replaying one first-round acknowledgement satisfies the first barrier
+  // only. Crediting it to the second barrier would be exactly the stale-ack
+  // bug: it was produced before that read request existed.
+  cluster.release_held(1);
+  CHECK_TRUE(first->done());
+  CHECK_FALSE(second->done());
+
+  cluster.release_held(3);
+  CHECK_TRUE(second->done());
+}
+
+TEST(RaftCore, IsolatedLeaderCannotServeReads) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *leader = cluster.leader();
+  CHECK_NOT_NULL(leader);
+  const uint64_t committed_before = leader->commit_index();
+
+  // The leader still thinks it leads, but a partition means the heartbeat
+  // round can never be acknowledged by a majority. Reads must not be served
+  // from this stale state.
+  cluster.block(leader->node_id());
+  auto read_index = leader->read_barrier();
+  CHECK_TRUE(read_index.has_value());
+  CHECK_EQ(read_index->index, committed_before);
+  auto result = read_index->wait_for(std::chrono::milliseconds{10});
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::Timeout);
+}
+
+TEST(RaftCore, ReadBarrierFailsOnLeadershipLoss) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+
+  for (int i = 0; i < 15; ++i) {
+    cluster.tick_one(NodeId{1});
+  }
+  raft::RaftNode *leader = cluster.node(NodeId{1});
+  leader->handle_message(
+      NodeId{2}, raft::RequestVoteResponse{leader->term(), true});
+  leader->handle_message(
+      NodeId{3}, raft::RequestVoteResponse{leader->term(), true});
+
+  auto read_index = leader->read_barrier();
+  CHECK_TRUE(read_index.has_value());
+  CHECK_FALSE(read_index->done());
+
+  leader->handle_message(
+      NodeId{3},
+      raft::AppendEntriesRequest{
+          leader->term() + 1, NodeId{3}, 0, 0, {}, 0});
+
+  auto result = read_index->wait_for(std::chrono::milliseconds{100});
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::NotLeader);
+}
+
+TEST(RaftCore, FollowerReadBarrierReturnsNotLeader) {
+  TestCluster cluster(
+      std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  for (int i = 0; i < 20; ++i) {
+    cluster.step();
+  }
+
+  raft::RaftNode *follower = cluster.node(NodeId{2});
+  CHECK_FALSE(follower->is_leader());
+  auto result = follower->read_barrier();
+  CHECK_FALSE(result.has_value());
+  CHECK_EQ(result.error().code, raft::ErrorCode::NotLeader);
 }
 
 TEST(RaftCore, FollowerRejectsProposal) {

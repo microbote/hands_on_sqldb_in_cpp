@@ -16,6 +16,7 @@
 
 #include "config.h"
 #include "logger.h"
+#include "raft_bootstrap.h"
 #include "server.h"
 #include "storage/kv_engine/kv_factory.h"
 
@@ -94,6 +95,29 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  // [raft] 的配置项（含校验）已经落地，但 P1b 的接线尚未完成：把存储切到
+  // Raft 需要先有生产 transport 与 RaftRuntime 的启动/关闭顺序。这里**故意
+  // 硬失败**，而不是静默继续跑本地存储 —— 否则用户会以为写已经被复制了。
+  //
+  // 接线时的顺序（见 raft/codex_glm53_validate_design.md 的生命周期一节）：
+  //   logger -> 本地 KVStore -> Raft LogStore -> StateMachine/RequestResultStore
+  //   -> Transport -> RaftRuntime -> RaftKVStore -> Server(raft_store)
+  // 退出顺序反过来：停 accept -> 停 raft -> 落盘/关 LogStore -> 关本地 store。
+  if (config->raft_enabled()) {
+#if !defined(SQLDB_HAVE_LEVELDB)
+    fmt::print(stderr, "配置错误: raft.enabled = true 需要带 leveldb 的构建\n");
+    return 2;
+#endif
+  }
+
+  // 日志接收端：level 非法 / 文件打不开都在这里拦下（启动期失败，别静默）。
+  // 放在打开存储之前：Raft 的恢复/选主日志同样重要，而这些步骤紧跟着来。
+  auto logger = server::Logger::create(config->log_level(), config->log_file());
+  if (!logger.has_value()) {
+    fmt::print(stderr, "日志初始化失败: {}\n", logger.error());
+    return 2;
+  }
+
   const std::string engine = config->engine();
   kv::DatabaseOptions options;
   options.set_path(config->path())
@@ -107,14 +131,24 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // 日志接收端：level 非法 / 文件打不开都在这里拦下（启动期失败，别静默）
-  auto logger = server::Logger::create(config->log_level(), config->log_file());
-  if (!logger.has_value()) {
-    fmt::print(stderr, "日志初始化失败: {}\n", logger.error());
-    return 2;
+  // raft.enabled：本地 store 作为状态机，外面再包一层 Raft。
+  // 顺序见 raft/codex_glm53_validate_design.md 的生命周期一节。
+  std::shared_ptr<kv::KVStore> sql_store = store;
+#if defined(SQLDB_HAVE_LEVELDB)
+  std::unique_ptr<server::RaftBootstrap> raft;
+  if (config->raft_enabled()) {
+    auto created =
+        server::RaftBootstrap::open(*config, store, **logger);
+    if (!created.has_value()) {
+      fmt::print(stderr, "启动 Raft 失败: {}\n", created.error());
+      return 1;
+    }
+    raft = std::move(*created);
+    sql_store = raft->store();
   }
+#endif
 
-  server::Server server(*config, store, *logger);
+  server::Server server(*config, sql_store, *logger);
   if (auto ok = server.listen(); !ok.has_value()) {
     fmt::print(stderr, "监听失败: {}\n", ok.error());
     return 1;
@@ -125,14 +159,24 @@ int main(int argc, char **argv) {
 
   fmt::print(stderr, "sqldb-server 正在监听 {} (engine={}, path={})\n",
              config->listen(), engine, config->path());
+  if (config->raft_enabled()) {
+    fmt::print(stderr, "raft: node_id={} listen={} (group size={})\n",
+               config->raft_node_id(), config->raft_listen(),
+               config->raft_peers().size());
+  }
   if (!config->log_file().empty()) {
     fmt::print(stderr, "日志级别 {} -> {}\n", config->log_level(),
                config->log_file());
   }
   server.run();
 
-  // 收尾：连接都退出了才能关存储（还有活跃快照时 close() 会返回 Busy）
-  const kv::Status closed = store->close();
+  // 收尾：连接都退出了才能关 raft/存储（还有活跃快照时 close() 会返回 Busy）
+#if defined(SQLDB_HAVE_LEVELDB)
+  if (raft != nullptr) {
+    raft->stop();
+  }
+#endif
+  const kv::Status closed = sql_store->close();
   if (closed != kv::Status::OK) {
     fmt::print(stderr, "关闭存储未完成: {}\n", kv::status_to_string(closed));
     return 1;

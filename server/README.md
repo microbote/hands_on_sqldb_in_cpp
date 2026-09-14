@@ -36,6 +36,18 @@ sqldb-server [--config=PATH] [--listen=HOST:PORT] [-h|--help]
 里拼错的 key 启动时被 `validate()` 拦下并报字段名。全部字段见
 `etc/sqldb-server.conf`（带注释），这里只说日志。
 
+`[raft]` 段已接线（默认 `enabled = false`，字段与校验见 `raft/DESIGN.md`
+§7）：改成 `true` 后 server 会把存储换成 Raft —— 本地 LevelDB 当状态机，
+Raft 日志/幂等结果放 `log_path/{log,request_results}`，SQL 连接照旧只看到
+`kv::KVStore`。几个要知道的点：
+
+- 需要带 LevelDB 的构建（默认就是）；
+- 每个节点用同一份静态 `peers`，`node_id` 必须在其中；单成员组不监听端口；
+- follower 上的读/写会返回 `NotLeader`（ERROR 帧里就是这串文字，暂不带
+  leader hint）；
+- 关闭顺序由 `server/raft_bootstrap` 保证：先停 SQL、再停定时器/transport/
+  raft 服务线程、最后关两个 LevelDB。
+
 ## 日志
 
 两个键，都在 `[server]`：

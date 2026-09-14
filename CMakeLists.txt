@@ -180,6 +180,11 @@ endif()
 # ============================================================
 add_library(sql_raft STATIC
     raft/kv_state_machine.cpp
+    raft/message_codec.cpp
+    raft/peers.cpp
+    raft/raft_kv_store.cpp
+    raft/raft_runtime.cpp
+    raft/tcp_transport.cpp
     raft/proposal_payload.cpp
     raft/raft_node.cpp
 )
@@ -190,6 +195,7 @@ target_include_directories(sql_raft PUBLIC
 
 target_link_libraries(sql_raft PUBLIC
     sql_kv
+    svrkit
 )
 
 if(LEVELDB_INCLUDE_DIR AND LEVELDB_LIBRARY)
@@ -338,6 +344,7 @@ target_compile_features(common_proto PUBLIC cxx_std_23)
 add_library(sql_server STATIC
     server/config.cpp
     server/logger.cpp
+    server/raft_bootstrap.cpp
     server/server.cpp
 )
 
@@ -349,6 +356,7 @@ target_include_directories(sql_server PUBLIC
 target_link_libraries(sql_server PUBLIC
     sql_session
     sql_kv
+    sql_raft
     common_proto
     svrkit
     fmt::fmt

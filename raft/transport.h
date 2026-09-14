@@ -30,12 +30,17 @@ struct AppendEntriesRequest {
   uint64_t prev_log_term = 0;
   std::vector<LogEntryMessage> entries;
   uint64_t leader_commit = kInvalidIndex;
+  // Heartbeat round this request belongs to, echoed back in the response so
+  // that read-index confirmation can only be credited to the round that
+  // actually produced it. 0 means "no read-index round".
+  uint64_t round = 0;
 };
 
 struct AppendEntriesResponse {
   uint64_t term = 0;
   bool success = false;
   uint64_t match_index = kInvalidIndex;
+  uint64_t round = 0;
 };
 
 using Message = std::variant<RequestVoteRequest, RequestVoteResponse,

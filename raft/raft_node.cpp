@@ -69,6 +69,9 @@ std::expected<void, Error> RaftNode::start() {
   role_ = Role::Follower;
   leader_id_.reset();
   votes_received_.clear();
+  heartbeat_round_ = 0;
+  peer_acked_round_.clear();
+  pending_read_barriers_.clear();
   reset_election_deadline();
 
   transport_.on_message(
@@ -112,13 +115,43 @@ std::expected<Proposal, Error> RaftNode::propose(std::string data) {
   match_index_[config_.node_id] = index;
   next_index_[config_.node_id] = index + 1;
 
+  Proposal proposal{index, hard_state_.term, entry.data, false, {},
+                    std::make_shared<ProposalCompletion>()};
+  pending_proposals_[index] = proposal.completion;
+
   if (auto result = advance_commit(); !result.has_value()) {
-    return std::unexpected(result.error());
+    record_error(result.error());
   }
   send_heartbeats();
 
-  return Proposal{index, hard_state_.term, entry.data,
-                  index <= commit_index_};
+  proposal.committed = index <= commit_index_;
+  return proposal;
+}
+
+std::expected<ReadIndex, Error> RaftNode::read_barrier() {
+  if (role_ != Role::Leader) {
+    return std::unexpected(
+        Error{ErrorCode::NotLeader, "read barrier requires the leader role"});
+  }
+
+  // ReadIndex: the read must see every entry that was committed before the
+  // request arrived, so remember the commit index now. Proving leadership
+  // needs a heartbeat round started *after* this point: acks that were already
+  // in flight may predate a partition, and therefore cannot be used.
+  const uint64_t target = commit_index_;
+  send_heartbeats();
+  const uint64_t round = heartbeat_round_;
+
+  ReadIndex read_index{target, hard_state_.term,
+                       std::make_shared<Completion>()};
+  if (quorum_acknowledged(round) && last_applied_ >= target) {
+    read_index.completion->finish(std::nullopt, {});
+    return read_index;
+  }
+
+  pending_read_barriers_.push_back(
+      PendingReadBarrier{round, target, read_index.completion});
+  return read_index;
 }
 
 void RaftNode::handle_message(NodeId from, const Message &message) {
@@ -218,6 +251,7 @@ std::expected<void, Error> RaftNode::become_leader() {
 
 std::expected<void, Error>
 RaftNode::become_follower(uint64_t term, std::optional<NodeId> leader_id) {
+  const Role old_role = role_;
   if (term > hard_state_.term) {
     const HardState old_hard_state = hard_state_;
     hard_state_.term = term;
@@ -230,6 +264,14 @@ RaftNode::become_follower(uint64_t term, std::optional<NodeId> leader_id) {
   }
 
   role_ = Role::Follower;
+  if (old_role == Role::Leader) {
+    fail_pending_proposals(std::nullopt,
+                           Error{ErrorCode::NotLeader,
+                                 "leadership was lost before commit"});
+    fail_read_barriers(Error{
+        ErrorCode::NotLeader,
+        "leadership was lost before the read barrier completed"});
+  }
   leader_id_ = std::move(leader_id);
   votes_received_.clear();
   reset_election_deadline();
@@ -303,7 +345,8 @@ std::expected<void, Error>
 RaftNode::handle_append_entries(NodeId from,
                                 const AppendEntriesRequest &request) {
   if (request.term < hard_state_.term) {
-    transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0});
+    transport_.send(
+        from, AppendEntriesResponse{hard_state_.term, false, 0, request.round});
     return {};
   }
 
@@ -319,7 +362,8 @@ RaftNode::handle_append_entries(NodeId from,
   }
 
   if (request.prev_log_index > last_log_index_) {
-    transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0});
+    transport_.send(
+        from, AppendEntriesResponse{hard_state_.term, false, 0, request.round});
     return {};
   }
 
@@ -329,8 +373,8 @@ RaftNode::handle_append_entries(NodeId from,
       return std::unexpected(prev.error());
     }
     if (prev->term != request.prev_log_term) {
-      transport_.send(
-          from, AppendEntriesResponse{hard_state_.term, false, 0});
+      transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
+                                                  request.round});
       return {};
     }
   }
@@ -357,6 +401,10 @@ RaftNode::handle_append_entries(NodeId from,
           return std::unexpected(result.error());
         }
         last_log_index_ = index - 1;
+        fail_pending_proposals(
+            index,
+            Error{ErrorCode::NotLeader,
+                  "proposal log suffix was truncated by a new leader"});
       } else if (existing->data != entry.data) {
         return std::unexpected(Error{
             ErrorCode::InternalError,
@@ -379,7 +427,8 @@ RaftNode::handle_append_entries(NodeId from,
 
   auto apply_result = apply_committed();
   transport_.send(
-      from, AppendEntriesResponse{hard_state_.term, true, match_index});
+      from, AppendEntriesResponse{hard_state_.term, true, match_index,
+                                  request.round});
   if (!apply_result.has_value()) {
     return std::unexpected(apply_result.error());
   }
@@ -403,12 +452,16 @@ void RaftNode::handle_append_entries_response(
     match_index_[from] = std::max(match_index_[from], response.match_index);
     next_index_[from] = std::max(next_index_[from],
                                   match_index_[from] + 1);
+    peer_acked_round_[from] =
+        std::max(peer_acked_round_[from], response.round);
 
     const uint64_t old_commit = commit_index_;
     if (auto result = advance_commit(); !result.has_value()) {
       record_error(result.error());
       return;
     }
+
+    evaluate_read_barriers();
 
     if (match_index_[from] < last_log_index_ || commit_index_ != old_commit) {
       if (auto result = send_append_entries(from); !result.has_value()) {
@@ -452,6 +505,10 @@ std::expected<void, Error> RaftNode::send_append_entries(NodeId to) {
   request.prev_log_term = prev_term;
   request.leader_commit = commit_index_;
 
+  // Carry the round so the response can be credited to exactly the round that
+  // produced it; retries reuse the round of their batch.
+  request.round = heartbeat_round_;
+
   for (uint64_t index = next; index <= last_log_index_; ++index) {
     auto entry = log_store_.at(index);
     if (!entry.has_value()) {
@@ -465,6 +522,7 @@ std::expected<void, Error> RaftNode::send_append_entries(NodeId to) {
 }
 
 void RaftNode::send_heartbeats() {
+  ++heartbeat_round_;
   for (const NodeId peer : config_.peers) {
     if (peer == config_.node_id) {
       continue;
@@ -509,11 +567,82 @@ std::expected<void, Error> RaftNode::apply_committed() {
     }
     auto result = state_machine_.apply(*entry);
     if (!result.has_value()) {
+      fail_pending_proposals(last_applied_ + 1, result.error());
+      fail_read_barriers(result.error());
       return std::unexpected(result.error());
     }
     ++last_applied_;
+    complete_applied_proposal(last_applied_, *result);
   }
+  evaluate_read_barriers();
   return {};
+}
+
+void RaftNode::complete_applied_proposal(
+    uint64_t index, const std::string &apply_result) {
+  const auto it = pending_proposals_.find(index);
+  if (it == pending_proposals_.end()) {
+    return;
+  }
+  auto completion = std::move(it->second);
+  pending_proposals_.erase(it);
+  completion->finish(std::nullopt, apply_result);
+}
+
+void RaftNode::fail_pending_proposals(std::optional<uint64_t> from_index,
+                                      Error error) {
+  std::vector<std::shared_ptr<ProposalCompletion>> completions;
+  for (auto it = pending_proposals_.begin();
+       it != pending_proposals_.end();) {
+    if (!from_index.has_value() || it->first >= *from_index) {
+      completions.push_back(std::move(it->second));
+      it = pending_proposals_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto &completion : completions) {
+    completion->finish(error, {});
+  }
+}
+
+void RaftNode::evaluate_read_barriers() {
+  for (auto it = pending_read_barriers_.begin();
+       it != pending_read_barriers_.end();) {
+    if (quorum_acknowledged(it->round) && last_applied_ >= it->target_index) {
+      auto completion = std::move(it->completion);
+      it = pending_read_barriers_.erase(it);
+      completion->finish(std::nullopt, {});
+    } else {
+      ++it;
+    }
+  }
+}
+
+void RaftNode::fail_read_barriers(Error error) {
+  std::vector<std::shared_ptr<Completion>> completions;
+  completions.reserve(pending_read_barriers_.size());
+  for (auto &entry : pending_read_barriers_) {
+    completions.push_back(std::move(entry.completion));
+  }
+  pending_read_barriers_.clear();
+  for (auto &completion : completions) {
+    completion->finish(error, {});
+  }
+}
+
+bool RaftNode::quorum_acknowledged(uint64_t round) const {
+  size_t acknowledged = 1; // The leader itself is always up to date.
+  for (const NodeId peer : config_.peers) {
+    if (peer == config_.node_id) {
+      continue;
+    }
+    const auto acked = peer_acked_round_.find(peer);
+    if (acked != peer_acked_round_.end() && acked->second >= round) {
+      ++acknowledged;
+    }
+  }
+  return has_quorum(acknowledged);
 }
 
 std::expected<uint64_t, Error> RaftNode::last_log_term() const {
@@ -558,6 +687,8 @@ bool RaftNode::has_quorum(size_t count) const {
 void RaftNode::initialize_leader_progress() {
   next_index_.clear();
   match_index_.clear();
+  peer_acked_round_.clear();
+  heartbeat_round_ = 0;
   for (const NodeId peer : config_.peers) {
     next_index_[peer] = last_log_index_ + 1;
     match_index_[peer] = peer == config_.node_id ? last_log_index_ : 0;

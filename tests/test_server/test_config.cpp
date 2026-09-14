@@ -164,6 +164,110 @@ TEST(Config, MissingFileIsReported) {
 }
 
 // ============================================================
+// [raft]：默认关闭，打开时必须给全 node_id / peers / log_path
+// ============================================================
+TEST(Config, RaftIsDisabledByDefault) {
+  auto config = server::parse_config("");
+  CHECK(config.has_value());
+  if (!config.has_value()) {
+    return;
+  }
+  CHECK_TRUE(config->validate().has_value());
+  CHECK_FALSE(config->raft_enabled());
+  CHECK_EQ(config->raft_node_id(), uint64_t{1});
+  CHECK_EQ(config->raft_listen(), std::string("127.0.0.1:5434"));
+  CHECK_EQ(config->raft_listen_host(), std::string("127.0.0.1"));
+  CHECK_EQ(config->raft_listen_port(), std::string("5434"));
+  CHECK_EQ(config->raft_election_timeout_ms(), uint64_t{1000});
+  CHECK_EQ(config->raft_heartbeat_ms(), uint64_t{100});
+  CHECK_TRUE(config->raft_peers().empty());
+  CHECK_TRUE(config->raft_log_path().empty());
+}
+
+TEST(Config, RaftEnabledRequiresNodeIdPeersAndLogPath) {
+  // 打开 raft 但什么都不给：先被 peers 拦下。
+  CHECK_FALSE(parses_and_validates("[raft]\nenabled = true\n"));
+
+  // peers 里没有本节点的 node_id。
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+enabled = true
+node_id = 1
+peers = 2@127.0.0.1:5434
+log_path = ./raft_log
+)"));
+
+  // 少了 log_path（日志和业务数据必须分开存）。
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+enabled = true
+node_id = 1
+peers = 1@127.0.0.1:5434
+)"));
+
+  // listen 形状不对。
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+enabled = true
+node_id = 1
+listen = 5434
+peers = 1@127.0.0.1:5434
+log_path = ./raft_log
+)"));
+}
+
+TEST(Config, RaftEnabledAcceptsCompleteConfiguration) {
+  auto config = server::parse_config(R"(
+[raft]
+enabled = true
+node_id = 2
+listen = 127.0.0.1:5435
+peers = 1@127.0.0.1:5434, 2@127.0.0.1:5435, 3@127.0.0.1:5436
+log_path = ./sql_db_raft_log
+)");
+  CHECK(config.has_value());
+  if (!config.has_value()) {
+    return;
+  }
+  CHECK_TRUE(config->validate().has_value());
+  CHECK_TRUE(config->raft_enabled());
+  CHECK_EQ(config->raft_node_id(), uint64_t{2});
+  CHECK_EQ(config->raft_log_path(), std::string("./sql_db_raft_log"));
+
+  const auto peers = config->raft_peers();
+  CHECK_EQ(peers.size(), size_t{3});
+  if (peers.size() == 3) {
+    CHECK_EQ(peers[0].node_id.value, uint64_t{1});
+    CHECK_EQ(peers[0].port, uint16_t{5434});
+    CHECK_EQ(peers[2].node_id.value, uint64_t{3});
+    CHECK_EQ(peers[2].port, uint16_t{5436});
+  }
+}
+
+TEST(Config, RaftRejectsBadTimingAndMalformedPeers) {
+  // heartbeat 必须小于 election timeout（开着关着都拦）。
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+heartbeat_ms = 1000
+election_timeout_ms = 1000
+)"));
+
+  // peers 拼错不能等到打开 raft 那天才发现。
+  const auto config = server::parse_config(R"(
+[raft]
+peers = 1-127.0.0.1:5434
+)");
+  CHECK(config.has_value());
+  if (config.has_value()) {
+    const auto ok = config->validate();
+    CHECK_FALSE(ok.has_value());
+    if (!ok.has_value()) {
+      CHECK(ok.error().find("raft.peers") != std::string::npos);
+    }
+  }
+}
+
+// ============================================================
 // 示例配置 = 内置默认值：两份必须逐键相等
 //
 // server/etc/sqldb-server.conf 是给人看的（带注释）同时也是"文档里那份

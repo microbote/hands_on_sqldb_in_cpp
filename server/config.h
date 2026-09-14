@@ -30,7 +30,9 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include "raft/types.h"
 #include "sql_types/value.h"
 
 namespace server {
@@ -108,6 +110,18 @@ public:
 
   // [session]
   std::string default_database() const; // 新连接自动 USE（空 = 不 USE）
+
+  // [raft]（默认 enabled = false，启动路径与以前一致）
+  bool raft_enabled() const;
+  uint64_t raft_node_id() const;
+  std::string raft_listen() const;
+  std::string raft_listen_host() const;
+  std::string raft_listen_port() const;
+  // 静态成员表（校验过：非空、唯一、端口合法）
+  std::vector<raft::PeerConfig> raft_peers() const;
+  uint64_t raft_election_timeout_ms() const;
+  uint64_t raft_heartbeat_ms() const;
+  std::string raft_log_path() const;
 
 private:
   Config generic_;
