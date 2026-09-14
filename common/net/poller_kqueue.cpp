@@ -1,4 +1,4 @@
-// server/poller_kqueue.cpp —— kqueue 后端（macOS / *BSD）
+// common/net/poller_kqueue.cpp —— kqueue 后端（macOS / *BSD）
 #include "poller.h"
 
 #if defined(__APPLE__)
@@ -9,7 +9,7 @@
 #include <cerrno>
 #include <vector>
 
-namespace server {
+namespace common::net {
 namespace {
 
 class KqueuePoller final : public Poller {
@@ -126,6 +126,6 @@ std::unique_ptr<Poller> make_kqueue_poller() {
   return poller;
 }
 
-} // namespace server
+} // namespace common::net
 
 #endif // __APPLE__

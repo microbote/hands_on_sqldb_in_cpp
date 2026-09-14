@@ -11,7 +11,7 @@
 //      `WaitFd{fd<0}` 立刻 ready -> 协程在 while 里**忙等不让出**，整条事件
 //      循环被饿死（现象：连 SELECT 都拿不到回复，定时器也不走）；
 //   3. 对端已经消失时 `write()` 送的 SIGPIPE 按默认处置**杀掉整个进程**
-//      （现象：测试进程 exit=141）。修法见 common/socket_util.h。
+//      （现象：测试进程 exit=141）。修法见 common/net/socket_util.h。
 // 下面 4 个用例把这三条都钉住了。
 
 #include "test_framework.h"

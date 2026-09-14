@@ -1,15 +1,13 @@
 // client/connection.cpp
 #include "connection.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cstring>
 #include <utility>
 
-#include "common/socket_util.h"
+#include "common/net/socket.h"
+#include "common/net/socket_util.h"
 #include "server/protocol.h"
 #include "session/session.h"
 
@@ -127,13 +125,8 @@ private:
 // ---- 远程连接：阻塞式协议客户端 ----
 class RemoteConnection : public SqlConnection {
 public:
-  RemoteConnection(int fd, std::string description)
-      : fd_(fd), description_(std::move(description)) {}
-  ~RemoteConnection() override {
-    if (fd_ >= 0) {
-      ::close(fd_);
-    }
-  }
+  RemoteConnection(common::net::TcpSocket socket, std::string description)
+      : socket_(std::move(socket)), description_(std::move(description)) {}
 
   Outcome execute(const std::string &sql) override {
     Outcome outcome;
@@ -323,16 +316,7 @@ private:
   }
 
   bool send_all(const std::string &data) {
-    size_t sent = 0;
-    while (sent < data.size()) {
-      const ssize_t wrote =
-          common::socket_write(fd_, data.data() + sent, data.size() - sent);
-      if (wrote <= 0) {
-        return false;
-      }
-      sent += static_cast<size_t>(wrote);
-    }
-    return true;
+    return socket_.send_all(data);
   }
 
   std::optional<server::DecodedFrame> next_frame() {
@@ -348,7 +332,7 @@ private:
         return std::nullopt;
       }
       char chunk[8192];
-      const ssize_t got = ::read(fd_, chunk, sizeof(chunk));
+      const ssize_t got = socket_.read_once(chunk, sizeof(chunk));
       if (got <= 0) {
         return std::nullopt;
       }
@@ -356,7 +340,7 @@ private:
     }
   }
 
-  int fd_ = -1;
+  common::net::TcpSocket socket_;
   std::string in_;
   std::string description_;
   std::string current_db_;
@@ -364,6 +348,20 @@ private:
   uint16_t protocol_version_ = 0;
   uint16_t server_version_ = 0;
 };
+
+std::unique_ptr<SqlConnection>
+make_remote_from_socket(common::net::TcpSocket socket, std::string *error,
+                        const std::string &label) {
+  auto connection =
+      std::make_unique<RemoteConnection>(std::move(socket), label);
+  if (!connection->handshake()) {
+    if (error != nullptr) {
+      *error = "protocol handshake failed (server speaks a different version?)";
+    }
+    return nullptr;
+  }
+  return connection;
+}
 
 } // namespace
 
@@ -374,47 +372,23 @@ make_local(std::shared_ptr<kv::KVEngine> engine) {
 
 std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
                                            std::string *error) {
-  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) {
+  auto socket = common::net::TcpSocket::connect(
+      options.host, static_cast<uint16_t>(std::stoi(options.port)));
+  if (!socket.has_value()) {
     if (error != nullptr) {
-      *error = std::string("socket(): ") + std::strerror(errno);
+      *error = socket.error();
     }
-    return nullptr;
-  }
-  common::socket_suppress_sigpipe(fd);
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(std::stoi(options.port)));
-  if (::inet_pton(AF_INET, options.host.c_str(), &addr.sin_addr) != 1) {
-    if (error != nullptr) {
-      *error = "host must be an IPv4 address: " + options.host;
-    }
-    ::close(fd);
-    return nullptr;
-  }
-  if (::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-    if (error != nullptr) {
-      *error = "connect " + options.host + ":" + options.port +
-               " failed: " + std::strerror(errno);
-    }
-    ::close(fd);
     return nullptr;
   }
   const std::string description = options.host + ":" + options.port;
-  return make_remote_from_fd(fd, error, description);
+  return make_remote_from_socket(std::move(*socket), error, description);
 }
 
 std::unique_ptr<SqlConnection> make_remote_from_fd(int fd, std::string *error,
                                                    const std::string &label) {
-  common::socket_suppress_sigpipe(fd);
-  auto connection = std::make_unique<RemoteConnection>(fd, label);
-  if (!connection->handshake()) {
-    if (error != nullptr) {
-      *error = "protocol handshake failed (server speaks a different version?)";
-    }
-    return nullptr;
-  }
-  return connection;
+  common::net::TcpSocket socket = common::net::TcpSocket::adopt(fd);
+  common::net::socket_suppress_sigpipe(socket.fd());
+  return make_remote_from_socket(std::move(socket), error, label);
 }
 
 } // namespace client

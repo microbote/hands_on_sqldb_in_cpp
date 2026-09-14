@@ -4,9 +4,11 @@
 服务器相关的**设计决策、P0 发现与踩坑**；M1 的测试用例落地后，用例清单也追加
 在这里（测试代码本身进 `tests/test_server/`，跑法见 `Makefile` 的 `server-test`）。
 
-现状（2026-09-13）：M1 的服务器骨架 + 客户端层 + 元信息 + 连接生命周期都已
-落地（第四 ~ 八节），本轮又补了通用配置包、读线程池与 Poller 抽象（第九节）。
-`test_server` 39 用例 / `ctest` 12/12 全绿，干净重建 0 告警，TSan 0 竞态。
+现状（2026-09-14）：M1 的服务器骨架 + 客户端层 + 元信息 + 连接生命周期都已
+落地（第四 ~ 八节），又补了通用配置包、读线程池与 Poller 抽象（第九节）。
+本轮把通用网络原语与协程服务器框架抽到 `common/net` / `common/svrkit`
+（第十节），`server/` 只保留 SQL 协议、配置与 Session 路由。
+`test_svrkit` 8 用例、`test_server` 34 用例全绿。
 第一节是动工前的 P0 体检（parser 线程安全），当时"代码还没开始写"。
 
 ---
@@ -449,3 +451,68 @@ unwatch 后不再报；写就绪/对端关闭要报（`POLLIN|POLLHUP` 任一，
   `llvm-debug` 同一套，加 `-fsanitize=thread` 即可）；直接 `cmake -B
   build-tsan` 会用 Apple Clang，它的 libc++ 太旧，连 C++23 的
   `construct_at` 都编不过。
+
+---
+
+## 十、本轮改动记录（2026-09-14）：common/net + common/svrkit 抽离
+
+目标：后续 Raft node 需要同一套长连接服务器框架，不再复制 SQL server 里的
+accept/事件循环/连接生命周期代码。本轮不是只搬文件名，而是把**网络原语、
+通用服务框架、SQL 应用层**三层边界固定下来。
+
+### 1. 新分层
+
+| 层 | 位置 | 内容 | 不能放什么 |
+|---|---|---|---|
+| 网络原语 | `common/net` | `Poller`（kqueue/epoll/poll）、`TcpSocket`（fd 所有权、connect/listen、阻塞读写）、SIGPIPE 防护 | SQL/Raft 协议、协程、业务配置 |
+| 通用服务器框架 | `common/svrkit` | `Task`、`Loop`、`ServiceThread`、`TcpServer`/`TcpConnection` | SQL Session、Raft 状态机、消息格式 |
+| SQL 应用层 | `server/` | `ServerConfig`、sqldb 协议编解码、SQL parse/write/read 路由、SQL metrics | listen/accept、fd 所有权、通用优雅退出 |
+
+`sql_server_protocol` 也单独成库：远程客户端只链接协议编解码，不再为了
+几个 encode/decode 函数链接整个 `sql_server`（这条会直接影响后续 Raft
+二进制边界）。
+
+### 2. `TcpServer` 抽走的职责
+
+`server::Server` 原来同时管 TCP 和 SQL，现在它只提供：
+
+```cpp
+Task serve_connection(std::shared_ptr<svrkit::TcpConnection> conn);
+```
+
+交给 `common::svrkit::TcpServer` 的职责：
+
+- `listen()` / accept 循环 / `max_connections`；
+- accept 或 `attach_connection()` 后设置非阻塞与 SIGPIPE 防护；
+- 连接列表、`connection_count()`、`connections_total()`；
+- 处理器返回后统一关闭 fd 并注销连接；
+- self-pipe 优雅退出（信号处理函数只 `write()`，Loop 线程负责真正收尾）；
+- 连接协程式 `read_some()` / `write_all()`。
+
+SQL 层仍保留：HELLO/QUERY/META/BYE 协议、空闲/事务空闲看门狗、parse 服务、
+写服务、读线程池与业务 metrics。应用协议收尾帧（SQL 的 BYE）也由应用层发，
+框架只保证处理器返回后关闭 fd。
+
+### 3. 测试调整
+
+| 测试 | 位置 | 覆盖 |
+|---|---|---|
+| Poller / Loop / ServiceThread | `tests/test_svrkit` | 从 `test_server` 迁出；这些不再依赖 SQL |
+| `TcpSocket.AdoptedSocketPairSendsBothWays` | `tests/test_svrkit` | 阻塞式 socket 封装与 fd 所有权 |
+| `TcpServer.AttachedConnectionRunsHandlerAndFrameworkClosesIt` | `tests/test_svrkit` | 通用 handler、异步 echo、框架统一关闭连接 |
+| `TcpServer.GracefulShutdownWakesHandlerAndStopsLoop` | `tests/test_svrkit` | self-pipe 优雅退出、唤醒读协程、连接计数归零 |
+| SQL 生命周期/E2E | `tests/test_server` | 原行为回归：HELLO/BYE、超时、事务路由、远程客户端 |
+
+`test_svrkit` 全部走 `socketpair`，不依赖 `bind()`，所以受限沙箱里也能
+覆盖通用框架；SQL 的真 TCP E2E 仍受沙箱 `bind()` 限制，普通终端跑
+`make server-test`。
+
+### 4. 验证
+
+- `./build/run_tests/test_svrkit`：**8 用例 / 65 断言 / 0 失败**；
+- `./build/run_tests/test_server`：**34 用例 / 196 断言 / 0 失败**
+  （真 TCP 用例在沙箱中按既有逻辑 `[skip]`）；
+- `cmake --build build -j2`：0 告警。
+
+后续 Raft 接入点：`common::svrkit::TcpServer` + 自己的协议 handler；重活
+（例如 apply 到状态机）用 `ServiceThread`，不要把状态机写进 svrkit。

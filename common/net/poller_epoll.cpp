@@ -1,4 +1,4 @@
-// server/poller_epoll.cpp —— epoll 后端（Linux）
+// common/net/poller_epoll.cpp —— epoll 后端（Linux）
 #include "poller.h"
 
 #if defined(__linux__)
@@ -9,7 +9,7 @@
 #include <cerrno>
 #include <vector>
 
-namespace server {
+namespace common::net {
 namespace {
 
 class EpollPoller final : public Poller {
@@ -89,6 +89,6 @@ std::unique_ptr<Poller> make_epoll_poller() {
   return poller;
 }
 
-} // namespace server
+} // namespace common::net
 
 #endif // __linux__

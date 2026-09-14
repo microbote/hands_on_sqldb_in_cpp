@@ -1,5 +1,5 @@
-// server/loop.cpp
-#include "loop.h"
+// common/svrkit/loop.cpp
+#include "common/svrkit/loop.h"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -10,7 +10,7 @@
 #include <chrono>
 #include <utility>
 
-namespace server {
+namespace common::svrkit {
 namespace {
 
 thread_local Loop *g_loop = nullptr;
@@ -98,7 +98,7 @@ Loop::Loop(std::string name) : name_(std::move(name)) {
     make_nonblocking(wakeup_read_);
     make_nonblocking(wakeup_write_);
   }
-  poller_ = Poller::create();
+  poller_ = net::Poller::create();
   if (poller_ != nullptr && wakeup_read_ >= 0) {
     poller_->watch(wakeup_read_, POLLIN); // 常驻，不随 watches_ 摘挂
   }
@@ -225,7 +225,7 @@ void Loop::run() {
     }
 
     // 3) 等事件：后端是平台相关的 kqueue/epoll/poll，事件词汇统一成 poll 的
-    Poller::Event fired[64];
+    net::Poller::Event fired[64];
     const int ready =
         poller_ != nullptr ? poller_->wait(timeout_ms, fired, 64) : -1;
     if (ready < 0) {
@@ -260,4 +260,4 @@ void Loop::run() {
   g_loop = nullptr;
 }
 
-} // namespace server
+} // namespace common::svrkit

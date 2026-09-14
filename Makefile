@@ -14,7 +14,7 @@
 BUILD_DIR = build
 JOBS      ?= 4
 
-.PHONY: all configure build sqldb cli client server test storage-test server-test tx-test session-test \
+.PHONY: all configure build sqldb cli client server test storage-test svrkit-test server-test tx-test session-test \
         executor-test relation-test planner-test statement-test parser-test \
         sql-types-test cmake-test clean distclean help
 
@@ -37,6 +37,11 @@ cli: sqldb
 server: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS) --target sqldb-server
 	@echo "✅ $(BUILD_DIR)/sqldb-server 可用（--config=<file>）"
+
+# 通用协程服务器框架（common/net + common/svrkit）
+svrkit-test: configure
+	cmake --build $(BUILD_DIR) -j$(JOBS)
+	./$(BUILD_DIR)/run_tests/test_svrkit
 
 server-test: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS)
@@ -104,6 +109,7 @@ help:
 	@echo "  make build            - 构建全部（库 + 测试 + sqldb）"
 	@echo "  make sqldb            - 只构建 CLI"
 	@echo "  make test             - 跑 ctest 全部用例（含 CLI 冒烟）"
+	@echo "  make svrkit-test      - 通用网络/协程服务器框架"
 	@echo "  make storage-test     - 存储层（Mock + LevelDB）"
 	@echo "  make tx-test          - 事务/多连接（Mock + LevelDB）"
 	@echo "  make session-test / planner-test / executor-test / ..."

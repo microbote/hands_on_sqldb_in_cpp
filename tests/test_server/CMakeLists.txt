@@ -8,9 +8,7 @@ find_package(Threads REQUIRED)
 add_executable(test_server
     main.cpp
     test_config.cpp
-    test_poller.cpp
     test_protocol.cpp
-    test_service.cpp
     test_e2e.cpp
     test_client.cpp
     test_lifecycle.cpp

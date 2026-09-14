@@ -155,7 +155,7 @@ void serve_fake(int fd) {
 
 // 回归：对端（服务器）已经没了以后客户端再发语句 —— `write()` 会送 SIGPIPE，
 // 默认处置直接杀掉客户端进程（这里就是测试进程）。正确行为是**报连接断开**。
-// 这跟"服务器被跑掉的客户端打死"是同一个坑的两面，见 common/socket_util.h。
+// 这跟"服务器被跑掉的客户端打死"是同一个坑的两面，见 common/net/socket_util.h。
 TEST(FakeServer, WriteAfterServerIsGoneReportsConnectionLost) {
   int fds[2] = {-1, -1};
   CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);

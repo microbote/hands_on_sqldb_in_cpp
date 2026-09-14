@@ -1,10 +1,10 @@
-// tests/test_server/test_poller.cpp
+// tests/test_svrkit/test_poller.cpp
 //
 // 平台后端（mac=kqueue / linux=epoll / 兜底=poll）的统一行为：
 // watch 之后事件能报上来、事件位用 poll 词汇、unwatch 之后不再报。
 #include "test_framework.h"
 
-#include "server/poller.h"
+#include "common/net/poller.h"
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -31,7 +31,7 @@ struct SocketPair {
 } // namespace
 
 TEST(Poller, ReportsReadReadinessInPollVocabulary) {
-  auto poller = server::Poller::create();
+  auto poller = common::net::Poller::create();
   CHECK(poller != nullptr);
   SocketPair pair;
   CHECK(pair.fds[0] >= 0);
@@ -40,7 +40,7 @@ TEST(Poller, ReportsReadReadinessInPollVocabulary) {
   }
 
   CHECK(poller->watch(pair.fds[0], POLLIN));
-  server::Poller::Event fired[4];
+  common::net::Poller::Event fired[4];
   // 没数据：超时返回 0
   CHECK_EQ(poller->wait(20, fired, 4), 0);
 
@@ -66,7 +66,7 @@ TEST(Poller, ReportsReadReadinessInPollVocabulary) {
 }
 
 TEST(Poller, ReportsWriteReadinessAndPeerClose) {
-  auto poller = server::Poller::create();
+  auto poller = common::net::Poller::create();
   CHECK(poller != nullptr);
   SocketPair pair;
   CHECK(pair.fds[0] >= 0);
@@ -76,7 +76,7 @@ TEST(Poller, ReportsWriteReadinessAndPeerClose) {
 
   // 写端几乎总是可写（缓冲区没满）
   CHECK(poller->watch(pair.fds[1], POLLOUT));
-  server::Poller::Event fired[4];
+  common::net::Poller::Event fired[4];
   CHECK_EQ(poller->wait(1000, fired, 4), 1);
   CHECK((fired[0].revents & POLLOUT) != 0);
 

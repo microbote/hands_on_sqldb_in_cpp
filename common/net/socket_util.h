@@ -1,4 +1,4 @@
-// common/socket_util.h
+// common/net/socket_util.h
 //
 // socket 写操作的两个平台差异，收在这里：
 //   - **SIGPIPE**：对端已经关掉读方向时 `write()` 会先送 SIGPIPE，默认处置
@@ -18,7 +18,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace common {
+namespace common::net {
 
 // 建连/accept 之后调一次：让这个 fd 上的写不再产生 SIGPIPE。
 // Linux 上没有 SO_NOSIGPIPE（靠 socket_write 的 MSG_NOSIGNAL），此时什么都不做。
@@ -43,4 +43,4 @@ inline ssize_t socket_write(int fd, const char *data, size_t size) {
 #endif
 }
 
-} // namespace common
+} // namespace common::net

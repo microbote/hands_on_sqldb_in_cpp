@@ -1,87 +1,18 @@
 // server/server.cpp
 #include "server.h"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
-#include <chrono>
-#include <cstring>
-#include <functional>
 #include <utility>
 
 #include <fmt/format.h>
 
-#include "common/socket_util.h"
 #include "protocol.h"
 
 namespace server {
 namespace {
 
 constexpr uint16_t kServerVersion = 1;
-
-int set_nonblocking(int fd) {
-  const int flags = ::fcntl(fd, F_GETFL, 0);
-  if (flags < 0) {
-    return -1;
-  }
-  return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-// 在协程里读一次（可读事件驱动）；返回：>0 读到的字节，0 = 对端关闭，
-// -1 = 真错误，-2 = 这次没数据（继续等）
-Task read_some(int fd, std::string &buffer, ssize_t &nread) {
-  while (true) {
-    char chunk[8192];
-    const ssize_t got = ::read(fd, chunk, sizeof(chunk));
-    if (got > 0) {
-      buffer.append(chunk, static_cast<size_t>(got));
-      nread = got;
-      co_return;
-    }
-    if (got == 0) {
-      nread = 0; // 对端关闭
-      co_return;
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      co_await WaitFd{fd, POLLIN};
-      continue;
-    }
-    nread = -1;
-    co_return;
-  }
-}
-
-// 在协程里把 data 写完
-Task write_all(int fd, std::string data, bool &ok) {
-  size_t sent = 0;
-  while (sent < data.size()) {
-    // 对端跑掉时不能让 SIGPIPE 杀掉整个服务器进程（见 common/socket_util.h）
-    const ssize_t wrote =
-        common::socket_write(fd, data.data() + sent, data.size() - sent);
-    if (wrote > 0) {
-      sent += static_cast<size_t>(wrote);
-      continue;
-    }
-    if (wrote < 0 && errno == EINTR) {
-      continue;
-    }
-    if (wrote < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      co_await WaitFd{fd, POLLOUT};
-      continue;
-    }
-    ok = false;
-    co_return;
-  }
-  ok = true;
-}
 
 ErrorFrame to_error_frame(const session::SessionError &error) {
   ErrorFrame frame;
@@ -97,38 +28,32 @@ ErrorFrame to_error_frame(const session::SessionError &error) {
 
 } // namespace
 
+common::svrkit::TcpServerOptions
+Server::make_transport_options(const ServerConfig &config, Server *owner) {
+  common::svrkit::TcpServerOptions options;
+  options.max_connections = config.max_connections();
+  options.logger = [owner](const char *level, const std::string &message) {
+    owner->log(level, message);
+  };
+  return options;
+}
+
 Server::Server(ServerConfig config, std::shared_ptr<kv::KVStore> store)
-    : config_(std::move(config)), store_(std::move(store)), loop_("server-io"),
+    : config_(std::move(config)), store_(std::move(store)),
+      transport_(make_transport_options(config_, this),
+                 [this](std::shared_ptr<common::svrkit::TcpConnection>
+                            connection) -> common::svrkit::Task {
+                   return serve_connection(std::move(connection));
+                 }),
       parse_service_("parse-service"), write_service_("write-service") {
-  int fds[2] = {-1, -1};
-  if (::pipe(fds) == 0) {
-    signal_read_ = fds[0];
-    signal_write_ = fds[1];
-    const auto set_nonblock = [](int fd) {
-      const int flags = ::fcntl(fd, F_GETFL, 0);
-      if (flags >= 0) {
-        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-      }
-    };
-    set_nonblock(signal_read_);
-    set_nonblock(signal_write_);
-  }
 }
 
 Server::~Server() {
+  transport_.stop();
   parse_service_.stop();
   write_service_.stop();
   for (auto &worker : read_pool_) {
     worker->stop();
-  }
-  if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
-  }
-  if (signal_read_ >= 0) {
-    ::close(signal_read_);
-  }
-  if (signal_write_ >= 0) {
-    ::close(signal_write_);
   }
 }
 
@@ -148,31 +73,6 @@ void Server::log(const char *level, const std::string &message) const {
   fmt::print(stderr, "[{}] {}\n", level, message);
 }
 
-void Server::request_shutdown() {
-  if (signal_write_ < 0) {
-    return;
-  }
-  const char byte = 's';
-  ssize_t ignored = ::write(signal_write_, &byte, 1); // async-signal-safe
-  (void)ignored;
-}
-
-void Server::register_connection(const std::shared_ptr<ConnState> &state) {
-  std::lock_guard<std::mutex> lock(connections_mutex_);
-  connections_list_.push_back(state);
-}
-
-void Server::unregister_connection(int fd) {
-  std::lock_guard<std::mutex> lock(connections_mutex_);
-  for (auto it = connections_list_.begin(); it != connections_list_.end();
-       ++it) {
-    if ((*it)->fd == fd) {
-      connections_list_.erase(it);
-      return;
-    }
-  }
-}
-
 void Server::arm_idle_watchdog(const std::shared_ptr<ConnState> &state,
                                bool in_tx) {
   const int64_t timeout_ms =
@@ -182,120 +82,25 @@ void Server::arm_idle_watchdog(const std::shared_ptr<ConnState> &state,
     return; // 0 = 不超时
   }
   const uint64_t generation = state->generation.fetch_add(1) + 1;
-  const int fd = state->fd;
-  loop_.add_timer(timeout_ms, [this, state, fd, generation] {
-    if (state->generation.load() != generation || state->stopping.load()) {
+  transport_.loop().add_timer(timeout_ms, [this, state, generation] {
+    if (state->generation.load() != generation ||
+        state->connection->stopping()) {
       return; // 连接已经往前走了（读到新语句）或正在收尾
     }
     state->timed_out = true;
     metrics_.idle_timeouts.fetch_add(1);
     // 只关**读方向**：协程会从 read 里醒来，还能把 ERROR 帧写回去
-    ::shutdown(fd, SHUT_RD);
+    state->connection->shutdown_read();
   });
-}
-
-void Server::begin_graceful_shutdown() {
-  if (stopping_.exchange(true)) {
-    return;
-  }
-  log("info", "shutdown: stop accepting new connections");
-  loop_.unwatch(listen_fd_);
-
-  {
-    std::lock_guard<std::mutex> lock(connections_mutex_);
-    for (const auto &state : connections_list_) {
-      state->stopping = true;
-      state->generation.fetch_add(1); // 让空闲看门狗失效
-      ::shutdown(state->fd, SHUT_RD);
-    }
-  }
-
-  // 等连接退出（上限 5s，之后强制停 loop）
-  const int64_t deadline_ms = 5000;
-  const int64_t step_ms = 20;
-  auto waited = std::make_shared<int64_t>(0);
-  auto poll_connections = std::make_shared<std::function<void()>>();
-  *poll_connections = [this, waited, poll_connections, deadline_ms]() {
-    const int64_t step_ms = 20;
-    if (connections_.load() == 0) {
-      log("info", "shutdown: all connections closed");
-      loop_.stop();
-      return;
-    }
-    *waited += step_ms;
-    if (*waited >= deadline_ms) {
-      log("warn",
-          fmt::format("shutdown: {} connection(s) still open after {}ms, "
-                      "stopping anyway",
-                      connections_.load(), deadline_ms));
-      loop_.stop();
-      return;
-    }
-    loop_.add_timer(step_ms, *poll_connections);
-  };
-  loop_.add_timer(step_ms, *poll_connections);
-}
-
-void Server::attach_connection(int fd) {
-  // 和 accept 路径一样：socket 必须非阻塞 —— 否则一次 read 就把整条
-  // 事件循环线程堵死（定时器、别的连接全都不转了）
-  if (set_nonblocking(fd) != 0) {
-    log("error", fmt::format("attach_connection: fcntl(O_NONBLOCK) failed: {}",
-                             std::strerror(errno)));
-    ::close(fd);
-    return;
-  }
-  common::socket_suppress_sigpipe(fd);
-  auto state = std::make_shared<ConnState>();
-  state->fd = fd;
-  register_connection(state);
-  connections_.fetch_add(1);
-  metrics_.connections_total.fetch_add(1);
-  loop_.spawn(serve_connection(fd, state));
 }
 
 std::expected<void, std::string> Server::listen() {
   if (store_ == nullptr || !store_->is_open()) {
     return std::unexpected("storage is not open");
   }
-  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd_ < 0) {
-    return std::unexpected(std::string("socket(): ") + std::strerror(errno));
-  }
-  int reuse = 1;
-  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-  // 端口 0 = 让内核挑（测试用）
   const int requested_port = std::stoi(config_.listen_port());
-  const std::string host = config_.listen_host();
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(requested_port));
-  if (host.empty() || host == "*" || host == "0.0.0.0") {
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-  } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-    return std::unexpected("listen host must be an IPv4 address: " + host);
-  }
-  if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
-      0) {
-    return std::unexpected(std::string("bind(): ") + std::strerror(errno));
-  }
-  if (::listen(listen_fd_, 128) != 0) {
-    return std::unexpected(std::string("listen(): ") + std::strerror(errno));
-  }
-  if (set_nonblocking(listen_fd_) != 0) {
-    return std::unexpected(std::string("fcntl(O_NONBLOCK): ") +
-                           std::strerror(errno));
-  }
-  sockaddr_in bound{};
-  socklen_t bound_len = sizeof(bound);
-  if (::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&bound),
-                    &bound_len) == 0) {
-    port_ = ntohs(bound.sin_port); // port = 0 时这里拿到真实端口
-  } else {
-    port_ = requested_port;
-  }
-  return {};
+  return transport_.listen(config_.listen_host(),
+                           static_cast<uint16_t>(requested_port));
 }
 
 void Server::run() {
@@ -308,23 +113,13 @@ void Server::run() {
     const size_t read_queue_max = config_.read_queue_max();
     read_pool_.reserve(read_threads);
     for (size_t i = 0; i < read_threads; ++i) {
-      auto worker =
-          std::make_unique<ServiceThread>(fmt::format("read-service-{}", i));
+      auto worker = std::make_unique<common::svrkit::ServiceThread>(
+          fmt::format("read-service-{}", i));
       worker->start(read_queue_max);
       read_pool_.push_back(std::move(worker));
     }
   }
-  if (signal_read_ >= 0) {
-    loop_.watch(signal_read_, POLLIN,
-                [this](short) { begin_graceful_shutdown(); });
-  }
-  // 没有监听 fd（测试/嵌入用 attach_connection 挂进来的场景）时不要起 accept
-  // 协程：`WaitFd{fd<0}` 的 await_ready() 为 true，协程会在 while 里**忙等**
-  // 而不让出，把整条事件循环饿死（别的连接一条语句都回不了）。这里踩过。
-  if (listen_fd_ >= 0) {
-    loop_.spawn(accept_loop());
-  }
-  loop_.run();
+  transport_.run();
   log("info",
       fmt::format("stopped: connections={} statements={} errors={} rows={} "
                   "idle_timeouts={} write_rejects={} parse_rejects={} "
@@ -342,49 +137,13 @@ void Server::run() {
   }
 }
 
-Task Server::accept_loop() {
-  while (!loop_.stopped()) {
-    co_await WaitFd{listen_fd_, POLLIN};
-    if (loop_.stopped()) {
-      break;
-    }
-    while (true) {
-      sockaddr_in peer{};
-      socklen_t peer_len = sizeof(peer);
-      const int fd =
-          ::accept(listen_fd_, reinterpret_cast<sockaddr *>(&peer), &peer_len);
-      if (fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          break; // 这一轮 accept 完了，回去等可读
-        }
-        if (errno == EINTR) {
-          continue;
-        }
-        break;
-      }
-      if (connections_.load() >= config_.max_connections()) {
-        ::close(fd); // 超限：直接关，不做半开连接
-        continue;
-      }
-      if (set_nonblocking(fd) != 0) {
-        ::close(fd);
-        continue;
-      }
-      common::socket_suppress_sigpipe(fd);
-      int nodelay = 1;
-      ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-      auto state = std::make_shared<ConnState>();
-      state->fd = fd;
-      register_connection(state);
-      connections_.fetch_add(1);
-      metrics_.connections_total.fetch_add(1);
-      log("debug", fmt::format("connection accepted: fd={}", fd));
-      loop_.spawn(serve_connection(fd, state));
-    }
-  }
-}
+common::svrkit::Task Server::serve_connection(
+    std::shared_ptr<common::svrkit::TcpConnection> connection) {
+  metrics_.connections_total.fetch_add(1);
+  auto state = std::make_shared<ConnState>();
+  state->connection = connection;
+  const int fd = connection->fd();
 
-Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
   session::Session session(store_->connect());
   const std::string default_database = config_.default_database();
   if (!default_database.empty()) {
@@ -396,11 +155,11 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
   // 1) HELLO（协议版本 + 能力位）
   {
     bool ok = false;
-    co_await write_all(fd, encode_hello(kServerVersion, 0), ok);
+    co_await connection->write_all(encode_hello(kServerVersion, 0), ok);
     alive = ok;
   }
 
-  while (alive && !loop_.stopped()) {
+  while (alive && !transport_.loop().stopped()) {
     // 2) 收帧（半帧/粘包都在这里处理）
     DecodedFrame frame;
     size_t consumed = 0;
@@ -415,7 +174,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
       //   - 在事务里     -> idle_in_transaction_timeout_ms（防快照钉住旧版本）
       arm_idle_watchdog(state, session.in_transaction());
       ssize_t nread = 0;
-      co_await read_some(fd, in, nread);
+      co_await connection->read_some(in, nread);
       if (nread <= 0) {
         if (state->timed_out.load()) {
           // 超时：尽力回一个 ERROR 帧告诉对端原因（读方向已经关了，写还能用）
@@ -430,7 +189,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
                     "(transaction rolled back)"
                   : "connection terminated: idle for too long";
           bool ignored = false;
-          co_await write_all(fd, encode_error(timeout), ignored);
+          co_await connection->write_all(encode_error(timeout), ignored);
           log("info", fmt::format("connection fd={} closed: idle timeout{}", fd,
                                   was_in_tx ? " (in transaction)" : ""));
         }
@@ -448,7 +207,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
     }
     if (frame.type == FrameType::kPing) {
       bool ok = false;
-      co_await write_all(fd, encode_simple(FrameType::kPing), ok);
+      co_await connection->write_all(encode_simple(FrameType::kPing), ok);
       alive = ok;
       continue;
     }
@@ -499,7 +258,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
         if (!schema.has_value()) {
           ErrorFrame missing;
           missing.message = "table not found: " + arg2;
-          co_await write_all(fd, encode_error(missing), ok);
+          co_await connection->write_all(encode_error(missing), ok);
           alive = ok;
           replied = true;
           break;
@@ -517,7 +276,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
       if (replied) {
         continue; // 已经回过错误帧了
       }
-      co_await write_all(fd, encode_meta_reply(payload), ok);
+      co_await connection->write_all(encode_meta_reply(payload), ok);
       alive = ok;
       continue;
     }
@@ -525,7 +284,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
       bool ok = false;
       ErrorFrame bad;
       bad.message = "unexpected frame from client";
-      co_await write_all(fd, encode_error(bad), ok);
+      co_await connection->write_all(encode_error(bad), ok);
       alive = ok;
       continue;
     }
@@ -542,7 +301,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
     std::expected<session::ParsedStatement, session::SessionError> parsed =
         std::unexpected(session::SessionError());
     {
-      SubmitToService submit;
+      common::svrkit::SubmitToService submit;
       submit.service = &parse_service_;
       submit.work = [&session, &sql, &parsed] { parsed = session.parse(sql); };
       co_await submit;
@@ -551,7 +310,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
         bool ok = false;
         ErrorFrame busy;
         busy.message = "server busy: parse queue is full";
-        co_await write_all(fd, encode_error(busy), ok);
+        co_await connection->write_all(encode_error(busy), ok);
         alive = ok;
         continue;
       }
@@ -569,7 +328,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
       const bool route_to_write =
           session.in_transaction() || !parsed->read_only;
       if (route_to_write) {
-        SubmitToService submit;
+        common::svrkit::SubmitToService submit;
         submit.service = &write_service_;
         submit.work = [&session, &parsed, &result] {
           result = session.execute_parsed(*parsed);
@@ -580,16 +339,16 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
           bool ok = false;
           ErrorFrame busy;
           busy.message = "server busy: write queue is full";
-          co_await write_all(fd, encode_error(busy), ok);
+          co_await connection->write_all(encode_error(busy), ok);
           alive = ok;
           continue;
         }
       } else if (!read_pool_.empty()) {
         // 纯读：轮询挑一条读线程执行，读请求之间真正并发
-        ServiceThread &worker =
+        common::svrkit::ServiceThread &worker =
             *read_pool_[read_next_.fetch_add(1, std::memory_order_relaxed) %
                         read_pool_.size()];
-        SubmitToService submit;
+        common::svrkit::SubmitToService submit;
         submit.service = &worker;
         submit.work = [&session, &parsed, &result] {
           result = session.execute_parsed(*parsed);
@@ -600,7 +359,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
           bool ok = false;
           ErrorFrame busy;
           busy.message = "server busy: read queue is full";
-          co_await write_all(fd, encode_error(busy), ok);
+          co_await connection->write_all(encode_error(busy), ok);
           alive = ok;
           continue;
         }
@@ -675,7 +434,7 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
     }
 
     bool ok = false;
-    co_await write_all(fd, std::move(out), ok);
+    co_await connection->write_all(std::move(out), ok);
     if (error_response) {
       metrics_.errors.fetch_add(1);
     }
@@ -683,12 +442,10 @@ Task Server::serve_connection(int fd, std::shared_ptr<ConnState> state) {
     alive = ok;
   }
 
-  // 收尾：发 BYE（对方可能已经关了，忽略失败）-> 关 fd -> 注销
+  // 协议收尾：发 BYE（对方可能已经关了，忽略失败）。
+  // fd 的关闭与连接注销由 svrkit::TcpServer 在处理器返回后统一完成。
   bool ignored = false;
-  co_await write_all(fd, encode_simple(FrameType::kBye), ignored);
-  ::close(fd);
-  unregister_connection(fd);
-  connections_.fetch_sub(1);
+  co_await connection->write_all(encode_simple(FrameType::kBye), ignored);
   log("debug", fmt::format("connection closed: fd={}", fd));
 }
 

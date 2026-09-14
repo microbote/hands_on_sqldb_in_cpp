@@ -1,11 +1,11 @@
-// server/poller.h
+// common/net/poller.h
 //
 // 平台无关的 IO 多路复用后端（学 libco 的第一点：上层接口固定，底层按
 // 平台条件编译换实现）：
 //
-//   __APPLE__  → kqueue          server/poller_kqueue.cpp
-//   __linux__  → epoll（LT）     server/poller_epoll.cpp
-//   任何平台   → poll(2) 兜底     server/poller_poll.cpp
+//   __APPLE__  → kqueue          common/net/poller_kqueue.cpp
+//   __linux__  → epoll（LT）     common/net/poller_epoll.cpp
+//   任何平台   → poll(2) 兜底     common/net/poller_poll.cpp
 //                （全平台都编译；平台后端创建失败时也退回它）
 //
 // 语义统一成 poll(2) 的词汇：**水平触发**、事件位是
@@ -18,7 +18,7 @@
 
 #include <memory>
 
-namespace server {
+namespace common::net {
 
 class Poller {
 public:
@@ -49,4 +49,4 @@ std::unique_ptr<Poller> make_kqueue_poller();
 std::unique_ptr<Poller> make_epoll_poller();
 #endif
 
-} // namespace server
+} // namespace common::net

@@ -241,19 +241,70 @@ target_compile_features(sql_session PUBLIC cxx_std_23)
 # 命令行客户端 sqldb：SQL 文本 -> session -> 表格输出
 # ============================================================
 # ============================================================
-# 服务器（协程框架）：server/ —— 依赖 sql_session + sql_kv
-#
-#   一个进程 = 一份 KVStore + N 条连接协程 + parse 服务线程 + 写线程。
-#   本地 CLI（sqldb）不依赖它，也不会因为服务器而改变行为。
+# common/net：跨平台网络原语
+#   - Poller：kqueue / epoll / poll 统一成 poll 词汇、水平触发
+#   - TcpSocket：阻塞式客户端与 svrkit 共用的连接/监听/所有权封装
+# ============================================================
+add_library(common_net STATIC
+    common/net/poller_poll.cpp
+    common/net/poller_kqueue.cpp
+    common/net/poller_epoll.cpp
+    common/net/socket.cpp
+)
+
+target_include_directories(common_net PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_features(common_net PUBLIC cxx_std_23)
+
+# ============================================================
+# common/svrkit：协议无关的协程服务器框架（后续 Raft 复用）
+#   Task / Loop / ServiceThread / TcpServer
+# ============================================================
+add_library(svrkit STATIC
+    common/svrkit/loop.cpp
+    common/svrkit/service.cpp
+    common/svrkit/tcp_server.cpp
+)
+
+target_include_directories(svrkit PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+find_package(Threads REQUIRED)
+target_link_libraries(svrkit PUBLIC
+    common_net
+    Threads::Threads
+)
+
+target_compile_features(svrkit PUBLIC cxx_std_23)
+
+# ============================================================
+# sqldb 服务器协议：server/ 与远程客户端共享，但协议库不依赖服务器框架
+# ============================================================
+add_library(sql_server_protocol STATIC
+    server/protocol.cpp
+)
+
+target_include_directories(sql_server_protocol PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/server
+)
+
+target_link_libraries(sql_server_protocol PUBLIC
+    sql_types
+    fmt::fmt
+)
+
+target_compile_features(sql_server_protocol PUBLIC cxx_std_23)
+
+# ============================================================
+# sqldb 服务器应用层：server/ —— SQL 协议 + Session 路由
+#   TCP/协程生命周期在 svrkit；本地 CLI（sqldb）不依赖它。
 # ============================================================
 add_library(sql_server STATIC
     server/config.cpp
-    server/loop.cpp
-    server/poller_poll.cpp
-    server/poller_kqueue.cpp
-    server/poller_epoll.cpp
-    server/protocol.cpp
-    server/service.cpp
     server/server.cpp
 )
 
@@ -265,13 +316,12 @@ target_include_directories(sql_server PUBLIC
 target_link_libraries(sql_server PUBLIC
     sql_session
     sql_kv
+    sql_server_protocol
+    svrkit
     fmt::fmt
 )
 
 target_compile_features(sql_server PUBLIC cxx_std_23)
-
-find_package(Threads REQUIRED)
-target_link_libraries(sql_server PUBLIC Threads::Threads)
 
 add_executable(sqldb-server server/main_server.cpp)
 target_link_libraries(sqldb-server PRIVATE sql_server)
@@ -296,7 +346,8 @@ target_include_directories(sql_client PUBLIC
 
 target_link_libraries(sql_client PUBLIC
     sql_session
-    sql_server   # 复用协议编解码
+    sql_server_protocol   # 复用协议编解码，不链接服务器框架
+    common_net            # 阻塞式 TCP transport
     fmt::fmt
 )
 

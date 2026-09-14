@@ -1,9 +1,9 @@
-// server/service.cpp
-#include "service.h"
+// common/svrkit/service.cpp
+#include "common/svrkit/service.h"
 
 #include <utility>
 
-namespace server {
+namespace common::svrkit {
 
 ServiceThread::ServiceThread(std::string name) : name_(std::move(name)) {}
 
@@ -72,4 +72,4 @@ void ServiceThread::run() {
   }
 }
 
-} // namespace server
+} // namespace common::svrkit

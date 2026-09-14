@@ -1,4 +1,4 @@
-// server/poller_poll.cpp —— poll(2) 后端：全平台兜底（零依赖、可移植）。
+// common/net/poller_poll.cpp —— poll(2) 后端：全平台兜底（零依赖、可移植）。
 // Poller::create() 也放这里（这个文件在哪都编译）。
 #include "poller.h"
 
@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-namespace server {
+namespace common::net {
 namespace {
 
 class PollPoller final : public Poller {
@@ -71,4 +71,4 @@ std::unique_ptr<Poller> Poller::create() {
   return make_poll_poller();
 }
 
-} // namespace server
+} // namespace common::net

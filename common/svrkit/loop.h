@@ -1,7 +1,7 @@
-// server/loop.h
+// common/svrkit/loop.h
 //
-// 每线程一个事件循环：`Poller`（平台相关的 kqueue/epoll/poll，见
-// poller.h）+ 定时器最小堆 + 跨线程唤醒管道。
+// 每线程一个事件循环：common::net::Poller（平台相关的 kqueue/epoll/poll，见
+// common/net/poller.h）+ 定时器最小堆 + 跨线程唤醒管道。
 //
 //   - 一个 Loop 归一条线程独占：`watch/unwatch/add_timer` 只能在 Loop
 //   线程调用；
@@ -18,10 +18,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "poller.h"
-#include "task.h"
+#include "common/net/poller.h"
+#include "common/svrkit/task.h"
 
-namespace server {
+namespace common::svrkit {
 
 class Loop {
 public:
@@ -65,7 +65,7 @@ private:
   std::string name_;
   std::atomic<bool> stop_{false};
 
-  std::unique_ptr<Poller> poller_; // 平台后端：kqueue / epoll / poll
+  std::unique_ptr<net::Poller> poller_; // 平台后端：kqueue / epoll / poll
   std::mutex mutex_;                          // 保护 pending_
   std::deque<std::function<void()>> pending_; // 跨线程投递的动作
   int wakeup_read_ = -1;
@@ -76,4 +76,4 @@ private:
   std::vector<std::pair<int64_t, std::function<void()>>> timers_;
 };
 
-} // namespace server
+} // namespace common::svrkit
