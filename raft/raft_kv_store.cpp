@@ -112,10 +112,12 @@ bool RaftKVStore::write_slot_held() const {
 }
 
 std::optional<kv::LeaderHint> RaftKVStore::leader_hint() {
-  // P2 slice: production is still a single group, so the redirect hint comes
-  // from group 0's leader. Per-statement multi-group routing on the server is
-  // the next slice (see server/server.cpp "多 group 的完整路由属于 P2").
-  RaftExecutor &executor = executor_for(0);
+  return leader_hint_for_group(0);
+}
+
+std::optional<kv::LeaderHint>
+RaftKVStore::leader_hint_for_group(uint64_t group) const {
+  RaftExecutor &executor = executor_for(group);
   const std::optional<NodeId> leader = executor.leader_hint();
   if (!leader.has_value() || *leader == executor.node_id()) {
     // No hint, or we *are* the leader: nothing to redirect.
@@ -247,7 +249,9 @@ kv::Status RaftKVEngine::check_group(uint64_t group, bool is_write) {
 
 kv::Status RaftKVEngine::get(const kv::Key &key, kv::ByteValue *value) {
   const uint64_t group = store_->router().group_for(key);
-  if (tx_ != nullptr) {
+  // @system/* 是元数据：读它不算"碰数据"，不绑定事务组，也不触发跨组规则
+  // （DML 执行期会读 schema，不能因此把自动提交事务绑到组 0）。
+  if (tx_ != nullptr && !store_->router().is_system_key(key)) {
     if (const kv::Status status = check_group(group, /*is_write=*/false);
         status != kv::Status::OK) {
       return status;
@@ -304,7 +308,7 @@ kv::Status RaftKVEngine::remove(const kv::Key &key) {
 
 bool RaftKVEngine::exists(const kv::Key &key) {
   const uint64_t group = store_->router().group_for(key);
-  if (tx_ != nullptr) {
+  if (tx_ != nullptr && !store_->router().is_system_key(key)) {
     if (check_group(group, /*is_write=*/false) != kv::Status::OK) {
       return false;
     }
@@ -326,9 +330,12 @@ kv::Status RaftKVEngine::get_batch(
   // Route: a batch spanning groups is a cross-group read. In a transaction it
   // goes through the strict/loose rules; outside one, a single statement must
   // stay within one group (one table), so reject it.
+  // @system/* 键不参与事务绑定（元数据读不算碰数据）。
   std::set<uint64_t> groups;
   for (const kv::Key &key : keys) {
-    groups.insert(store_->router().group_for(key));
+    if (!store_->router().is_system_key(key)) {
+      groups.insert(store_->router().group_for(key));
+    }
   }
   if (groups.size() > 1 && tx_ == nullptr) {
     const auto first = groups.begin();
@@ -473,7 +480,7 @@ RaftKVEngine::new_iterator(const kv::KeyRange &range) {
     last_error_ = kv::Status::CrossGroupTransaction;
     return nullptr;
   }
-  if (tx_ != nullptr) {
+  if (tx_ != nullptr && !store_->router().is_system_key(start)) {
     if (const kv::Status status = check_group(*group, /*is_write=*/false);
         status != kv::Status::OK) {
       last_error_ = status;
@@ -581,10 +588,13 @@ kv::Status RaftKVEngine::acquire_write_slot() {
   if (write_slot_) {
     return kv::Status::OK;
   }
-  // P2 slice: the session acquires the slot before a write statement is
-  // routed, so it defaults to group 0 (the single-group production path).
-  // Per-statement group routing before slot acquisition is the next slice.
+  // 无参版本兼容旧调用：事务已绑组则抢该组的槽，否则默认 0 号组。多组
+  // server 路径用带组版本（session 先按语句目标算组）。
   const uint64_t group = bound_group_.value_or(0);
+  return acquire_write_slot_for(group);
+}
+
+kv::Status RaftKVEngine::acquire_write_slot(uint64_t group) {
   return acquire_write_slot_for(group);
 }
 

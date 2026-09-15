@@ -63,6 +63,12 @@ public:
   const std::map<uint64_t, RaftExecutor *> &executors() const {
     return executors_;
   }
+  uint64_t group_for(const kv::Key &key) const { return router_.group_for(key); }
+  // 目标组的 leader hint（不是该组 leader 才有值），key 决定组。
+  std::optional<kv::LeaderHint> leader_hint_for(const kv::Key &key) override {
+    return leader_hint_for_group(router_.group_for(key));
+  }
+  std::optional<kv::LeaderHint> leader_hint_for_group(uint64_t group) const;
 
 private:
   friend class RaftKVEngine;
@@ -112,9 +118,13 @@ public:
   kv::Status rollback_transaction() override;
   bool in_transaction() const override;
   kv::Status acquire_write_slot() override;
+  kv::Status acquire_write_slot(uint64_t group) override;
   void release_write_slot() override;
   bool has_write_slot() const override;
   bool has_snapshot() const override;
+  uint64_t group_for_key(const kv::Key &key) const override {
+    return store_->router().group_for(key);
+  }
 
   void flush() override;
   std::string stats() const override;

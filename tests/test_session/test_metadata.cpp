@@ -28,6 +28,44 @@ TEST(Session, CrossGroupReadModeIsConnectionLevelState) {
   CHECK_FALSE(session.loose_cross_group_reads());
 }
 
+TEST(Session, RoutingKeyPointsAtTheStatementTarget) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  CHECK(sess_test::bootstrap(session, 0)); // shop 库 + users 表
+
+  // DML -> 表数据前缀（多 group 下决定数据组）。
+  auto dml = session.parse("INSERT INTO users (id) VALUES (1)");
+  CHECK(dml.has_value());
+  if (dml.has_value()) {
+    const auto key = session.routing_key(*dml);
+    CHECK_TRUE(key.has_value());
+    if (key.has_value()) {
+      CHECK_EQ(key->substr(0, 6), std::string("@data/"));
+    }
+  }
+
+  // DDL / USE -> @system 键（组 0）。
+  auto ddl = session.parse("CREATE TABLE t2 (id INT PRIMARY KEY)");
+  CHECK(ddl.has_value());
+  if (ddl.has_value()) {
+    CHECK_EQ(session.routing_key(*ddl).value_or(""),
+             std::string("@system/databases"));
+  }
+  auto use = session.parse("USE shop");
+  CHECK(use.has_value());
+  if (use.has_value()) {
+    CHECK_EQ(session.routing_key(*use).value_or(""),
+             std::string("@system/databases"));
+  }
+
+  // 事务语句不占组。
+  auto tx = session.parse("BEGIN");
+  CHECK(tx.has_value());
+  if (tx.has_value()) {
+    CHECK_FALSE(session.routing_key(*tx).has_value());
+  }
+}
+
 TEST(Metadata, DatabasesCarryTableCountAndCreationTime) {
   auto engine = sess_test::open_engine();
   session::Session session(engine, fake_clock);

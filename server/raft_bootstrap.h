@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common/svrkit/loop.h"
+#include "raft/group_router.h"
 #include "raft/leveldb_log_store.h"
 #include "raft/leveldb_request_result_store.h"
 #include "raft/kv_state_machine.h"
@@ -24,22 +25,31 @@
 
 namespace server {
 
+// One raft group's full stack: its own log/result stores, state machine
+// (over the shared business KV), node and runtime. All groups of a node share
+// a single RaftTcpTransport (multiplexed by group id) and one RaftKVStore.
+struct RaftGroupState {
+  raft::LevelDBLogStore log_store;
+  raft::LevelDBRequestResultStore request_results;
+  std::unique_ptr<raft::KVStateMachine> state_machine;
+  std::unique_ptr<raft::RaftNode> node;
+  std::unique_ptr<raft::RaftRuntime> runtime;
+};
+
 // Assembles the raft-enabled startup path and owns its shutdown order.
 //
-// Startup (mirrors the lifecycle section of
-// raft/codex_glm53_validate_design.md):
-//
+// Startup:
 //   local KVStore (state machine storage, opened by the caller)
-//     -> LevelDBLogStore            <log_path>/log
-//     -> LevelDBRequestResultStore  <log_path>/request_results
-//     -> KVStateMachine
-//     -> RaftTcpTransport           (sender thread starts here)
-//     -> RaftNode
-//     -> RaftRuntime                (the only thread that touches RaftNode)
-//     -> listen + inbound thread + heartbeat timer
-//     -> RaftKVStore                (what the SQL server sees)
+//     -> per group: LevelDBLogStore + LevelDBRequestResultStore + KVStateMachine
+//     -> RaftTcpTransport (one, shared by all groups; sender thread starts here)
+//     -> per group: RaftNode + RaftRuntime
+//     -> listen + inbound thread + heartbeat timer (ticks every group)
+//     -> RaftKVStore (what the SQL server sees)
 //
-// Shutdown is the reverse: timer -> transport -> runtime -> stores.
+// Single-group deployments use <log_path>/log and <log_path>/request_results
+// exactly as before; multi-group uses <log_path>/group<N>/... per group.
+//
+// Shutdown is the reverse: timer -> transport -> runtimes -> stores.
 class RaftBootstrap {
 public:
   struct Options {
@@ -64,30 +74,33 @@ public:
   RaftBootstrap(const RaftBootstrap &) = delete;
   RaftBootstrap &operator=(const RaftBootstrap &) = delete;
 
-  // Idempotent: stops the timer, the transport (sender + inbound), the raft
-  // service thread and closes the raft stores.
+  // Idempotent: stops the timer, the transport (sender + inbound), every raft
+  // service thread and closes every group's stores.
   void stop();
 
   std::shared_ptr<kv::KVStore> store() const { return store_; }
-  raft::RaftNode *node() const { return node_.get(); }
+  raft::RaftNode *node() const { return node(0); }
   raft::RaftTcpTransport *transport() const { return transport_.get(); }
+  size_t group_count() const { return groups_.size(); }
+  raft::RaftNode *node(size_t group) const {
+    return group < groups_.size() ? groups_[group]->node.get() : nullptr;
+  }
+  raft::RaftRuntime *runtime(size_t group) const {
+    return group < groups_.size() ? groups_[group]->runtime.get() : nullptr;
+  }
 
 private:
   RaftBootstrap() = default;
 
-  bool post_to_runtime(std::function<void()> work);
+  bool post_to_runtime(uint64_t group_id, std::function<void()> work);
   void on_tick();
   void arm_timer();
 
   Logger *logger_ = nullptr;
   std::shared_ptr<kv::KVStore> local_;
   raft::SystemClock clock_;
-  raft::LevelDBLogStore log_store_;
-  raft::LevelDBRequestResultStore request_results_;
-  std::unique_ptr<raft::KVStateMachine> state_machine_;
+  std::vector<std::unique_ptr<RaftGroupState>> groups_;
   std::unique_ptr<raft::RaftTcpTransport> transport_;
-  std::unique_ptr<raft::RaftNode> node_;
-  std::unique_ptr<raft::RaftRuntime> runtime_;
   std::shared_ptr<raft::RaftKVStore> store_;
   common::svrkit::Loop timer_loop_{"raft-timer"};
   std::thread timer_thread_;

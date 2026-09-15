@@ -454,9 +454,16 @@ public:
   // 申请写槽：已持有 -> OK；别的连接持有 -> Status::Busy。
   // 只读事务不必调用（这正是"读者不阻塞写者"的实现方式）。
   virtual Status acquire_write_slot() { return Status::NotSupported; }
+  // 多组（multi-raft）：申请**指定组**的写槽。非 raft 引擎忽略 group，
+  // 退化为无参版本。
+  virtual Status acquire_write_slot(uint64_t /*group*/) {
+    return acquire_write_slot();
+  }
   // 归还写槽（没持有则什么都不做）。事务的 commit/rollback 会自动归还。
   virtual void release_write_slot() {}
   virtual bool has_write_slot() const { return false; }
+  // 多组（multi-raft）：一个 key 属于哪个组。非 raft 引擎返回 0。
+  virtual uint64_t group_for_key(const Key & /*key*/) const { return 0; }
 
   // 当前是否有活跃快照（一致读视图）。测试/诊断用。
   virtual bool has_snapshot() const { return false; }
@@ -517,6 +524,12 @@ public:
   // 默认 nullopt = 单机存储没有这个概念；endpoint 为空表示只知道 node id。
   // server 据此回 NotLeader + 重定向信息，客户端可换节点重试。
   virtual std::optional<LeaderHint> leader_hint() { return std::nullopt; }
+  // 多组（multi-raft）：这个 key 的目标组的 leader hint。非 raft 引擎回退
+  // 到 leader_hint()（单机语义）。
+  virtual std::optional<LeaderHint> leader_hint_for(const Key &key) {
+    (void)key;
+    return leader_hint();
+  }
 };
 
 } // namespace kv

@@ -300,6 +300,34 @@ read_timeout_ms = 300
     CHECK_EQ(default_config->raft_read_timeout_ms(), uint64_t{0});
   }
 
+  // shards：合法解析 + 非法拒绝 + 默认单 group。
+  const auto shards_config = server::parse_config(R"(
+[raft]
+shards = @data/a,@data/b,1; @data/b,@data/c,2
+)");
+  CHECK(shards_config.has_value());
+  if (shards_config.has_value()) {
+    CHECK_TRUE(shards_config->validate().has_value());
+    const auto router = shards_config->raft_group_router();
+    CHECK_EQ(router.group_for("@data/a1"), uint64_t{1});
+    CHECK_EQ(router.group_for("@data/b1"), uint64_t{2});
+    CHECK_EQ(router.group_for("@system/databases"), uint64_t{0});
+  }
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+shards = @data/a,@data/c,1; @data/b,@data/d,2
+)"));
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+shards = @system/a,@system/b,1
+)"));
+  const auto default_shards = server::parse_config("");
+  CHECK(default_shards.has_value());
+  if (default_shards.has_value()) {
+    CHECK_EQ(default_shards->raft_group_router().group_for("@data/x"),
+             uint64_t{0});
+  }
+
   // heartbeat 必须小于 election timeout（开着关着都拦）。
   CHECK_FALSE(parses_and_validates(R"(
 [raft]

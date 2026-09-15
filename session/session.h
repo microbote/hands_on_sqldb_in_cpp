@@ -205,6 +205,9 @@ public:
   // 执行一个已经解析好的语句（建 Query + 校验 + 执行）
   std::expected<std::unique_ptr<exec::ResultCursor>, SessionError>
   execute_parsed(const ParsedStatement &parsed);
+  // 语句的目标路由 key（多 group 用）：DML -> 表数据前缀（数据组）；
+  // DDL/USE -> @system 键（组 0）；事务语句 -> nullopt（不占组）。
+  std::optional<kv::Key> routing_key(const ParsedStatement &parsed) const;
   // 解析失败的统一收尾：中止的事务里优先报"事务已中止"
   // （服务器把 parse 放到别的线程上跑，所以这个收尾要能单独调用）
   SessionError

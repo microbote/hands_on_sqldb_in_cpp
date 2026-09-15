@@ -40,31 +40,36 @@ ErrorFrame to_error_frame(const session::SessionError &error,
 
 // 语句执行入口：先问存储"这台是不是该干这事"。
 //
-// P1 只有一个 group，所以"本节点不是这个 group 的 leader"= 整条语句该换个
-// 节点执行：直接回 NotLeader（带 leader 的客户端地址），不碰本地状态机。
-// 多 group 的完整路由属于 P2，届时这里换成按 key 判定。
+// 按语句的目标组判定：DML 的目标是表数据前缀所在的组，DDL/USE 是组 0
+// （@system）。本节点不是该组 leader 就回 NotLeader + **该组** leader 的
+// 客户端地址，不碰本地状态机。事务语句不占组，跳过预检查（引擎内部报错）。
 //
-// 注意：leader_hint() 对 RaftKVStore 是一次阻塞提交（到 raft 服务线程），
+// 注意：leader_hint_for() 对 RaftKVStore 是一次阻塞提交（到 raft 服务线程），
 // 所以这个函数必须跑在服务线程/读池线程上，不能在 event loop 里直接调。
 std::expected<std::unique_ptr<exec::ResultCursor>, session::SessionError>
 execute_on_this_node(session::Session &session,
                      const session::ParsedStatement &parsed,
                      kv::KVStore &store,
                      std::optional<kv::LeaderHint> *leader_hint) {
-  if (auto hint = store.leader_hint(); hint.has_value()) {
-    *leader_hint = hint;
-    return std::unexpected(session::SessionError(
-        session::SessionErrorCode::NOT_LEADER,
-        hint->endpoint.empty()
-            ? "not the leader for this group"
-            : "not the leader for this group; leader is at " + hint->endpoint,
-        parsed.sql));
+  if (const auto routing = session.routing_key(parsed); routing.has_value()) {
+    if (auto hint = store.leader_hint_for(*routing); hint.has_value()) {
+      *leader_hint = hint;
+      return std::unexpected(session::SessionError(
+          session::SessionErrorCode::NOT_LEADER,
+          hint->endpoint.empty()
+              ? "not the leader for this group"
+              : "not the leader for this group; leader is at " +
+                    hint->endpoint,
+          parsed.sql));
+    }
   }
   auto result = session.execute_parsed(parsed);
   if (!result.has_value() &&
       result.error().code == session::SessionErrorCode::NOT_LEADER) {
     // 引擎自己报的 NotLeader（比如刚被降级）：把 hint 一起带给客户端。
-    *leader_hint = store.leader_hint();
+    if (const auto routing = session.routing_key(parsed); routing.has_value()) {
+      *leader_hint = store.leader_hint_for(*routing);
+    }
   }
   return result;
 }

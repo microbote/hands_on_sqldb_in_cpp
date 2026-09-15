@@ -62,6 +62,10 @@ peers =
 # 客户端可达的 SQL 地址（node_id@host:port）：本节点不是 leader 时用它回
 # "NotLeader + 该去哪台"，客户端据此重连。留空 = 只报错、不给重定向目标。
 sql_endpoints =
+# 数据分片表（P2 M1 静态分片）："<start>,<end>,<group_id>; ..."，分号分隔。
+# 每个条目给 group_id（>=1）一段 [start,end) 的 key range；@system/* 固定归
+# 0 号组，数据 range 不得覆盖它。留空 = 单 group（全部键归 0 号组）。
+shards =
 election_timeout_ms = 1000
 heartbeat_ms = 100
 # Raft 日志/HardState 的独立 LevelDB 目录（不要和业务数据共用一个目录）。
@@ -360,6 +364,13 @@ std::expected<void, std::string> Config::validate() const {
         "raft.election_timeout_ms");
   }
   const std::string raft_peers = get_string("raft.peers");
+  const std::string shards = get_string("raft.shards");
+  if (!shards.empty()) {
+    auto parsed = raft::GroupRouter::parse_shards(shards);
+    if (!parsed.has_value()) {
+      return std::unexpected("config key 'raft.shards': " + parsed.error());
+    }
+  }
   if (!raft_enabled) {
     // Still reject a malformed list when it is present, so a typo cannot hide
     // until the day raft is switched on.
@@ -569,6 +580,18 @@ uint64_t ServerConfig::raft_election_timeout_ms() const {
 
 uint64_t ServerConfig::raft_heartbeat_ms() const {
   return static_cast<uint64_t>(CFG_INT(generic_, raft.heartbeat_ms));
+}
+
+raft::GroupRouter ServerConfig::raft_group_router() const {
+  const std::string text = CFG_STR(generic_, raft.shards);
+  if (text.empty()) {
+    return raft::GroupRouter{}; // 单 group：全部键归 0 号组
+  }
+  auto parsed = raft::GroupRouter::parse_shards(text);
+  if (!parsed.has_value()) {
+    return raft::GroupRouter{}; // validate() 已经拦过；这里不抛，回单组
+  }
+  return std::move(*parsed);
 }
 
 uint64_t ServerConfig::raft_snapshot_entries() const {

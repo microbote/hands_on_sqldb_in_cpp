@@ -9,6 +9,7 @@
 #include "planner/optimizer.h"
 #include "planner/planner.h"
 #include "planner/rewriter.h"
+#include "relation/key_prefix.h"
 #include "sql_types/query.h"
 #include "sql_types/row.h"
 #include "sql_types/schema.h"
@@ -440,12 +441,19 @@ Session::execute_parsed(const ParsedStatement &parsed_stmt) {
   // 只读事务/查询不抢写槽，所以读者不会挡住写者。
   const bool own_transaction = !in_transaction_; // 显式事务里让位给事务本身
   const bool is_write_stmt = !query.is_select();
-  if (is_write_stmt && engine_ != nullptr &&
-      engine_->acquire_write_slot() != kv::Status::OK) {
-    return std::unexpected(SessionError(
-        SessionErrorCode::TRANSACTION_ERROR,
-        "another transaction is writing (busy); retry after it commits",
-        statement));
+  if (is_write_stmt && engine_ != nullptr) {
+    // 多 group：先按语句目标算出组，再抢**该组**的写槽（写事务不跨组）。
+    uint64_t group = 0;
+    const auto routing = routing_key(parsed_stmt);
+    if (routing.has_value()) {
+      group = engine_->group_for_key(*routing);
+    }
+    if (engine_->acquire_write_slot(group) != kv::Status::OK) {
+      return std::unexpected(SessionError(
+          SessionErrorCode::TRANSACTION_ERROR,
+          "another transaction is writing (busy); retry after it commits",
+          statement));
+    }
   }
 
   AutoCommit auto_commit((own_transaction && is_write_stmt) ? engine_.get()
@@ -618,6 +626,50 @@ std::vector<DatabaseInfo> Session::databases() const {
     result.push_back(std::move(info));
   }
   return result;
+}
+
+std::optional<kv::Key>
+Session::routing_key(const ParsedStatement &parsed) const {
+  const ASTNode *root = parsed.ast.get();
+  if (root == nullptr) {
+    return std::nullopt;
+  }
+  if (root->type == NODE_EXPLAIN) {
+    root = reinterpret_cast<const ExplainNode *>(root->data)->statement;
+    if (root == nullptr) {
+      return std::nullopt;
+    }
+  }
+  const char *table = nullptr;
+  switch (root->type) {
+  case NODE_SELECT:
+    table = reinterpret_cast<const SelectNode *>(root->data)->table;
+    break;
+  case NODE_INSERT:
+    table = reinterpret_cast<const InsertNode *>(root->data)->table;
+    break;
+  case NODE_UPDATE:
+    table = reinterpret_cast<const UpdateNode *>(root->data)->table;
+    break;
+  case NODE_DELETE:
+    table = reinterpret_cast<const DeleteNode *>(root->data)->table;
+    break;
+  case NODE_CREATE_TABLE:
+  case NODE_DROP_TABLE:
+  case NODE_CREATE_DATABASE:
+  case NODE_DROP_DATABASE:
+  case NODE_USE:
+    // DDL/USE 写 @system（组 0）。注意：DROP TABLE 在 M1 的多组下还会删
+    // 数据段（数据组），是已知不支持的跨组操作，这里按元数据组路由。
+    return sql::keys::databases();
+  default:
+    return std::nullopt; // 事务语句不占组
+  }
+  if (table == nullptr || table[0] == '\0') {
+    return std::nullopt;
+  }
+  return sql::keys::data_prefix(catalog_.current_database(),
+                                sql::Identifier(table));
 }
 
 std::vector<TableInfo> Session::tables(const sql::Identifier &db) const {

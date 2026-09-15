@@ -146,6 +146,39 @@ TEST(GroupRouter, RoutesSystemAndDataRanges) {
   CHECK_FALSE(router.batch_group(range_cross).has_value());
 }
 
+TEST(GroupRouter, ParseShardsValidatesAndRoutes) {
+  // 合法：两个数据组；key 里的 ':' 不受影响。
+  auto parsed = raft::GroupRouter::parse_shards(
+      "@data/1:a/5:users/,@data/1:a/6:orders/,1;"
+      "@data/1:a/6:orders/,@data/1:a/7:items/,2");
+  CHECK_TRUE(parsed.has_value());
+  if (!parsed.has_value()) {
+    return;
+  }
+  CHECK_EQ(parsed->group_for("@data/1:a/5:users/row1"), uint64_t{1});
+  CHECK_EQ(parsed->group_for("@data/1:a/6:orders/row1"), uint64_t{2});
+  CHECK_EQ(parsed->group_for("@system/databases"), uint64_t{0});
+
+  // 格式错误 / 空 range / 重叠 / 组 id 重复 / 组 0 / 覆盖 @system。
+  CHECK_FALSE(raft::GroupRouter::parse_shards("not-a-shard").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("a,,1").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("a,b").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("a,a,1").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("a,z,1;m,y,2").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("a,m,1;m,z,1").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("a,z,0").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("@,@t,1").has_value());
+  CHECK_FALSE(raft::GroupRouter::parse_shards("@system/a,@system/b,1")
+                  .has_value());
+
+  // 空文本 = 单 group 路由（全部归 0）。
+  auto empty = raft::GroupRouter::parse_shards("");
+  CHECK_TRUE(empty.has_value());
+  if (empty.has_value()) {
+    CHECK_EQ(empty->group_for("anything"), uint64_t{0});
+  }
+}
+
 TEST(GroupTransport, SharedTransportDispatchesByGroup) {
   TestNetwork network;
   auto transport = std::make_unique<TestTransport>(NodeId{1}, network);

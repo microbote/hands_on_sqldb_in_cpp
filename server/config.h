@@ -33,6 +33,7 @@
 #include <map>
 #include <vector>
 
+#include "raft/group_router.h"
 #include "raft/types.h"
 #include "sql_types/value.h"
 
@@ -127,6 +128,8 @@ public:
   // proposal / read 等待预算（0 = 回退到 election_timeout_ms）。
   uint64_t raft_proposal_timeout_ms() const;
   uint64_t raft_read_timeout_ms() const;
+  // 数据分片路由表（空 = 单 group）。validate() 已校验，这里直接解析。
+  raft::GroupRouter raft_group_router() const;
   std::string raft_log_path() const;
   // node id -> 客户端可达的 SQL "host:port"（空 map = 不给重定向目标）
   std::map<uint64_t, std::string> raft_sql_endpoints() const;

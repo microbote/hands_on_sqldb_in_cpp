@@ -21,6 +21,7 @@
 #include "server/config.h"
 #include "server/logger.h"
 #include "server/raft_bootstrap.h"
+#include "session/session.h"
 #include "storage/kv_engine/kv_factory.h"
 
 namespace {
@@ -196,6 +197,210 @@ TEST(RaftBootstrap, SingleNodeServesWritesAndSurvivesRestart) {
     (*bootstrap)->stop();
     CHECK_EQ(last_local->close(), kv::Status::OK);
   }
+}
+
+TEST(RaftBootstrap, MultiGroupStartsAndRoutesWritesPerGroup) {
+  TempDir dir;
+  CHECK_TRUE(!dir.path().empty());
+  auto logger = server::Logger::create("error", "");
+  CHECK_TRUE(logger.has_value());
+  if (!logger.has_value()) {
+    return;
+  }
+
+  // One node participates in three single-member groups (0/1/2): @system/*
+  // -> 0, @data/a..m -> 1, @data/m..zz -> 2. No listener needed (single
+  // member groups), so this runs in sandboxes.
+  const std::string config_text =
+      "[raft]\nenabled = true\nnode_id = 1\nlisten = 127.0.0.1:5434\n"
+      "peers = 1@127.0.0.1:5434\n"
+      "shards = @data/a,@data/m,1; @data/m,@data/zz,2\n"
+      "election_timeout_ms = 80\nheartbeat_ms = 20\n"
+      "log_path = " +
+      dir.path() + "/raft\n";
+  auto config = server::parse_config(config_text);
+  CHECK_TRUE(config.has_value());
+  if (!config.has_value()) {
+    return;
+  }
+  CHECK_TRUE(config->validate().has_value());
+
+  auto local = open_local(dir.path() + "/kv");
+  CHECK_TRUE(local != nullptr);
+  if (local == nullptr) {
+    return;
+  }
+
+  auto bootstrap = server::RaftBootstrap::open(
+      *config, local, **logger, server::RaftBootstrap::Options{false});
+  CHECK_TRUE(bootstrap.has_value());
+  if (!bootstrap.has_value()) {
+    return;
+  }
+  CHECK_EQ((*bootstrap)->group_count(), size_t{3});
+
+  // Every single-member group elects itself (the timer drives ticks).
+  const int64_t elect_deadline = now_ms() + 5000;
+  while (now_ms() < elect_deadline) {
+    bool all_leader = true;
+    for (size_t g = 0; g < (*bootstrap)->group_count(); ++g) {
+      if (!(*bootstrap)->node(g)->is_leader()) {
+        all_leader = false;
+        break;
+      }
+    }
+    if (all_leader) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  for (size_t g = 0; g < (*bootstrap)->group_count(); ++g) {
+    CHECK_TRUE((*bootstrap)->node(g)->is_leader());
+  }
+
+  auto engine = (*bootstrap)->store()->connect();
+  CHECK_TRUE(engine != nullptr);
+  if (engine == nullptr) {
+    (*bootstrap)->stop();
+    return;
+  }
+
+  // Writes route to their own group's raft log (per-group LevelDB stores).
+  CHECK_EQ(engine->put("@data/a1", "1"), kv::Status::OK);     // group 1
+  CHECK_EQ(engine->put("@data/z1", "2"), kv::Status::OK);     // group 2
+  CHECK_EQ(engine->put("@system/databases", "meta"),
+           kv::Status::OK); // group 0
+
+  const int64_t apply_deadline = now_ms() + 5000;
+  while (now_ms() < apply_deadline) {
+    bool all_applied = true;
+    for (size_t g = 0; g < (*bootstrap)->group_count(); ++g) {
+      if ((*bootstrap)->node(g)->applied_index() < 2) {
+        all_applied = false;
+        break;
+      }
+    }
+    if (all_applied) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  // Each group applied the election no-op + exactly one routed write.
+  for (size_t g = 0; g < (*bootstrap)->group_count(); ++g) {
+    CHECK_EQ((*bootstrap)->node(g)->applied_index(), uint64_t{2});
+  }
+
+  // The state machine (shared KV) sees all three writes.
+  CHECK_EQ(read_applied(*local, "@data/a1").value_or(""), std::string{"1"});
+  CHECK_EQ(read_applied(*local, "@data/z1").value_or(""), std::string{"2"});
+  CHECK_EQ(read_applied(*local, "@system/databases").value_or(""),
+           std::string{"meta"});
+
+  (*bootstrap)->stop();
+}
+
+TEST(RaftBootstrap, MultiGroupRunsSqlThroughPerGroupWriteSlots) {
+  TempDir dir;
+  CHECK_TRUE(!dir.path().empty());
+  auto logger = server::Logger::create("error", "");
+  CHECK_TRUE(logger.has_value());
+  if (!logger.has_value()) {
+    return;
+  }
+
+  const std::string config_text =
+      "[raft]\nenabled = true\nnode_id = 1\nlisten = 127.0.0.1:5434\n"
+      "peers = 1@127.0.0.1:5434\n"
+      // 真实表键形如 @data/<len db>:<db>/<len table>:<table>/，按库名长度切：
+      // shop(4) -> 组 1；更长的库名 -> 组 2。
+      "shards = @data/,@data/5:,1; @data/5:,@data/9:,2\n"
+      "election_timeout_ms = 80\nheartbeat_ms = 20\n"
+      "log_path = " +
+      dir.path() + "/raft\n";
+  auto config = server::parse_config(config_text);
+  CHECK_TRUE(config.has_value());
+  if (!config.has_value()) {
+    return;
+  }
+  auto local = open_local(dir.path() + "/kv");
+  CHECK_TRUE(local != nullptr);
+  if (local == nullptr) {
+    return;
+  }
+  auto bootstrap = server::RaftBootstrap::open(
+      *config, local, **logger, server::RaftBootstrap::Options{false});
+  CHECK_TRUE(bootstrap.has_value());
+  if (!bootstrap.has_value()) {
+    return;
+  }
+
+  // 等所有单成员组选出 leader，BEGIN 的 barrier 才能过。
+  const int64_t elect_deadline = now_ms() + 5000;
+  while (now_ms() < elect_deadline) {
+    bool all_leader = true;
+    for (size_t g = 0; g < (*bootstrap)->group_count(); ++g) {
+      if (!(*bootstrap)->node(g)->is_leader()) {
+        all_leader = false;
+        break;
+      }
+    }
+    if (all_leader) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+
+  auto engine = (*bootstrap)->store()->connect();
+  CHECK_TRUE(engine != nullptr);
+  if (engine == nullptr) {
+    (*bootstrap)->stop();
+    return;
+  }
+  session::Session session(engine);
+  auto exec = [&](const std::string &sql) {
+    auto result = session.execute(sql);
+    if (!result.has_value()) {
+      fmt::print(stderr, "[debug] sql failed: {} -> {}\n", sql,
+                 result.error().to_string());
+    }
+    return result.has_value();
+  };
+
+  // DDL 落在组 0（@system）；INSERT 落在组 1（表 t 的数据前缀在
+  // @data/a..m 区间）；SELECT 走组 1 读。写槽按语句目标组获取。
+  CHECK_TRUE(exec("CREATE DATABASE shop"));
+  CHECK_TRUE(exec("USE shop"));
+  CHECK_TRUE(exec("CREATE TABLE t (id INT PRIMARY KEY, v INT)"));
+  CHECK_TRUE(exec("INSERT INTO t (id, v) VALUES (1, 10)"));
+
+  const int64_t apply_deadline = now_ms() + 5000;
+  while (now_ms() < apply_deadline) {
+    if ((*bootstrap)->node(0)->applied_index() >= 3 &&
+        (*bootstrap)->node(1)->applied_index() >= 2) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  // 组 0：选举 no-op + CREATE DATABASE + CREATE TABLE 的若干元数据写。
+  // 组 1：选举 no-op + INSERT（表 t 落在 @data/4:shop/...）。
+  CHECK_GE((*bootstrap)->node(0)->applied_index(), uint64_t{3});
+  CHECK_EQ((*bootstrap)->node(1)->applied_index(), uint64_t{2});
+
+  auto select = session.execute("SELECT id, v FROM t");
+  CHECK_TRUE(select.has_value());
+  if (select.has_value()) {
+    bool got_row = false;
+    while (true) {
+      auto row = (*select)->next();
+      if (!row.has_value()) {
+        break;
+      }
+      got_row = true;
+    }
+    CHECK_TRUE(got_row);
+  }
+
+  (*bootstrap)->stop();
 }
 
 TEST(RaftCluster, ThreeNodesReplicateOverTcp) {
