@@ -12,7 +12,9 @@ KV 状态机桥接 / `RaftKVStore` + `RaftKVEngine` / ReadIndex 读屏障 / 组�
 各自本地压缩自己的日志。快照 blob 在需要时才生成并**按当前 applied index
 打标**，与内容保持一致。**Phase B 已落地**：事务级 read-index 合并、
 proposal/read 超时独立配置、`get_batch` 迭代器复用、apply 耗时监控。
-剩余工作见 §11（语句级读合并需 lease、成员变更、P2 多 group）。
+**Phase C 切片 1 已落地**：`GroupRouter` 静态路由（`@system/*` → 0 号组）、
+适配层多 group 路由、per-group 写槽、跨组事务 strict/loose 规则。
+剩余工作见 §11（语句级读合并需 lease、成员变更、P2 server 路由/每 group 快照）。
 本文件是实施方案，不是使用说明；职责/接口/踩坑见 `raft/README.md`。
 
 ## 0. 目标与范围

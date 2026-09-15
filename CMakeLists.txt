@@ -179,6 +179,7 @@ endif()
 # 它不接入 server 入口，也不认识 SQL；后续 P1 再增加 KV 适配层。
 # ============================================================
 add_library(sql_raft STATIC
+    raft/group_router.cpp
     raft/kv_state_machine.cpp
     raft/message_codec.cpp
     raft/peers.cpp

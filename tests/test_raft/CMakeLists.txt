@@ -5,6 +5,7 @@ add_executable(test_raft
     main.cpp
     test_raft.cpp
     test_raft_kv_store.cpp
+    test_raft_multi_group.cpp
     test_raft_message_codec.cpp
     test_raft_peers.cpp
     test_raft_runtime.cpp

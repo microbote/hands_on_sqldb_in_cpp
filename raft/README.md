@@ -23,6 +23,13 @@ barrier 覆盖整个持快照读阶段）、`raft.proposal_timeout_ms` / `raft.r
 （`apply_count / total_apply_ns / max_apply_ns`）。
 **仍留作后续**：lease 方案的语句级读合并、跨组只读模式、成员变更。
 
+**Phase C 切片 1（多 group 适配层路由）已落地**：`GroupRouter`
+（`@system/*` 固定 0 号组 + 数据 range 表）、`RaftKVStore` 泛化为多 group
+（单 group 路径行为不变）、**per-group 写槽**、跨组事务规则
+（写跨组拒绝；未写时跨组读 strict/loose，跨组后冻结只读；自动提交跨组
+batch/range 拒绝）。server 侧按语句路由、`CLIENT_OPTIONS` 帧、每 group
+独立快照留待切片 2。
+
 ## 模块结构
 
 | 文件 | 职责 |

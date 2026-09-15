@@ -407,20 +407,42 @@ follower 端有 1 GiB 待组装缓冲上限，超大快照仍需要后续做流�
 follower `BEGIN` 立即 NotLeader；`get_batch` 覆盖 store/覆盖层/缺失/重复 key
 且两种缺失策略语义不变；超时预算在运行时与配置层都可见。
 
-### Phase C：多 group（P2）
+### Phase C：多 group（P2）—— 切片 1（适配层路由）✅，切片 2 待做
 
-这是 DESIGN 里最大的未开始项：
+切片 1 已落地（2026-09-15）：
 
-1. 路由表 `key → group`：P1 先做静态 range 表，**写死 `@system/*` 落 0 号组**；
-2. `MultiRaft`（或等价管理类）持有 N 个 `RaftNode`，`RaftKVStore` 从直接持有
-   单节点改为路由；
-3. 写槽从“store 一把”拆成 per-group（§3.9 的 acquire/release 下沉到组）；
-4. 写事务跨组拒绝、跨组只读 `strict` / `loose` 模式 + `CLIENT_OPTIONS` 帧；
-   强制点在 `RaftKVEngine`，语句执行前报错，事务保持可回滚；
-5. 结构化错误：`CrossGroupTransaction` 带两个 group id；schema 读三态化。
+1. ✅ `GroupRouter`（`raft/group_router.{h,cpp}`）：`@system/*` 写死落 0 号组，
+   数据 range 表 `[start, end) → group_id`，未覆盖键回退 0 号组；提供
+   `group_for / range_group / batch_group`（batch/range 跨组即判定多组）。
+2. ✅ `RaftKVStore` 泛化成多 group：持有 `group_id → RaftExecutor*` + 路由表，
+   单 group 构造仍是一个 executor + 空路由表（行为与旧版逐字节一致，全部旧
+   测试未动）；`RaftKVEngine` 每个读写先路由到所属 group 的 executor。
+3. ✅ 写槽从 store 一把拆成 **per-group**（`write_slots_[group]`）：两个事务
+   写不同组互不阻塞，同组仍单写者。
+4. ✅ 跨组事务规则（DESIGN §3.1）落在 `RaftKVEngine::check_group`：
+   - 首个碰数据的操作绑定 group（读也算）；
+   - 写事务跨组 → 立即 `CrossGroupTransaction`，事务保持可回滚；
+   - 未写过时读别的组：`strict`（默认）拒绝 / `loose` 放行，一旦跨组事务冻结
+     为只读，任何再写都报错；
+   - 自动提交的单条 batch / range 跨组也直接拒绝。
+   `loose` 目前是引擎上的 setter（`set_loose_cross_group_reads`），客户端
+   `CLIENT_OPTIONS` 帧接线是切片 2。
 
-验收（DESIGN §9 P2 的验收标准）：两表并发写互不阻塞；写事务跨组报明确错误；
-`loose` 下 `BEGIN; SELECT a; SELECT b; COMMIT` 可跑，`strict` 下报错。
+**切片 1 的已知简化（切片 2 处理）**：
+- 事务快照仍是**全局一张** LevelDB 快照（BEGIN 时对每个 group 各取一次
+  barrier 再取快照）；DESIGN 的“每 group 独立快照 / loose 事务 = N 份
+  快照”需要存储层支持，未做。
+- server 侧仍是单 group 启动（bootstrap 只建一组），`leader_hint()` 报 0 号组；
+  “按语句判定 group 再抢写槽 / 回 NotLeader”的 server 路由是切片 2（代码注释
+  “多 group 的完整路由属于 P2”未变）。
+- 结构化错误仍只有状态码：`CrossGroupTransaction` 不带两个 group id；
+  schema 读三态化未做。
+- `begin_transaction` 每个 group 各一次 barrier：组数越多 BEGIN 越贵（与
+  DESIGN 的“N 份”成本方向一致），读只事务持快照阶段不追加 barrier。
+
+验收（已通过）：路由（含 `@system/*`）、按组状态机写入与 barrier 计数、
+per-group 写槽并发、跨组写拒绝可回滚、strict/loose 读规则、自动提交跨组
+batch/range 拒绝、跨组扫描拒绝。
 
 ### Phase D：成员变更与长期项（P3+）
 
