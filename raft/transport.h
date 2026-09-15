@@ -52,9 +52,13 @@ struct InstallSnapshotRequest {
   NodeId leader_id;
   uint64_t last_included_index = kInvalidIndex;
   uint64_t last_included_term = 0;
-  // Serialized state machine snapshot covering [start, last_included_index].
-  // P1 sends the whole snapshot in one frame; chunking is a follow-up for
-  // very large snapshots.
+  // Byte offset of this chunk within the serialized snapshot. The first
+  // chunk of a snapshot always has offset 0.
+  uint64_t offset = 0;
+  // True when this is the last chunk; the follower installs only then.
+  bool done = true;
+  // One chunk of the serialized state machine snapshot covering
+  // [start, last_included_index].
   std::string data;
 };
 

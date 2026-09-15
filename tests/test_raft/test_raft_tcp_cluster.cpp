@@ -55,7 +55,8 @@ public:
   ClusterNode(NodeId id, const std::vector<NodeId> &peers,
               AtomicManualClock &clock,
               std::function<std::expected<int, std::string>(const raft::PeerConfig &)>
-                  connector) {
+                  connector,
+              uint64_t snapshot_entries = 0) {
     local_ = std::make_shared<kv::MockStore>();
     CHECK_EQ(local_->open(kv::DatabaseOptions{}), kv::Status::OK);
     state_machine_ =
@@ -74,9 +75,11 @@ public:
         std::move(options), [this](std::function<void()> work) {
           return runtime_->post(std::move(work));
         });
+    raft::NodeConfig node_config{id, peers, 200, 40};
+    node_config.group_range = kv::KeyRange::from(kv::Key{});
+    node_config.snapshot_entries_threshold = snapshot_entries;
     node_ = std::make_unique<raft::RaftNode>(
-        raft::NodeConfig{id, peers, 200, 40}, log_, *transport_,
-        *state_machine_, clock);
+        std::move(node_config), log_, *transport_, *state_machine_, clock);
     runtime_ = std::make_unique<raft::RaftRuntime>(*node_, "raft-cluster");
     runtime_->start();
     std::expected<void, raft::Error> started;
@@ -106,6 +109,18 @@ public:
     bool leader = false;
     runtime_->run([&] { leader = node_->is_leader(); });
     return leader;
+  }
+
+  uint64_t last_included_index() {
+    uint64_t value = 0;
+    runtime_->run([&] { value = node_->last_included_index(); });
+    return value;
+  }
+
+  uint64_t last_log_index() {
+    uint64_t value = 0;
+    runtime_->run([&] { value = node_->last_log_index(); });
+    return value;
   }
 
   kv::Status applied_value(const kv::Key &key, kv::ByteValue *value) {
@@ -257,6 +272,205 @@ TEST(RaftTcpCluster, ThreeNodesElectAndReplicateOverRealSockets) {
   }
   CHECK_TRUE(all_replicas);
 
+  for (auto &node : nodes) {
+    node.reset();
+  }
+  for (auto &[key, wire] : wires) {
+    ::close(wire.dialer_fd);
+  }
+}
+
+TEST(RaftTcpCluster, LateFollowerCatchesUpViaSnapshotOverRealSockets) {
+  const std::vector<NodeId> ids{NodeId{1}, NodeId{2}, NodeId{3}, NodeId{4}};
+  AtomicManualClock clock;
+
+  // wires[(from,to)] = socketpair used when `from` dials `to`.
+  std::map<std::pair<uint64_t, uint64_t>, Wire> wires;
+  for (const NodeId from : ids) {
+    for (const NodeId to : ids) {
+      if (from == to) {
+        continue;
+      }
+      int pair[2] = {-1, -1};
+      CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+      wires[{from.value, to.value}] = Wire{pair[0], pair[1]};
+    }
+  }
+
+  auto make_connector = [&wires](NodeId id) {
+    return [&wires, id](const raft::PeerConfig &peer)
+        -> std::expected<int, std::string> {
+      const auto it = wires.find({id.value, peer.node_id.value});
+      if (it == wires.end()) {
+        return std::unexpected("no wire for this peer");
+      }
+      return ::dup(it->second.dialer_fd);
+    };
+  };
+
+  const std::vector<NodeId> first_three{NodeId{1}, NodeId{2}, NodeId{3}};
+  std::vector<std::unique_ptr<ClusterNode>> nodes;
+  for (const NodeId id : first_three) {
+    nodes.push_back(std::make_unique<ClusterNode>(
+        id, ids, clock, make_connector(id), /*snapshot_entries=*/3));
+  }
+  // Node 4 is created but its inbound side stays unattached until after the
+  // leader has compacted, so it is genuinely behind and must catch up via a
+  // snapshot transfer over real sockets.
+  auto node4 = std::make_unique<ClusterNode>(
+      NodeId{4}, ids, clock, make_connector(NodeId{4}), /*snapshot_entries=*/3);
+
+  for (const NodeId id : first_three) {
+    for (const NodeId peer : ids) {
+      if (peer == id) {
+        continue;
+      }
+      nodes[id.value - 1]->attach_inbound(
+          wires[{peer.value, id.value}].acceptor_fd);
+    }
+    nodes[id.value - 1]->start_inbound_loop();
+  }
+
+  std::vector<ClusterNode *> live{nodes[0].get(), nodes[1].get(),
+                                  nodes[2].get()};
+  auto tick_live = [&] {
+    clock.advance(20);
+    for (ClusterNode *node : live) {
+      node->runtime().request_tick();
+    }
+  };
+
+  // Nodes 1..3 form a quorum (3 of 4) and elect a leader without node 4.
+  ClusterNode *leader = nullptr;
+  const int64_t election_deadline = now_ms() + 8000;
+  while (now_ms() < election_deadline) {
+    tick_live();
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    int leaders = 0;
+    ClusterNode *candidate = nullptr;
+    for (auto &node : nodes) {
+      if (node->is_leader()) {
+        ++leaders;
+        candidate = node.get();
+      }
+    }
+    if (leaders == 1) {
+      leader = candidate;
+      break;
+    }
+  }
+  CHECK_TRUE(leader != nullptr);
+  if (leader == nullptr) {
+    for (auto &node : nodes) {
+      node.reset();
+    }
+    node4.reset();
+    for (auto &[key, wire] : wires) {
+      ::close(wire.dialer_fd);
+    }
+    return;
+  }
+
+  auto propose = [&](uint64_t request_id, const std::string &key) -> bool {
+    raft::ProposalPayload payload;
+    payload.client_id = 7;
+    payload.request_id = request_id;
+    payload.batch.put(key, "value-" + std::to_string(request_id));
+    auto proposal =
+        leader->runtime().propose(raft::encode_proposal_payload(payload));
+    CHECK_TRUE(proposal.has_value());
+    if (!proposal.has_value()) {
+      return false;
+    }
+    const int64_t deadline = now_ms() + 8000;
+    while (now_ms() < deadline) {
+      tick_live();
+      auto result = proposal->wait_for(std::chrono::milliseconds{0});
+      if (result.has_value() && result->committed) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    return false;
+  };
+
+  for (uint64_t i = 1; i <= 4; ++i) {
+    CHECK_TRUE(propose(i, "key-" + std::to_string(i)));
+  }
+
+  // Let the leader compact its log at the applied index.
+  const int64_t compact_deadline = now_ms() + 8000;
+  while (now_ms() < compact_deadline &&
+         leader->last_included_index() < 3) {
+    tick_live();
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  CHECK_GE(leader->last_included_index(), 3);
+
+  // Node 4 joins: attach its inbound connections and start its loop. The
+  // peers' outbound connections to node 4 were established at construction,
+  // so their frames are waiting in the socket buffers.
+  for (const NodeId peer : first_three) {
+    node4->attach_inbound(wires[{peer.value, NodeId{4}.value}].acceptor_fd);
+  }
+  node4->start_inbound_loop();
+  for (const NodeId id : first_three) {
+    nodes[id.value - 1]->attach_inbound(
+        wires[{NodeId{4}.value, id.value}].acceptor_fd);
+  }
+  live.push_back(node4.get());
+
+  // Node 4 must catch up via the snapshot: every pre-compaction key lands.
+  const int64_t catchup_deadline = now_ms() + 15000;
+  bool caught_up = false;
+  while (now_ms() < catchup_deadline) {
+    tick_live();
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    bool all = true;
+    for (uint64_t i = 1; i <= 4; ++i) {
+      kv::ByteValue value;
+      if (node4->applied_value("key-" + std::to_string(i), &value) !=
+          kv::Status::OK) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
+      caught_up = true;
+      break;
+    }
+  }
+  CHECK_TRUE(caught_up);
+  CHECK_GE(node4->last_included_index(), 3);
+
+  // A post-snapshot write replicates to all four nodes.
+  CHECK_TRUE(propose(5, "key-5"));
+  bool all_four = false;
+  const int64_t all_deadline = now_ms() + 8000;
+  while (now_ms() < all_deadline) {
+    all_four = true;
+    for (auto &node : nodes) {
+      kv::ByteValue value;
+      if (node->applied_value("key-5", &value) != kv::Status::OK) {
+        all_four = false;
+        break;
+      }
+    }
+    if (all_four) {
+      kv::ByteValue value;
+      if (node4->applied_value("key-5", &value) != kv::Status::OK) {
+        all_four = false;
+      }
+    }
+    if (all_four) {
+      break;
+    }
+    tick_live();
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  CHECK_TRUE(all_four);
+
+  node4.reset();
   for (auto &node : nodes) {
     node.reset();
   }

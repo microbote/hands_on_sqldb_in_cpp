@@ -10,12 +10,13 @@ SQL 侧适配。P1b 已落地：`RaftRuntime`（单服务线程）、RPC 二进�
 （`[raft] sql_endpoints` → ERROR 帧尾部 hint → 客户端自动重连重试一次）。
 **Phase A v1（快照/压缩）已落地**：`SnapshotMetadata` + `LogStore::install_snapshot()`
 （LevelDB 持久化快照点、重启恢复、压缩前缀在 `at()` 以边界项合成）、
-`InstallSnapshot` RPC 编解码与 TCP 直通、leader 侧按 `[raft] snapshot_entries`
-阈值生成快照并压缩日志、落后/新 follower 通过快照追赶并继续复制、
+`InstallSnapshot` RPC 编解码与 TCP 直通（**分片传输**：1 MiB/帧，绕开
+64 MiB 帧上限）、leader 侧按 `[raft] snapshot_entries` 阈值生成快照并压缩
+日志、落后/新 follower 通过快照追赶并继续复制（含真实 TCP 三/四节点端到端
+测试）、
 `KVStateMachine` 支持无上界（整 key space）快照生成/恢复。
-**仍留作后续**：分片式大快照传输（当前单帧、受 64MB 帧上限约束）、
-follower 本地压缩（现在只随快照安装发生）、read-index 合并、跨组只读模式、
-成员变更。
+**仍留作后续**：follower 本地压缩（现在只随快照安装发生）、read-index 合并、
+跨组只读模式、成员变更。
 
 ## 模块结构
 

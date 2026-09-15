@@ -353,24 +353,29 @@ read_barrier：目标 = 当前 commit_index
    两套实现均已改）。
 2. ✅ 新增 `InstallSnapshot` RPC（消息类型 5/6 + codec + TCP 直通），
    `AppendEntriesResponse` 增加失败时的 `hint_last_index`，leader 据此判断
-   follower 是否整体落后于压缩点、直接发快照而不是全量回放。
+   follower 是否整体落后于压缩点、直接发快照而不是全量回放；
+   **分片传输**：快照按 1 MiB/帧切成有序 chunk（offset + done），follower
+   在服务线程上按序累积，末帧到达才原子安装；乱序/重叠 chunk 一律返回失败
+   由 leader 整体重发（至少一次语义，幂等）。单帧 64 MiB 上限不再是瓶颈。
 3. ✅ 触发策略：`[raft] snapshot_entries`（默认 0 = 关闭），leader 在 tick 里
    当“日志条数 - 已压缩条数 ≥ 阈值”时以 `last_applied_` 为快照点，
    `KVStateMachine::snapshot(group_range)` → 截断日志 + 持久化元数据。
 4. ✅ 安装路径：follower 先 `restore(range, data)`（状态机数据），再
-   `install_snapshot()`（日志+元数据）；**单帧同步安装**跑在 raft 服务线程上，
-   新日志不会与安装交错，所以 P0 的“边收边追”暂存在本实现里天然不需要；
-   崩溃窗口（restore 后、压缩前）靠幂等 apply 兜底。
+   `install_snapshot()`（日志+元数据）；整次安装原子地跑在 raft 服务线程上，
+   同连接按序到达，所以 P0 的“边收边追”暂存在本实现里天然不需要；崩溃窗口
+   （restore 后、压缩前）靠幂等 apply 兜底。
 5. ✅ leader 侧 `send_append_entries` 发现 `next_index <= last_included` 时
    改发快照，发完乐观推进 `next/match`。
 
-**已知边界（后续）**：快照单帧传输，受 `kMaxFrameBytes = 64MB` 上限约束，
-超大库需要分片；压缩只发生在 leader，正常运行的 follower 只在收到快照时才
-压缩自己的日志；快照生成在 raft 服务线程上扫描全库，慢时挡心跳。
+**已知边界（后续）**：压缩只发生在 leader，正常运行的 follower 只在收到
+快照时才压缩自己的日志；快照生成在 raft 服务线程上扫描全库，慢时挡心跳；
+follower 端有 1 GiB 待组装缓冲上限，超大快照仍需要后续做流式落盘。
 
 验收（已通过）：单节点压缩后继续写 + 重启恢复压缩点；三节点 leader 压缩后
-新 follower 靠快照追平并继续复制；LevelDB 重启后快照元数据与日志前缀
-恢复正确；`KVStateMachine` 全 key space（无上界）快照生成/恢复。
+新 follower 靠快照追平并继续复制；**2.5 MiB 大快照跨多个 chunk 完整安装**；
+**四节点真实 TCP 上晚加入 follower 靠分片快照追平并继续复制**；LevelDB 重启后
+快照元数据与日志前缀恢复正确；`KVStateMachine` 全 key space（无上界）
+快照生成/恢复。
 
 ### Phase B：读路径与等待收敛
 

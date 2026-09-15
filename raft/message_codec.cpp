@@ -153,6 +153,8 @@ std::string encode_message(const Message &message) {
           put_u64(out, concrete.leader_id.value);
           put_u64(out, concrete.last_included_index);
           put_u64(out, concrete.last_included_term);
+          put_u64(out, concrete.offset);
+          put_u8(out, concrete.done ? 1 : 0);
           put_bytes(out, concrete.data);
         } else if constexpr (std::is_same_v<T, InstallSnapshotResponse>) {
           put_u8(out,
@@ -276,9 +278,12 @@ std::expected<Message, Error> decode_message(std::string_view payload) {
     auto leader = read_u64(payload, offset);
     auto last_included_index = read_u64(payload, offset);
     auto last_included_term = read_u64(payload, offset);
+    auto chunk_offset = read_u64(payload, offset);
+    auto done = read_bool(payload, offset);
     auto data = read_bytes(payload, offset);
     if (!term.has_value() || !leader.has_value() ||
         !last_included_index.has_value() || !last_included_term.has_value() ||
+        !chunk_offset.has_value() || !done.has_value() ||
         !data.has_value()) {
       return std::unexpected(truncated("InstallSnapshotRequest"));
     }
@@ -286,6 +291,8 @@ std::expected<Message, Error> decode_message(std::string_view payload) {
     request.leader_id = NodeId{*leader};
     request.last_included_index = *last_included_index;
     request.last_included_term = *last_included_term;
+    request.offset = *chunk_offset;
+    request.done = *done;
     request.data = std::move(*data);
     return finish(std::move(request));
   }

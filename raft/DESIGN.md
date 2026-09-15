@@ -8,7 +8,7 @@ KV 状态机桥接 / `RaftKVStore` + `RaftKVEngine` / ReadIndex 读屏障 / 组�
 `RaftRuntime` 单线程服务 / RPC 编解码 / TCP transport / `[raft]` 配置与
 `sqldb-server` 接线）。**Phase A v1（快照/压缩）已落地**：leader 侧按
 `[raft] snapshot_entries` 阈值生成快照并压缩日志，落后/新 follower 通过
-`InstallSnapshot` 追赶（当前单帧传输，分片式与 follower 本地压缩留作后续）。
+`InstallSnapshot` 追赶（**分片传输**，1 MiB/帧；follower 本地压缩留作后续）。
 剩余工作见 §11（read-index 合并、成员变更、P2 多 group、分片快照）。
 本文件是实施方案，不是使用说明；职责/接口/踩坑见 `raft/README.md`。
 

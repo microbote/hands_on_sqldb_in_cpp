@@ -84,6 +84,8 @@ TEST(MessageCodec, RoundTripsEveryMessageType) {
   snapshot_request.leader_id = NodeId{1};
   snapshot_request.last_included_index = 40;
   snapshot_request.last_included_term = 11;
+  snapshot_request.offset = 5;
+  snapshot_request.done = false;
   const std::string snapshot_data{"SQSN\x00\x01\xff", 8};
   snapshot_request.data = snapshot_data;
   auto decoded_snapshot_request =
@@ -96,6 +98,8 @@ TEST(MessageCodec, RoundTripsEveryMessageType) {
     CHECK_EQ(out.leader_id.value, uint64_t{1});
     CHECK_EQ(out.last_included_index, uint64_t{40});
     CHECK_EQ(out.last_included_term, uint64_t{11});
+    CHECK_EQ(out.offset, uint64_t{5});
+    CHECK_FALSE(out.done);
     CHECK_EQ(out.data, snapshot_data);
   }
 

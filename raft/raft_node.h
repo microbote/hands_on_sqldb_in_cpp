@@ -141,6 +141,17 @@ private:
   uint64_t heartbeat_round_ = 0;
   std::map<NodeId, uint64_t> peer_acked_round_;
 
+  // Chunked InstallSnapshot accumulation. The follower buffers chunks on the
+  // raft service thread and installs (state machine restore + log compaction)
+  // only when the final chunk arrives.
+  struct PendingSnapshot {
+    uint64_t term = 0;
+    uint64_t last_included_index = kInvalidIndex;
+    uint64_t last_included_term = 0;
+    std::string buffer;
+  };
+  std::optional<PendingSnapshot> pending_snapshot_;
+
   uint64_t election_deadline_ = 0;
   uint64_t next_heartbeat_ = 0;
   std::optional<Error> last_error_;

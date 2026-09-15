@@ -8,6 +8,12 @@
 namespace raft {
 namespace {
 
+// Leader snapshot transfer chunk size. Kept far below the 64 MiB frame cap so
+// a single chunk always fits in one frame.
+constexpr size_t kSnapshotChunkBytes = 1u << 20;
+// Follower-side guard against a broken leader filling memory with chunks.
+constexpr size_t kMaxPendingSnapshotBytes = 1ull << 30;
+
 bool log_is_up_to_date(uint64_t last_log_index, uint64_t last_log_term,
                        uint64_t candidate_index, uint64_t candidate_term) {
   if (candidate_term != last_log_term) {
@@ -85,6 +91,7 @@ std::expected<void, Error> RaftNode::start() {
   heartbeat_round_ = 0;
   peer_acked_round_.clear();
   pending_read_barriers_.clear();
+  pending_snapshot_.reset();
   reset_election_deadline();
 
   transport_.on_message(
@@ -300,6 +307,8 @@ RaftNode::become_follower(uint64_t term, std::optional<NodeId> leader_id) {
   }
   leader_id_ = std::move(leader_id);
   votes_received_.clear();
+  // A term change invalidates any half-received snapshot from the old leader.
+  pending_snapshot_.reset();
   reset_election_deadline();
   return {};
 }
@@ -537,6 +546,7 @@ RaftNode::handle_install_snapshot(NodeId from,
     transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
     return {};
   }
+  const bool term_changed = request.term > hard_state_.term;
   if (request.term > hard_state_.term ||
       (request.term == hard_state_.term && role_ != Role::Follower)) {
     if (auto result = become_follower(request.term, request.leader_id);
@@ -554,20 +564,56 @@ RaftNode::handle_install_snapshot(NodeId from,
     return {};
   }
 
+  // Accumulate the chunked snapshot on the raft service thread. Chunks from
+  // the leader arrive in order over one connection, so no staging of
+  // concurrent log entries is needed: the whole install happens atomically
+  // when the final chunk arrives, before any other message is processed.
+  if (request.offset == 0 || term_changed ||
+      !pending_snapshot_.has_value()) {
+    pending_snapshot_ = PendingSnapshot{request.term,
+                                        request.last_included_index,
+                                        request.last_included_term, {}};
+  }
+  PendingSnapshot &pending = *pending_snapshot_;
+  if (pending.last_included_index != request.last_included_index ||
+      pending.last_included_term != request.last_included_term ||
+      request.offset != pending.buffer.size()) {
+    // Out-of-order or overlapping chunks: the follower cannot assemble the
+    // snapshot. Drop it and ask the leader to resend from offset 0.
+    pending_snapshot_.reset();
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return {};
+  }
+  pending.buffer.append(request.data);
+  if (pending.buffer.size() > kMaxPendingSnapshotBytes) {
+    pending_snapshot_.reset();
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return std::unexpected(Error{
+        ErrorCode::InvalidArgument,
+        "raft snapshot exceeds the pending-buffer size limit"});
+  }
+
+  if (!request.done) {
+    return {}; // waiting for the remaining chunks
+  }
+
   // Restore the state machine data first: if we crash before the log store is
   // compacted, a restart replays the (idempotent) log over the restored data.
-  if (auto result = state_machine_.restore(snapshot_range(), request.data);
+  if (auto result = state_machine_.restore(snapshot_range(), pending.buffer);
       !result.has_value()) {
+    pending_snapshot_.reset();
     transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
     return std::unexpected(result.error());
   }
 
-  SnapshotMetadata meta{request.last_included_index,
-                        request.last_included_term};
+  SnapshotMetadata meta{pending.last_included_index,
+                        pending.last_included_term};
   if (auto result = log_store_.install_snapshot(meta); !result.has_value()) {
+    pending_snapshot_.reset();
     transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
     return std::unexpected(result.error());
   }
+  pending_snapshot_.reset();
 
   last_included_index_ = meta.last_included_index;
   last_included_term_ = meta.last_included_term;
@@ -676,14 +722,37 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
     return std::unexpected(data.error());
   }
 
-  InstallSnapshotRequest request;
-  request.term = hard_state_.term;
-  request.leader_id = config_.node_id;
-  request.last_included_index = last_included_index_;
-  request.last_included_term = last_included_term_;
-  request.data = *data;
-
-  transport_.send(to, request);
+  // Split the snapshot into ordered chunks. They are enqueued in one call, so
+  // they stay in order on the outbound queue; the transport preserves
+  // per-connection ordering, so the follower assembles them in order.
+  uint64_t offset = 0;
+  const std::string &blob = *data;
+  while (offset < blob.size()) {
+    const size_t take =
+        std::min(kSnapshotChunkBytes, static_cast<size_t>(blob.size() - offset));
+    InstallSnapshotRequest request;
+    request.term = hard_state_.term;
+    request.leader_id = config_.node_id;
+    request.last_included_index = last_included_index_;
+    request.last_included_term = last_included_term_;
+    request.offset = offset;
+    request.done = (offset + take == blob.size());
+    request.data = blob.substr(offset, take);
+    transport_.send(to, request);
+    offset += take;
+  }
+  if (blob.empty()) {
+    // A degenerate empty snapshot still needs one frame so the follower knows
+    // the transfer is complete.
+    InstallSnapshotRequest request;
+    request.term = hard_state_.term;
+    request.leader_id = config_.node_id;
+    request.last_included_index = last_included_index_;
+    request.last_included_term = last_included_term_;
+    request.offset = 0;
+    request.done = true;
+    transport_.send(to, request);
+  }
 
   // Optimistically move the follower past the snapshot; the next
   // AppendEntries verifies and refines the progress.

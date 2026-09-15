@@ -939,6 +939,123 @@ TEST(RaftCore, NewFollowerCatchesUpViaSnapshot) {
   CHECK_TRUE(n3->state_machine.contains("post-2"));
 }
 
+namespace {
+// Large enough to span several 1 MiB snapshot transfer chunks.
+constexpr size_t kLargeSnapshotBytes = 2'500'000;
+} // namespace
+
+TEST(RaftCore, LargeSnapshotInstallsAcrossMultipleChunks) {
+  class LargeSnapshotStateMachine final : public raft::StateMachine {
+  public:
+    std::expected<std::string, raft::Error>
+    apply(const raft::LogEntry &entry) override {
+      applied.push_back(entry.data);
+      return entry.data;
+    }
+
+    std::expected<std::string, raft::Error>
+    snapshot(kv::KeyRange) override {
+      return std::string(kLargeSnapshotBytes, 'S');
+    }
+
+    std::expected<void, raft::Error> restore(std::string_view data) override {
+      restored_data.assign(data);
+      return {};
+    }
+
+    bool contains(const std::string &data) const {
+      return std::find(applied.begin(), applied.end(), data) != applied.end();
+    }
+
+    std::vector<std::string> applied;
+    std::string restored_data;
+  };
+
+  struct LargeNode {
+    raft::MemoryLogStore log;
+    LargeSnapshotStateMachine state_machine;
+    std::unique_ptr<TestTransport> transport;
+    std::unique_ptr<raft::RaftNode> node;
+  };
+
+  using raft::NodeId;
+  ManualClock clock;
+  TestNetwork network;
+  const std::vector<NodeId> peers{NodeId{1}, NodeId{2}, NodeId{3}};
+  const uint64_t threshold = 3;
+
+  auto make_node = [&](NodeId id) -> std::unique_ptr<LargeNode> {
+    auto test_node = std::make_unique<LargeNode>();
+    test_node->transport = std::make_unique<TestTransport>(id, network);
+    test_node->node = std::make_unique<raft::RaftNode>(
+        raft::NodeConfig{id, peers, 100, 10, kv::KeyRange::from(kv::Key{}),
+                         threshold},
+        test_node->log, *test_node->transport, test_node->state_machine,
+        clock);
+    network.bind(id, test_node->node.get());
+    return test_node;
+  };
+
+  auto n1 = make_node(NodeId{1});
+  auto n2 = make_node(NodeId{2});
+  std::vector<raft::RaftNode *> live{n1->node.get(), n2->node.get()};
+  auto step = [&](uint64_t ms = 10) {
+    clock.advance(ms);
+    for (raft::RaftNode *n : live) {
+      n->tick();
+    }
+    network.deliver_all();
+  };
+
+  CHECK_TRUE(n1->node->start().has_value());
+  CHECK_TRUE(n2->node->start().has_value());
+  for (int i = 0; i < 20; ++i) {
+    step();
+  }
+  raft::RaftNode *leader =
+      n1->node->is_leader() ? n1->node.get() : n2->node.get();
+  CHECK_TRUE(leader->is_leader());
+
+  auto propose_and_wait = [&](const std::string &data) {
+    auto proposal = leader->propose(data);
+    CHECK_TRUE(proposal.has_value());
+    for (int i = 0; i < 200 && !proposal->done(); ++i) {
+      step();
+    }
+    auto committed = proposal->wait();
+    CHECK_TRUE(committed.has_value());
+  };
+
+  for (uint64_t i = 1; i <= 4; ++i) {
+    propose_and_wait("pre-" + std::to_string(i));
+  }
+  for (int i = 0; i < 5; ++i) {
+    step();
+  }
+  const uint64_t included = leader->last_included_index();
+  CHECK_GE(included, 3);
+
+  // A new follower catches up via a snapshot that spans multiple chunks.
+  auto n3 = make_node(NodeId{3});
+  CHECK_TRUE(n3->node->start().has_value());
+  live.push_back(n3->node.get());
+  for (int i = 0; i < 60; ++i) {
+    step();
+  }
+
+  CHECK_EQ(n3->state_machine.restored_data.size(), kLargeSnapshotBytes);
+  CHECK_TRUE(std::all_of(n3->state_machine.restored_data.begin(),
+                         n3->state_machine.restored_data.end(),
+                         [](char c) { return c == 'S'; }));
+  CHECK_EQ(n3->node->last_included_index(), included);
+  CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
+
+  propose_and_wait("post");
+  CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
+  CHECK_EQ(n3->node->applied_index(), leader->applied_index());
+  CHECK_TRUE(n3->state_machine.contains("post"));
+}
+
 TEST(ProposalPayload, RoundTripsAllWriteBatchOperations) {
   raft::ProposalPayload payload;
   payload.client_id = 42;
