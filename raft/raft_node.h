@@ -98,6 +98,11 @@ private:
   std::expected<void, Error> send_snapshot(NodeId to);
   std::expected<void, Error> maybe_compact_log();
   void send_heartbeats();
+  // Convenience wrapper: every outbound message carries this node's group id,
+  // so a transport shared by several groups can route it correctly.
+  void send(NodeId to, const Message &message) {
+    transport_.send(to, config_.group_id, message);
+  }
   std::expected<void, Error> advance_commit();
   std::expected<void, Error> apply_committed();
   void complete_applied_proposal(uint64_t index,

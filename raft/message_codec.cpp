@@ -108,9 +108,10 @@ void put_entry(std::string &out, const LogEntry &entry) {
 
 } // namespace
 
-std::string encode_message(const Message &message) {
+std::string encode_message(uint64_t group_id, const Message &message) {
   std::string out;
   put_u8(out, kMessageVersion);
+  put_u64(out, group_id);
 
   std::visit(
       [&](const auto &concrete) {
@@ -170,7 +171,8 @@ std::string encode_message(const Message &message) {
   return out;
 }
 
-std::expected<Message, Error> decode_message(std::string_view payload) {
+std::expected<DecodedRaftMessage, Error>
+decode_message(std::string_view payload) {
   size_t offset = 0;
   auto version = read_u8(payload, offset);
   if (!version.has_value()) {
@@ -180,16 +182,21 @@ std::expected<Message, Error> decode_message(std::string_view payload) {
     return std::unexpected(
         malformed("unsupported version " + std::to_string(*version)));
   }
+  auto group_id = read_u64(payload, offset);
+  if (!group_id.has_value()) {
+    return std::unexpected(group_id.error());
+  }
   auto type = read_u8(payload, offset);
   if (!type.has_value()) {
     return std::unexpected(type.error());
   }
 
-  const auto finish = [&](Message message) -> std::expected<Message, Error> {
+  const auto finish =
+      [&](Message message) -> std::expected<DecodedRaftMessage, Error> {
     if (offset != payload.size()) {
       return std::unexpected(malformed("trailing bytes"));
     }
-    return message;
+    return DecodedRaftMessage{*group_id, std::move(message)};
   };
 
   switch (static_cast<MessageType>(*type)) {
@@ -309,8 +316,8 @@ std::expected<Message, Error> decode_message(std::string_view payload) {
       malformed("unknown message type " + std::to_string(*type)));
 }
 
-std::string encode_frame(const Message &message) {
-  return frame_payload(encode_message(message));
+std::string encode_frame(uint64_t group_id, const Message &message) {
+  return frame_payload(encode_message(group_id, message));
 }
 
 std::string frame_payload(std::string_view payload) {
@@ -334,7 +341,8 @@ std::expected<std::string, Error> unframe_payload(std::string_view frame) {
   return std::string{frame.substr(offset)};
 }
 
-std::expected<Message, Error> decode_frame(std::string_view frame) {
+std::expected<DecodedRaftMessage, Error>
+decode_frame(std::string_view frame) {
   auto payload = unframe_payload(frame);
   if (!payload.has_value()) {
     return std::unexpected(payload.error());

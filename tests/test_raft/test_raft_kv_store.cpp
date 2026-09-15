@@ -50,6 +50,7 @@ public:
 
   raft::RaftNode *node() { return node_.get(); }
   raft::RaftKVStore *store() { return store_.get(); }
+  TestTransport *transport() { return transport_.get(); }
 
   std::shared_ptr<kv::KVEngine> connect() { return store_->connect(); }
 
@@ -79,7 +80,7 @@ public:
       auto node = std::make_unique<KVTestNode>(id, ids_, clock_, network_,
                                               election_timeout_, heartbeat_,
                                               client_endpoints_);
-      network_.bind(id, node->node());
+      network_.bind(id, node->transport());
       nodes_[id] = std::move(node);
     }
   }

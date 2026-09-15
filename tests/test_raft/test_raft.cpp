@@ -73,7 +73,7 @@ public:
           raft::NodeConfig{id, ids_, election_timeout, heartbeat},
           test_node->log, *test_node->transport,
           test_node->state_machine, clock_);
-      network_.bind(id, test_node->node.get());
+      network_.bind(id, test_node->transport.get());
       nodes_[id] = std::move(test_node);
     }
   }
@@ -862,7 +862,7 @@ TEST(RaftCore, NewFollowerCatchesUpViaSnapshot) {
                          threshold},
         test_node->log, *test_node->transport, test_node->state_machine,
         clock);
-    network.bind(id, test_node->node.get());
+    network.bind(id, test_node->transport.get());
     return test_node;
   };
 
@@ -994,7 +994,7 @@ TEST(RaftCore, LargeSnapshotInstallsAcrossMultipleChunks) {
                          threshold},
         test_node->log, *test_node->transport, test_node->state_machine,
         clock);
-    network.bind(id, test_node->node.get());
+    network.bind(id, test_node->transport.get());
     return test_node;
   };
 
@@ -1073,7 +1073,7 @@ TEST(RaftCore, UpToDateFollowerCompactsItsOwnLog) {
                          threshold},
         test_node->log, *test_node->transport, test_node->state_machine,
         clock);
-    network.bind(id, test_node->node.get());
+    network.bind(id, test_node->transport.get());
     return test_node;
   };
 

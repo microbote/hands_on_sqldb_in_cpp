@@ -95,6 +95,7 @@ std::expected<void, Error> RaftNode::start() {
   reset_election_deadline();
 
   transport_.on_message(
+      config_.group_id,
       [this](NodeId from, const Message &message) {
         handle_message(from, message);
       });
@@ -242,7 +243,7 @@ std::expected<void, Error> RaftNode::start_election() {
     if (peer == config_.node_id) {
       continue;
     }
-    transport_.send(peer,
+    send(peer,
                    RequestVoteRequest{hard_state_.term, config_.node_id,
                                       last_log_index_, *last_term});
   }
@@ -315,7 +316,7 @@ RaftNode::become_follower(uint64_t term, std::optional<NodeId> leader_id) {
 std::expected<void, Error>
 RaftNode::handle_request_vote(NodeId from, const RequestVoteRequest &request) {
   if (request.term < hard_state_.term) {
-    transport_.send(from, RequestVoteResponse{hard_state_.term, false});
+    send(from, RequestVoteResponse{hard_state_.term, false});
     return {};
   }
   if (request.term > hard_state_.term) {
@@ -348,7 +349,7 @@ RaftNode::handle_request_vote(NodeId from, const RequestVoteRequest &request) {
     reset_election_deadline();
   }
 
-  transport_.send(from, RequestVoteResponse{hard_state_.term, granted});
+  send(from, RequestVoteResponse{hard_state_.term, granted});
   return {};
 }
 
@@ -379,7 +380,7 @@ std::expected<void, Error>
 RaftNode::handle_append_entries(NodeId from,
                                 const AppendEntriesRequest &request) {
   if (request.term < hard_state_.term) {
-    transport_.send(
+    send(
         from, AppendEntriesResponse{hard_state_.term, false, 0, request.round});
     return {};
   }
@@ -396,7 +397,7 @@ RaftNode::handle_append_entries(NodeId from,
   }
 
   if (request.prev_log_index > last_log_index_) {
-    transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
+    send(from, AppendEntriesResponse{hard_state_.term, false, 0,
                                                 request.round, last_log_index_});
     return {};
   }
@@ -405,7 +406,7 @@ RaftNode::handle_append_entries(NodeId from,
   // only known at the snapshot boundary; anything below it cannot be
   // verified, so reject and let the leader fall back to a snapshot.
   if (request.prev_log_index < last_included_index_) {
-    transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
+    send(from, AppendEntriesResponse{hard_state_.term, false, 0,
                                                 request.round, last_log_index_});
     return {};
   }
@@ -422,7 +423,7 @@ RaftNode::handle_append_entries(NodeId from,
       prev_term = prev->term;
     }
     if (prev_term != request.prev_log_term) {
-      transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
+      send(from, AppendEntriesResponse{hard_state_.term, false, 0,
                                                   request.round,
                                                   last_log_index_});
       return {};
@@ -476,7 +477,7 @@ RaftNode::handle_append_entries(NodeId from,
   }
 
   auto apply_result = apply_committed();
-  transport_.send(
+  send(
       from, AppendEntriesResponse{hard_state_.term, true, match_index,
                                   request.round});
   if (!apply_result.has_value()) {
@@ -542,7 +543,7 @@ std::expected<void, Error>
 RaftNode::handle_install_snapshot(NodeId from,
                                   const InstallSnapshotRequest &request) {
   if (request.term < hard_state_.term) {
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return {};
   }
   const bool term_changed = request.term > hard_state_.term;
@@ -559,7 +560,7 @@ RaftNode::handle_install_snapshot(NodeId from,
 
   if (request.last_included_index == kInvalidIndex ||
       request.last_included_term == 0) {
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return {};
   }
 
@@ -569,7 +570,7 @@ RaftNode::handle_install_snapshot(NodeId from,
   // (it only snapshots peers behind its compaction point); refuse loudly and
   // let the leader retry with a newer snapshot.
   if (request.last_included_index < last_applied_) {
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return {};
   }
 
@@ -590,13 +591,13 @@ RaftNode::handle_install_snapshot(NodeId from,
     // Out-of-order or overlapping chunks: the follower cannot assemble the
     // snapshot. Drop it and ask the leader to resend from offset 0.
     pending_snapshot_.reset();
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return {};
   }
   pending.buffer.append(request.data);
   if (pending.buffer.size() > kMaxPendingSnapshotBytes) {
     pending_snapshot_.reset();
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return std::unexpected(Error{
         ErrorCode::InvalidArgument,
         "raft snapshot exceeds the pending-buffer size limit"});
@@ -611,7 +612,7 @@ RaftNode::handle_install_snapshot(NodeId from,
   if (auto result = state_machine_.restore(snapshot_range(), pending.buffer);
       !result.has_value()) {
     pending_snapshot_.reset();
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return std::unexpected(result.error());
   }
 
@@ -619,7 +620,7 @@ RaftNode::handle_install_snapshot(NodeId from,
                         pending.last_included_term};
   if (auto result = log_store_.install_snapshot(meta); !result.has_value()) {
     pending_snapshot_.reset();
-    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    send(from, InstallSnapshotResponse{hard_state_.term, false});
     return std::unexpected(result.error());
   }
   pending_snapshot_.reset();
@@ -640,7 +641,7 @@ RaftNode::handle_install_snapshot(NodeId from,
   complete_applied_proposals_upto(meta.last_included_index);
   evaluate_read_barriers();
 
-  transport_.send(from, InstallSnapshotResponse{hard_state_.term, true});
+  send(from, InstallSnapshotResponse{hard_state_.term, true});
   return {};
 }
 
@@ -718,7 +719,7 @@ std::expected<void, Error> RaftNode::send_append_entries(NodeId to) {
     request.entries.push_back(LogEntryMessage{*entry});
   }
 
-  transport_.send(to, request);
+  send(to, request);
   return {};
 }
 
@@ -763,7 +764,7 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
     request.offset = offset;
     request.done = (offset + take == blob.size());
     request.data = blob.substr(offset, take);
-    transport_.send(to, request);
+    send(to, request);
     offset += take;
   }
   if (blob.empty()) {
@@ -776,7 +777,7 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
     request.last_included_term = included_term;
     request.offset = 0;
     request.done = true;
-    transport_.send(to, request);
+    send(to, request);
   }
 
   // Optimistically move the follower past the snapshot; the next

@@ -72,7 +72,8 @@ public:
     options.connect = std::move(connector);
     options.reconnect_backoff_ms = 20;
     transport_ = std::make_unique<raft::RaftTcpTransport>(
-        std::move(options), [this](std::function<void()> work) {
+        std::move(options),
+        [this](uint64_t /*group_id*/, std::function<void()> work) {
           return runtime_->post(std::move(work));
         });
     raft::NodeConfig node_config{id, peers, 200, 40};

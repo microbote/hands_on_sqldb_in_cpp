@@ -53,7 +53,7 @@ public:
                                10},
               log_, transport_, state_machine_, clock_),
         runtime_(node_, "raft-test", proposal_timeout_ms, read_timeout_ms) {
-    network_.bind(NodeId{1}, &node_);
+    network_.bind(NodeId{1}, &transport_);
     CHECK_TRUE(node_.start().has_value());
   }
 

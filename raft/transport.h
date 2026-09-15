@@ -73,12 +73,16 @@ using Message = std::variant<RequestVoteRequest, RequestVoteResponse,
 
 // Transport is asynchronous from RaftNode's perspective. Implementations must
 // queue send() calls rather than synchronously re-entering RaftNode.
+//
+// A transport may be shared by several RaftNodes (one per group): every
+// message carries the sender's group id, and on_message() registers per group.
 class Transport {
 public:
   virtual ~Transport() = default;
 
-  virtual void send(NodeId to, const Message &message) = 0;
+  virtual void send(NodeId to, uint64_t group_id, const Message &message) = 0;
   virtual void on_message(
+      uint64_t group_id,
       std::function<void(NodeId /*from*/, const Message &)> callback) = 0;
 };
 

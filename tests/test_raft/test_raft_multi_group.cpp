@@ -49,7 +49,7 @@ std::unique_ptr<Group> make_group(NodeId node_id, ManualClock &clock,
       raft::NodeConfig{node_id, std::vector<NodeId>{node_id}, 100, 10,
                        kv::KeyRange::from(kv::Key{}), 0},
       group->log, *group->transport, *group->state_machine, clock);
-  network.bind(node_id, group->node.get());
+  network.bind(node_id, group->transport.get());
   group->executor = std::make_unique<raft::RaftNodeExecutor>(*group->node);
   return group;
 }
@@ -144,6 +144,32 @@ TEST(GroupRouter, RoutesSystemAndDataRanges) {
   kv::WriteBatch range_cross;
   range_cross.remove_range("a", "n"); // ["a","n") spans groups 1 and 2
   CHECK_FALSE(router.batch_group(range_cross).has_value());
+}
+
+TEST(GroupTransport, SharedTransportDispatchesByGroup) {
+  TestNetwork network;
+  auto transport = std::make_unique<TestTransport>(NodeId{1}, network);
+  network.bind(NodeId{1}, transport.get());
+
+  int group0 = 0;
+  int group1 = 0;
+  transport->on_message(0, [&](NodeId, const raft::Message &) { ++group0; });
+  transport->on_message(1, [&](NodeId, const raft::Message &) { ++group1; });
+
+  network.enqueue(NodeId{2}, NodeId{1}, 0,
+                  raft::RequestVoteRequest{1, NodeId{2}, 0, 0});
+  network.enqueue(NodeId{2}, NodeId{1}, 1,
+                  raft::AppendEntriesRequest{1, NodeId{2}, 0, 0, {}, 1, 2});
+  network.deliver_all();
+  CHECK_EQ(group0, 1);
+  CHECK_EQ(group1, 1);
+
+  // A group nobody registered is dropped, not delivered to another group.
+  network.enqueue(NodeId{2}, NodeId{1}, 7,
+                  raft::RequestVoteResponse{1, true});
+  network.deliver_all();
+  CHECK_EQ(group0, 1);
+  CHECK_EQ(group1, 1);
 }
 
 TEST(MultiGroup, WritesRouteToTheirOwnGroupStateMachine) {

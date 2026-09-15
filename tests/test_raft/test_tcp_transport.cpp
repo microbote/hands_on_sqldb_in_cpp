@@ -127,9 +127,9 @@ TEST(TcpTransport, SendsHandshakeThenFramesInOrder) {
   };
 
   raft::RaftTcpTransport transport(
-      options, [](std::function<void()>) { return true; });
-  transport.send(NodeId{2}, raft::RequestVoteRequest{5, NodeId{1}, 3, 2});
-  transport.send(NodeId{2}, raft::AppendEntriesResponse{5, true, 4, 7});
+      options, [](uint64_t, std::function<void()>) { return true; });
+  transport.send(NodeId{2}, 0, raft::RequestVoteRequest{5, NodeId{1}, 3, 2});
+  transport.send(NodeId{2}, 0, raft::AppendEntriesResponse{5, true, 4, 7});
 
   const std::vector<std::string> frames = read_frames(pair[0], 3, 2000);
   CHECK_EQ(frames.size(), size_t{3});
@@ -149,7 +149,7 @@ TEST(TcpTransport, SendsHandshakeThenFramesInOrder) {
     auto vote = raft::decode_message(frames[1]);
     CHECK_TRUE(vote.has_value());
     if (vote.has_value()) {
-      const auto &request = std::get<raft::RequestVoteRequest>(*vote);
+      const auto &request = std::get<raft::RequestVoteRequest>(vote->message);
       CHECK_EQ(request.term, uint64_t{5});
       CHECK_EQ(request.candidate_id.value, uint64_t{1});
       CHECK_EQ(request.last_log_index, uint64_t{3});
@@ -159,7 +159,7 @@ TEST(TcpTransport, SendsHandshakeThenFramesInOrder) {
     auto append = raft::decode_message(frames[2]);
     CHECK_TRUE(append.has_value());
     if (append.has_value()) {
-      const auto &response = std::get<raft::AppendEntriesResponse>(*append);
+      const auto &response = std::get<raft::AppendEntriesResponse>(append->message);
       CHECK_EQ(response.term, uint64_t{5});
       CHECK_TRUE(response.success);
       CHECK_EQ(response.match_index, uint64_t{4});
@@ -183,24 +183,26 @@ TEST(TcpTransport, ReceivesHandshakeThenPostsMessages) {
   std::mutex posted_mutex;
   std::vector<std::function<void()>> posted;
   auto options = base_options(1);
-  raft::RaftTcpTransport transport(options, [&](std::function<void()> work) {
-    std::lock_guard<std::mutex> lock(posted_mutex);
-    posted.push_back(std::move(work));
-    return true;
-  });
+  raft::RaftTcpTransport transport(
+      options, [&](uint64_t, std::function<void()> work) {
+        std::lock_guard<std::mutex> lock(posted_mutex);
+        posted.push_back(std::move(work));
+        return true;
+      });
 
   std::vector<std::pair<NodeId, raft::Message>> received_all;
-  transport.on_message([&](NodeId sender, const raft::Message &message) {
-    received_all.emplace_back(sender, message);
-  });
+  transport.on_message(
+      0, [&](NodeId sender, const raft::Message &message) {
+        received_all.emplace_back(sender, message);
+      });
 
   transport.attach_inbound_connection(pair[1]);
   std::thread loop_thread([&] { transport.run_inbound(); });
 
   const std::string outbound =
       raft::frame_payload(hello_payload(9)) +
-      raft::encode_frame(raft::RequestVoteResponse{4, true}) +
-      raft::encode_frame(
+      raft::encode_frame(0, raft::RequestVoteResponse{4, true}) +
+      raft::encode_frame(0,
           raft::AppendEntriesRequest{4, NodeId{9}, 1, 3, {}, 1, 6});
   CHECK_TRUE(write_all(pair[0], outbound));
 
@@ -249,6 +251,68 @@ TEST(TcpTransport, ReceivesHandshakeThenPostsMessages) {
   ::close(pair[0]);
 }
 
+TEST(TcpTransport, DispatchesFramesByGroupId) {
+  int pair[2] = {-1, -1};
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+
+  std::mutex posted_mutex;
+  std::vector<std::function<void()>> posted;
+  auto options = base_options(1);
+  raft::RaftTcpTransport transport(
+      options, [&](uint64_t, std::function<void()> work) {
+        std::lock_guard<std::mutex> lock(posted_mutex);
+        posted.push_back(std::move(work));
+        return true;
+      });
+
+  int group0_hits = 0;
+  int group1_hits = 0;
+  transport.on_message(0, [&](NodeId, const raft::Message &) { ++group0_hits; });
+  transport.on_message(1, [&](NodeId, const raft::Message &) { ++group1_hits; });
+
+  transport.attach_inbound_connection(pair[1]);
+  std::thread loop_thread([&] { transport.run_inbound(); });
+
+  // One connection carries two groups' frames; each must reach only its own
+  // group's callback.
+  const std::string outbound =
+      raft::frame_payload(hello_payload(9)) +
+      raft::encode_frame(0, raft::RequestVoteResponse{4, true}) +
+      raft::encode_frame(1, raft::RequestVoteRequest{5, NodeId{9}, 3, 2}) +
+      raft::encode_frame(0, raft::RequestVoteResponse{6, false});
+  CHECK_TRUE(write_all(pair[0], outbound));
+
+  const int64_t deadline = now_ms() + 2000;
+  while (now_ms() < deadline) {
+    {
+      std::lock_guard<std::mutex> lock(posted_mutex);
+      if (posted.size() >= 3) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  {
+    std::lock_guard<std::mutex> lock(posted_mutex);
+    CHECK_EQ(posted.size(), size_t{3});
+  }
+
+  std::vector<std::function<void()>> work_items;
+  {
+    std::lock_guard<std::mutex> lock(posted_mutex);
+    work_items.swap(posted);
+  }
+  for (auto &work : work_items) {
+    work();
+  }
+  CHECK_EQ(group0_hits, 2);
+  CHECK_EQ(group1_hits, 1);
+
+  transport.stop();
+  loop_thread.join();
+  ::close(pair[0]);
+}
+
 TEST(TcpTransport, ClosesConnectionThatSkipsTheHandshake) {
   int pair[2] = {-1, -1};
   CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
@@ -256,7 +320,7 @@ TEST(TcpTransport, ClosesConnectionThatSkipsTheHandshake) {
   std::atomic<int> posted{0};
   auto options = base_options(1);
   raft::RaftTcpTransport transport(
-      options, [&](std::function<void()>) {
+      options, [&](uint64_t, std::function<void()>) {
         posted.fetch_add(1);
         return true;
       });
@@ -265,7 +329,7 @@ TEST(TcpTransport, ClosesConnectionThatSkipsTheHandshake) {
 
   // A Raft frame first: no handshake, so the transport must drop the peer.
   CHECK_TRUE(write_all(pair[0],
-                       raft::encode_frame(raft::RequestVoteResponse{1, true})));
+                       raft::encode_frame(0, raft::RequestVoteResponse{1, true})));
   CHECK_TRUE(wait_for_eof(pair[0], 2000));
   CHECK_EQ(posted.load(), 0);
   CHECK_EQ(transport.receive_errors(), uint64_t{1});
@@ -290,13 +354,13 @@ TEST(TcpTransport, ReconnectsAfterWriteFailure) {
   };
 
   raft::RaftTcpTransport transport(
-      options, [](std::function<void()>) { return true; });
-  transport.send(NodeId{2}, raft::RequestVoteResponse{1, true});
+      options, [](uint64_t, std::function<void()>) { return true; });
+  transport.send(NodeId{2}, 0, raft::RequestVoteResponse{1, true});
   CHECK_EQ(read_frames(pair[0], 2, 2000).size(), size_t{2});
 
   // Peer goes away: the next write fails, so the sender must reconnect.
   ::close(pair[0]);
-  transport.send(NodeId{2}, raft::RequestVoteResponse{2, true});
+  transport.send(NodeId{2}, 0, raft::RequestVoteResponse{2, true});
 
   const int64_t deadline = now_ms() + 2000;
   while (connects.load() < 2 && now_ms() < deadline) {

@@ -104,11 +104,12 @@ RaftTcpTransport::RaftTcpTransport(Options options, PostFn post)
 
 RaftTcpTransport::~RaftTcpTransport() { stop(); }
 
-void RaftTcpTransport::send(NodeId to, const Message &message) {
+void RaftTcpTransport::send(NodeId to, uint64_t group_id,
+                            const Message &message) {
   if (to == options_.node_id) {
     return; // RaftNode never addresses itself; dropping here keeps the queue clean
   }
-  std::string frame = encode_frame(message);
+  std::string frame = encode_frame(group_id, message);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_ || outbound_queue_.size() >= options_.max_outbound_queue) {
@@ -121,9 +122,10 @@ void RaftTcpTransport::send(NodeId to, const Message &message) {
 }
 
 void RaftTcpTransport::on_message(
+    uint64_t group_id,
     std::function<void(NodeId, const Message &)> callback) {
   std::lock_guard<std::mutex> lock(callback_mutex_);
-  on_message_ = std::move(callback);
+  on_messages_[group_id] = std::move(callback);
 }
 
 std::expected<void, std::string> RaftTcpTransport::listen() {
@@ -282,17 +284,23 @@ void RaftTcpTransport::close_peer(OutboundPeer &peer) {
   connected_peers_.fetch_sub(1);
 }
 
-void RaftTcpTransport::deliver(NodeId from, Message message) {
+void RaftTcpTransport::deliver(uint64_t group_id, NodeId from,
+                               Message message) {
   std::function<void(NodeId, const Message &)> callback;
   {
     std::lock_guard<std::mutex> lock(callback_mutex_);
-    callback = on_message_;
+    const auto it = on_messages_.find(group_id);
+    if (it == on_messages_.end()) {
+      dropped_frames_.fetch_add(1);
+      return;
+    }
+    callback = it->second;
   }
   if (!callback || !post_) {
     dropped_frames_.fetch_add(1);
     return;
   }
-  if (!post_([callback, from, message = std::move(message)] {
+  if (!post_(group_id, [callback, from, message = std::move(message)] {
         callback(from, message);
       })) {
     dropped_frames_.fetch_add(1);
@@ -358,7 +366,7 @@ common::svrkit::Task RaftTcpTransport::handle_inbound(
         fatal = true;
         break;
       }
-      deliver(*peer, std::move(*message));
+      deliver(message->group_id, *peer, std::move(message->message));
     }
     if (fatal) {
       break;

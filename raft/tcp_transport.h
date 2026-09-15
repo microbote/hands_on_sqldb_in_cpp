@@ -53,9 +53,12 @@ public:
     int64_t reconnect_backoff_ms = 500;
   };
 
-  // Runs `work` on the Raft service thread. Returning false means the raft
-  // service is stopping or backed up (the frame is dropped and counted).
-  using PostFn = std::function<bool(std::function<void()>)>;
+  // Runs `work` on the given group's Raft service thread. Returning false means
+  // the raft service is stopping or backed up (the frame is dropped and
+  // counted). The group id lets one shared transport dispatch to the right
+  // group's RaftRuntime.
+  using PostFn =
+      std::function<bool(uint64_t group_id, std::function<void()>)>;
 
   RaftTcpTransport(Options options, PostFn post);
   ~RaftTcpTransport() override;
@@ -65,8 +68,10 @@ public:
 
   // Transport interface. `send` only enqueues; `on_message` stores the
   // callback that RaftNode installs in start().
-  void send(NodeId to, const Message &message) override;
-  void on_message(std::function<void(NodeId, const Message &)>) override;
+  void send(NodeId to, uint64_t group_id, const Message &message) override;
+  void on_message(
+      uint64_t group_id,
+      std::function<void(NodeId, const Message &)>) override;
 
   // Binds the inbound listener. Production calls this before run_inbound().
   std::expected<void, std::string> listen();
@@ -96,7 +101,7 @@ private:
 
   common::svrkit::Task
   handle_inbound(std::shared_ptr<common::svrkit::TcpConnection> connection);
-  void deliver(NodeId from, Message message);
+  void deliver(uint64_t group_id, NodeId from, Message message);
   void sender_loop();
   void flush_peer(OutboundPeer &peer, int64_t now);
   bool ensure_connected(OutboundPeer &peer, int64_t now);
@@ -108,7 +113,8 @@ private:
   PostFn post_;
   common::svrkit::TcpServer inbound_;
   mutable std::mutex callback_mutex_;
-  std::function<void(NodeId, const Message &)> on_message_;
+  std::map<uint64_t, std::function<void(NodeId, const Message &)>>
+      on_messages_;
 
   std::thread sender_;
   mutable std::mutex mutex_;

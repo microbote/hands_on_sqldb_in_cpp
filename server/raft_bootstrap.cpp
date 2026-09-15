@@ -112,7 +112,8 @@ RaftBootstrap::open(const ServerConfig &config,
   // this indirection only exists to break the construction cycle.
   self->transport_ = std::make_unique<raft::RaftTcpTransport>(
       std::move(transport_options),
-      [raw = self.get()](std::function<void()> work) {
+      [raw = self.get()](uint64_t group_id, std::function<void()> work) {
+        (void)group_id; // P1: single group; multi-group wiring is M1/S3
         return raw->post_to_runtime(std::move(work));
       });
 

@@ -72,6 +72,10 @@ struct NodeConfig {
   // Compact the log once this many applied entries have accumulated since the
   // last snapshot. 0 disables compaction (the pre-snapshot behavior).
   uint64_t snapshot_entries_threshold = 0;
+  // Which raft group this node belongs to. A shared transport multiplexes
+  // several groups over one connection using this id; single-group deployments
+  // leave it at 0.
+  uint64_t group_id = 0;
 };
 
 // A static member of the group: identity plus where to reach it.

@@ -18,13 +18,14 @@ namespace raft {
 // Frame layout (all integers big-endian):
 //   u32 payload_size       (excludes this 4-byte prefix)
 //   u8  version            (kMessageVersion)
+//   u64 group_id           (which raft group this message belongs to)
 //   u8  message_type
 //   type-specific fields
 //
 // AppendEntries entries are encoded as
 //   u64 count, then per entry: u64 index, u64 term, u64 data_len + bytes
 // so entry data (a serialized WriteBatch) is binary safe.
-inline constexpr uint8_t kMessageVersion = 2;
+inline constexpr uint8_t kMessageVersion = 3;
 inline constexpr uint32_t kMaxFrameBytes = 64u * 1024u * 1024u;
 
 enum class MessageType : uint8_t {
@@ -36,15 +37,24 @@ enum class MessageType : uint8_t {
   kInstallSnapshotResponse = 6,
 };
 
+// A decoded raft message plus the group it belongs to (used to dispatch to the
+// right RaftNode when one transport is shared by several groups).
+struct DecodedRaftMessage {
+  uint64_t group_id = 0;
+  Message message;
+};
+
 // Encodes a message payload without the length prefix.
-std::string encode_message(const Message &message);
-std::expected<Message, Error> decode_message(std::string_view payload);
+std::string encode_message(uint64_t group_id, const Message &message);
+std::expected<DecodedRaftMessage, Error>
+decode_message(std::string_view payload);
 
 // Encodes a length-prefixed frame (payload plus the u32 size prefix).
-std::string encode_frame(const Message &message);
+std::string encode_frame(uint64_t group_id, const Message &message);
 // Decodes one complete frame. The size prefix must match the remaining bytes
 // exactly; a mismatch or trailing data is rejected.
-std::expected<Message, Error> decode_frame(std::string_view frame);
+std::expected<DecodedRaftMessage, Error>
+decode_frame(std::string_view frame);
 
 // Generic version of the same framing, for transport-level payloads that are
 // not Raft messages (the peer handshake).
