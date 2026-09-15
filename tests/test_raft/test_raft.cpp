@@ -923,7 +923,9 @@ TEST(RaftCore, NewFollowerCatchesUpViaSnapshot) {
     step();
   }
 
-  CHECK_EQ(n3->node->last_included_index(), included);
+  // The snapshot is labeled at the leader's applied index at send time, so
+  // the follower's compaction point can be ahead of the captured one.
+  CHECK_GE(n3->node->last_included_index(), included);
   CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
   CHECK_EQ(n3->node->applied_index(), leader->applied_index());
   CHECK_TRUE(n3->state_machine.restored);
@@ -1047,13 +1049,144 @@ TEST(RaftCore, LargeSnapshotInstallsAcrossMultipleChunks) {
   CHECK_TRUE(std::all_of(n3->state_machine.restored_data.begin(),
                          n3->state_machine.restored_data.end(),
                          [](char c) { return c == 'S'; }));
-  CHECK_EQ(n3->node->last_included_index(), included);
+  CHECK_GE(n3->node->last_included_index(), included);
   CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
 
   propose_and_wait("post");
   CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
   CHECK_EQ(n3->node->applied_index(), leader->applied_index());
   CHECK_TRUE(n3->state_machine.contains("post"));
+}
+
+TEST(RaftCore, UpToDateFollowerCompactsItsOwnLog) {
+  using raft::NodeId;
+  ManualClock clock;
+  TestNetwork network;
+  const std::vector<NodeId> peers{NodeId{1}, NodeId{2}, NodeId{3}};
+  const uint64_t threshold = 3;
+
+  auto make_node = [&](NodeId id) -> std::unique_ptr<TestNode> {
+    auto test_node = std::make_unique<TestNode>();
+    test_node->transport = std::make_unique<TestTransport>(id, network);
+    test_node->node = std::make_unique<raft::RaftNode>(
+        raft::NodeConfig{id, peers, 100, 10, kv::KeyRange::from(kv::Key{}),
+                         threshold},
+        test_node->log, *test_node->transport, test_node->state_machine,
+        clock);
+    network.bind(id, test_node->node.get());
+    return test_node;
+  };
+
+  auto n1 = make_node(NodeId{1});
+  auto n2 = make_node(NodeId{2});
+  auto n3 = make_node(NodeId{3});
+  std::vector<raft::RaftNode *> live{n1->node.get(), n2->node.get(),
+                                     n3->node.get()};
+  auto step = [&](uint64_t ms = 10) {
+    clock.advance(ms);
+    for (raft::RaftNode *n : live) {
+      n->tick();
+    }
+    network.deliver_all();
+  };
+
+  CHECK_TRUE(n1->node->start().has_value());
+  CHECK_TRUE(n2->node->start().has_value());
+  CHECK_TRUE(n3->node->start().has_value());
+  for (int i = 0; i < 20; ++i) {
+    step();
+  }
+
+  raft::RaftNode *leader = nullptr;
+  for (raft::RaftNode *n : live) {
+    if (n->is_leader()) {
+      CHECK_TRUE(leader == nullptr);
+      leader = n;
+    }
+  }
+  CHECK_NOT_NULL(leader);
+
+  auto propose_and_wait = [&](const std::string &data) {
+    auto proposal = leader->propose(data);
+    CHECK_TRUE(proposal.has_value());
+    for (int i = 0; i < 200 && !proposal->done(); ++i) {
+      step();
+    }
+    auto committed = proposal->wait();
+    CHECK_TRUE(committed.has_value());
+  };
+
+  for (uint64_t i = 1; i <= 5; ++i) {
+    propose_and_wait("e" + std::to_string(i));
+  }
+  for (int i = 0; i < 10; ++i) {
+    step();
+  }
+
+  // The leader and every up-to-date follower compact their own logs once the
+  // threshold is reached.
+  CHECK_GE(leader->last_included_index(), 3);
+  CHECK_GE(n1->node->last_included_index(), 3);
+  CHECK_GE(n2->node->last_included_index(), 3);
+  CHECK_GE(n3->node->last_included_index(), 3);
+  CHECK_FALSE(n1->log.at(1).has_value());
+  CHECK_FALSE(n2->log.at(1).has_value());
+  CHECK_FALSE(n3->log.at(1).has_value());
+  for (raft::RaftNode *n : live) {
+    CHECK_EQ(n->last_log_index(), leader->last_log_index());
+    CHECK_EQ(n->applied_index(), leader->applied_index());
+  }
+
+  // Followers with a locally compacted log still replicate post-compaction
+  // writes.
+  propose_and_wait("post");
+  for (raft::RaftNode *n : live) {
+    CHECK_EQ(n->last_log_index(), leader->last_log_index());
+    CHECK_EQ(n->applied_index(), leader->applied_index());
+  }
+  CHECK_TRUE(n2->state_machine.contains("post"));
+  CHECK_TRUE(n3->state_machine.contains("post"));
+}
+
+TEST(RaftCore, RejectsSnapshotLabeledBehindAppliedState) {
+  ManualClock clock;
+  TestNetwork network;
+  raft::MemoryLogStore log;
+  RecordingStateMachine state_machine;
+  TestTransport transport(NodeId{1}, network);
+  raft::RaftNode node(
+      raft::NodeConfig{NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100, 10,
+                       kv::KeyRange::from(kv::Key{}), 0},
+      log, transport, state_machine, clock);
+  CHECK_TRUE(node.start().has_value());
+
+  clock.advance(200);
+  node.tick();
+  CHECK_TRUE(node.is_leader());
+
+  for (uint64_t i = 1; i <= 3; ++i) {
+    auto proposal = node.propose("d" + std::to_string(i));
+    CHECK_TRUE(proposal.has_value());
+    CHECK_TRUE(proposal->done());
+  }
+  CHECK_EQ(node.applied_index(), 4); // no-op at 1 + three entries at 2..4
+
+  // A snapshot labeled at index 1 is behind the applied state (4): it must be
+  // rejected, not installed.
+  raft::InstallSnapshotRequest stale;
+  stale.term = node.term();
+  stale.leader_id = NodeId{1};
+  stale.last_included_index = 1;
+  stale.last_included_term = node.term();
+  stale.offset = 0;
+  stale.done = true;
+  stale.data = "snapshot";
+  node.handle_message(NodeId{1}, stale);
+  network.deliver_all();
+
+  CHECK_EQ(node.applied_index(), 4);
+  CHECK_EQ(node.last_log_index(), 4);
+  CHECK_TRUE(state_machine.contains("d3"));
 }
 
 TEST(ProposalPayload, RoundTripsAllWriteBatchOperations) {

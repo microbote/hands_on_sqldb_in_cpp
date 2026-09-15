@@ -118,10 +118,8 @@ void RaftNode::tick() {
     record_error(result.error());
   }
 
-  if (role_ == Role::Leader) {
-    if (auto result = maybe_compact_log(); !result.has_value()) {
-      record_error(result.error());
-    }
+  if (auto result = maybe_compact_log(); !result.has_value()) {
+    record_error(result.error());
   }
 }
 
@@ -564,6 +562,16 @@ RaftNode::handle_install_snapshot(NodeId from,
     return {};
   }
 
+  // A snapshot labeled behind our own applied state would revert the state
+  // machine, and request-result deduplication would then skip replaying the
+  // reverted entries, silently diverging. A correct leader never sends one
+  // (it only snapshots peers behind its compaction point); refuse loudly and
+  // let the leader retry with a newer snapshot.
+  if (request.last_included_index < last_applied_) {
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return {};
+  }
+
   // Accumulate the chunked snapshot on the raft service thread. Chunks from
   // the leader arrive in order over one connection, so no staging of
   // concurrent log entries is needed: the whole install happens atomically
@@ -722,6 +730,22 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
     return std::unexpected(data.error());
   }
 
+  // The snapshot is the *current* state machine state, so label it with the
+  // index it actually covers: last_applied_. This keeps the blob and its
+  // metadata consistent even when this node applied entries since its own
+  // compaction point. The follower jumps straight to the applied index.
+  const uint64_t included_index = last_applied_;
+  uint64_t included_term = 0;
+  if (included_index == last_included_index_) {
+    included_term = last_included_term_;
+  } else {
+    auto entry = log_store_.at(included_index);
+    if (!entry.has_value()) {
+      return std::unexpected(entry.error());
+    }
+    included_term = entry->term;
+  }
+
   // Split the snapshot into ordered chunks. They are enqueued in one call, so
   // they stay in order on the outbound queue; the transport preserves
   // per-connection ordering, so the follower assembles them in order.
@@ -733,8 +757,8 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
     InstallSnapshotRequest request;
     request.term = hard_state_.term;
     request.leader_id = config_.node_id;
-    request.last_included_index = last_included_index_;
-    request.last_included_term = last_included_term_;
+    request.last_included_index = included_index;
+    request.last_included_term = included_term;
     request.offset = offset;
     request.done = (offset + take == blob.size());
     request.data = blob.substr(offset, take);
@@ -747,8 +771,8 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
     InstallSnapshotRequest request;
     request.term = hard_state_.term;
     request.leader_id = config_.node_id;
-    request.last_included_index = last_included_index_;
-    request.last_included_term = last_included_term_;
+    request.last_included_index = included_index;
+    request.last_included_term = included_term;
     request.offset = 0;
     request.done = true;
     transport_.send(to, request);
@@ -756,13 +780,18 @@ std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
 
   // Optimistically move the follower past the snapshot; the next
   // AppendEntries verifies and refines the progress.
-  next_index_[to] = last_included_index_ + 1;
-  match_index_[to] = std::max(match_index_[to], last_included_index_);
+  next_index_[to] = included_index + 1;
+  match_index_[to] = std::max(match_index_[to], included_index);
   return {};
 }
 
 std::expected<void, Error> RaftNode::maybe_compact_log() {
-  if (role_ != Role::Leader || config_.snapshot_entries_threshold == 0) {
+  // Both leaders and up-to-date followers compact their own logs once enough
+  // applied entries have accumulated. Candidates are skipped (brief anyway).
+  if (role_ != Role::Leader && role_ != Role::Follower) {
+    return {};
+  }
+  if (config_.snapshot_entries_threshold == 0) {
     return {};
   }
   const uint64_t kept = last_log_index_ - last_included_index_;
@@ -778,19 +807,18 @@ std::expected<void, Error> RaftNode::maybe_compact_log() {
   if (!entry.has_value()) {
     return std::unexpected(entry.error());
   }
-  auto data = state_machine_.snapshot(snapshot_range());
-  if (!data.has_value()) {
-    return std::unexpected(data.error());
-  }
 
+  // Only the metadata is stored here. The snapshot blob is generated on
+  // demand by send_snapshot() when a lagging peer actually needs it, so an
+  // up-to-date follower never pays for a full-DB scan just to shrink its log.
   SnapshotMetadata meta{target, entry->term};
   if (auto result = log_store_.install_snapshot(meta); !result.has_value()) {
     return std::unexpected(result.error());
   }
   last_included_index_ = target;
   last_included_term_ = entry->term;
-  // commit_index_ is already >= last_applied_ == target. Followers behind the
-  // compacted prefix receive the snapshot on their next heartbeat.
+  // commit_index_ is already >= last_applied_ == target. Peers behind the
+  // compacted prefix receive the snapshot on the next heartbeat.
   return {};
 }
 

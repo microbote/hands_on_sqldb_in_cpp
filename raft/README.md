@@ -12,11 +12,10 @@ SQL 侧适配。P1b 已落地：`RaftRuntime`（单服务线程）、RPC 二进�
 （LevelDB 持久化快照点、重启恢复、压缩前缀在 `at()` 以边界项合成）、
 `InstallSnapshot` RPC 编解码与 TCP 直通（**分片传输**：1 MiB/帧，绕开
 64 MiB 帧上限）、leader 侧按 `[raft] snapshot_entries` 阈值生成快照并压缩
-日志、落后/新 follower 通过快照追赶并继续复制（含真实 TCP 三/四节点端到端
-测试）、
+日志、**up-to-date follower 也各自本地压缩自己的日志**（不用等快照安装）、
+落后/新 follower 通过快照追赶并继续复制（含真实 TCP 三/四节点端到端测试）、
 `KVStateMachine` 支持无上界（整 key space）快照生成/恢复。
-**仍留作后续**：follower 本地压缩（现在只随快照安装发生）、read-index 合并、
-跨组只读模式、成员变更。
+**仍留作后续**：read-index 合并、跨组只读模式、成员变更。
 
 ## 模块结构
 
