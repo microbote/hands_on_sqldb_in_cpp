@@ -6,9 +6,11 @@ English version: [DESIGN.en.md](DESIGN.en.md)
 （选举 / 日志复制 / commit / apply / LevelDB 持久化 / payload 编解码 /
 KV 状态机桥接 / `RaftKVStore` + `RaftKVEngine` / ReadIndex 读屏障 / 组内写槽 /
 `RaftRuntime` 单线程服务 / RPC 编解码 / TCP transport / `[raft]` 配置与
-`sqldb-server` 接线）。剩余工作见 §11（快照传输、compaction、leader hint、
-read-index 合并、成员变更、P2 多 group）。本文件是实施方案，不是使用说明；
-职责/接口/踩坑见 `raft/README.md`。
+`sqldb-server` 接线）。**Phase A v1（快照/压缩）已落地**：leader 侧按
+`[raft] snapshot_entries` 阈值生成快照并压缩日志，落后/新 follower 通过
+`InstallSnapshot` 追赶（当前单帧传输，分片式与 follower 本地压缩留作后续）。
+剩余工作见 §11（read-index 合并、成员变更、P2 多 group、分片快照）。
+本文件是实施方案，不是使用说明；职责/接口/踩坑见 `raft/README.md`。
 
 ## 0. 目标与范围
 
@@ -456,6 +458,9 @@ peers   = 1@127.0.0.1:5434,2@127.0.0.1:5435,3@127.0.0.1:5436
 election_timeout_ms = 1000
 heartbeat_ms        = 100
 log_path            = ./sql_db_raft_log     # 单独的 LevelDB 存 raft 日志
+snapshot_entries    = 0                      # 日志条目数阈值，超过则 leader 生成快照并压缩（0=关闭）
+# 客户端可达的 SQL 地址（id@host:port）：不是 leader 时回给客户端做重定向
+sql_endpoints       = 1@127.0.0.1:5433,2@127.0.0.1:5434,3@127.0.0.1:5435
 ```
 
 **已落地**（`server/config.{h,cpp}`）：上面这些键都在内置默认值表里（默认
@@ -470,6 +475,9 @@ raft_election_timeout_ms()/raft_heartbeat_ms()/raft_log_path()`。
   id 与 host:port 都不能重复（**关闭状态也查**，免得拼错藏到打开那天）；
 - `enabled = true` 时额外要求：`peers` 非空、`node_id` 出现在 `peers` 里、
   `listen` 形如 `host:port`、`log_path` 非空。
+- `sql_endpoints` 可选（同样 `id@host:port`）：id 必须是 `peers` 里的节点，
+  否则直接拒绝（拼错的 id 会让重定向静默失效）。留空 = 只报 `NotLeader`，
+  不给重定向目标。
 
 静态分片（`shard.N = <start>,<end>`）还没做：P1 只有一个 group，P2 再引入
 静态 range 表并**写死 `@system/*` 落 0 号组**（§2.2）。
@@ -494,7 +502,7 @@ raft_election_timeout_ms()/raft_heartbeat_ms()/raft_log_path()`。
 |------|------|----------|------|
 | **P0** | raft 核心：选举 / 日志复制 / 提交 / apply / 快照；**in-proc transport + 可注入假时钟** | 单测：正常路径、分区、丢消息、乱序、重启、单节点→三节点。**沙箱内可全绿**（不碰 socket） | 已落地 |
 | **P1a** | 单 group 适配层：`RaftKVStore` / `RaftKVEngine`、**ReadIndex 读屏障**、组内写槽、proposal 幂等 id、超时与错误映射 | `test_raft` 的 `RaftKVAdapter` 套件（单节点读写/事务/回滚/写槽、三节点复制、follower `NotLeader`、分区 leader 超时） | 已落地 |
-| **P1b** | RaftRuntime 线程模型（`ServiceThread` 驱动 tick/消息/apply）、RPC 编解码、`[raft]` 配置、生产 transport（svrkit 独立端口）、server 入口接线、leader hint 回客户端 | 端到端：SQL 跑在 raft 上，杀掉 leader 后能重新选主并继续 | 已落地（单节点重启持久化 + 三节点真实 socket 选举/复制都有测试；leader hint 未做） |
+| **P1b** | RaftRuntime 线程模型（`ServiceThread` 驱动 tick/消息/apply）、RPC 编解码、`[raft]` 配置、生产 transport（svrkit 独立端口）、server 入口接线、leader hint 回客户端 | 端到端：SQL 跑在 raft 上，杀掉 leader 后能重新选主并继续 | 已落地（单节点重启持久化、三节点真实 socket 选举/复制、NotLeader+重定向都有测试） |
 | **P2** | 多 group：按表分片；`@system/*` 落 0 号组；每 group 独立 leader；**写事务跨组拒绝 + `strict`/`loose` 模式 + `CLIENT_OPTIONS` 帧**（§3.3/§3.4） | 两表并发写互不阻塞；写事务跨组报明确错误；`--cross-group-read=loose` 下 `BEGIN; SELECT a; SELECT b; COMMIT` 能跑，`strict`（默认）下报错 | 未开始 |
 | **P3** | `_meta` group 管 placement、**表级 split/merge**、成员变更、follower read / lease | 需另行设计（本文档不含） | 未开始 |
 
@@ -579,8 +587,15 @@ P1 拆成 a/b 两段的理由：a 段的接口和语义能在**单线程 + in-pr
 - **transport 的运维语义**：断线重连是"退避 + 重发未写字节"，没有实现连接
   保活/半开检测（对端进程僵死时只能靠写失败发现），也没有压测过 N 较大时的
   连接数（现在是 N×(N-1) 条）；要不要做多路复用留到有实测需求时再定。
-- **`NotLeader` 的 leader hint 与重试**：现在客户端只看到
-  `NotLeader` 文本错误，没有 hint，也没有 server 代转。
+- **`NotLeader` 的剩余形状**：现在 server 在语句执行前查一次 hint（阻塞提交到
+  raft 服务线程，代价很小），命中就回 `NOT_LEADER` + 地址，客户端自动重连重试
+  一次。还没做的是"server 代转"（把语句转发给 leader 执行再回结果）——那需要
+  服务端内部再起一个客户端，等有明确收益再说。
+- **schema 读路径的 NotLeader**：`Catalog` 的读接口是 `bool/optional`（
+  表不存在 vs 读失败分不开）。有 hint 时 server 的预检查会先拦下，所以 follower
+  上不会走到 schema 读取；但**还没学到 leader 的 follower**（刚启动 / 被分区）
+  仍可能把"读不到"报成"表不存在"（或按空表处理）——彻底修需要让 Catalog 的读
+  接口带三态/状态位。
 - **proposal 等待上限可配置**：现在借用 `election_timeout_ms`，将来应该有
   独立的 `raft.proposal_timeout_ms`，并区分"读超时"和"写超时"。
 - **affected rows / apply 结果与幂等结果的原子性**：现在 `apply_result` 固定是

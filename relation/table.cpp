@@ -118,8 +118,13 @@ std::unique_ptr<TableCursor> Table::scan(const KeyRange &range,
       physical_end(range); // 半开：空集时 start == end，迭代器自然为空
   kv_range.direction =
       ascending ? kv::ScanDirection::kForward : kv::ScanDirection::kReverse;
-  return std::make_unique<TableCursor>(this, range,
-                                       engine_->new_iterator(kv_range));
+  auto iterator = engine_->new_iterator(kv_range);
+  // new_iterator() 只能返回 nullptr：失败原因从引擎的 last_error() 拿
+  // （NotLeader / Timeout / IOError），别把"打不开存储"当成"表是空的"。
+  const kv::Status open_status =
+      iterator == nullptr ? engine_->last_error() : kv::Status::OK;
+  return std::make_unique<TableCursor>(this, range, std::move(iterator),
+                                      open_status);
 }
 
 std::unique_ptr<TableCursor> Table::scan_all(bool ascending) const {

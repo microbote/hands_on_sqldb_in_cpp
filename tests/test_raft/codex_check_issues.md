@@ -25,9 +25,9 @@
   `[raft]` 配置段与校验、TCP transport（握手 + 双向连接 + 重连重发）、
   `server/raft_bootstrap` 与 `main_server` 接线全部落地。
 
-当前测试规模：`test_raft` 49 个测试、927 个断言；`test_server` 51 个测试、
-370 个断言（含 `[raft]` 配置 4 条、单节点 bootstrap 重启 1 条、三节点
-真实 socket 1 条）。全仓 `ctest` 为 14/14 通过。
+当前测试规模：`test_raft` 51 个测试、977 个断言；`test_server` 57 个测试、
+426 个断言（含 `[raft]` 配置、单节点 bootstrap 重启、三节点真实 socket、
+NotLeader 重定向服务端/客户端两半）。全仓 `ctest` 为 14/14 通过。
 
 ## 2. 组件与文件
 
@@ -608,7 +608,60 @@ raft_election_timeout_ms()/raft_heartbeat_ms()/raft_log_path()`。
    client_id 会重复，于是"重启后的第一条新写"可能被状态机当成旧请求的重放而
    **静默不生效**（写返回 OK，值没变）。修法：client_id 带每进程随机盐。
 
-## 11. 已知未完成项
+## 11. NotLeader + leader hint 的客户端重定向
+
+### 11.1 形状
+
+```
+RaftKVStore::leader_hint()            // 本节点不是 leader 时给出 {node_id, SQL 地址}
+  -> Server::execute_on_this_node()   // 每条语句执行前先问一次（服务线程上）
+  -> ERROR(code=NOT_LEADER, leader_hint{node_id, endpoint})
+  -> 客户端 REPL：不在事务里 -> redirect(endpoint) -> 重发一次
+```
+
+要点：
+
+1. **先问 hint 再执行**：命中就直接回 `NOT_LEADER`，不碰本地状态机。放在
+   parse 之后（parse 错本来就与 leader 无关）、执行之前；跑在写服务/读池
+   线程上，因为 `leader_hint()` 是一次到 raft 服务线程的阻塞提交。
+2. **地址来自 `[raft] sql_endpoints`**（`id@host:port`，id 必须在 `peers` 里）。
+   没配 = 只给 node id，客户端无法自动重连（只能报错）。缺某个节点的地址时
+   endpoint 为空、node id 仍给。
+3. **协议向后兼容**：ERROR 帧尾部新增 `u8 has_hint + u64 node_id + bytes
+   endpoint`；老服务端没有这段（解码得到 nullopt），老客户端解完固定字段就停。
+   服务端在 HELLO 里通告 `kCapabilityLeaderHint`，客户端只在通告了才认这个 hint。
+4. **客户端只重试一次**：新节点如果也说不是 leader 就把错误交给用户，避免两个
+   节点之间来回弹。
+5. **事务里不重连**：事务状态挂在旧连接上，换连接等于把它丢掉，所以直接报错
+   （否则会得到一个"事务悄悄没了"的更糟结果）。
+6. **adapter 必须走 RaftRuntime**：这轮同时把 `RaftKVStore`/`RaftKVEngine` 从
+   "直接持有 `RaftNode&`"改成持有 `RaftExecutor&`——生产用 `RaftRuntime`
+   （提交到服务线程），测试用 `RaftNodeExecutor`（单线程直调）。不改的话，
+   多 session 并发下 adapter 会绕过 runtime 直接碰 `RaftNode`，正是 §4.4 里
+   明令禁止的那条。
+
+### 11.2 测试
+
+| 用例 | 验证点 |
+| --- | --- |
+| `RaftKVAdapter.FollowerEngineReturnsNotLeader` | follower 的读/写都是 `NotLeader`，且 `KVEngine::last_error()` 也是它 |
+| `RaftKVAdapter.LeaderHintPointsAtTheLeaderClientEndpoint` | follower 给出 leader 的 node id + SQL 地址；leader 自己不重定向 |
+| `RaftKVAdapter.LeaderWithUnknownClientAddressOmitsTheEndpoint` | 地址表缺该节点时，只给 node id、endpoint 为空 |
+| `Protocol.ErrorFrameCarriesOptionalLeaderHint` | hint 往返；不带 hint 时编码与老格式一致 |
+| `Protocol.ErrorFrameWithoutTrailingHintIsStillReadable` | 老服务端格式（尾部无字节）仍能解出、无 hint |
+| `RaftRedirect.ServerAnswersNotLeaderWithTheLeaderEndpoint` | 真 Server + 真客户端（socketpair，不 bind）：读/写都回 `NOT_LEADER` + 地址，消息里也带地址 |
+| `RaftRedirect.ServerWithoutHintExecutesNormally` | 单机存储（hint = nullopt）照常执行 |
+| `RaftRedirect.ReplReconnectsToTheHintedLeaderAndRetries` | 假服务端 1 回 NotLeader+hint → REPL 自动 dial 到服务端 2 并重试成功（dial 两次、两边各收到 1 条语句） |
+| `RaftRedirect.ReplDoesNotRetryInsideATransaction` | 事务里收到 NotLeader 直接报错：不 dial、不重试 |
+
+### 11.3 顺带修掉的静默错误
+
+`Table::scan()` 拿到的迭代器为 nullptr 时，`TableCursor` 原来把 `it_ == nullptr`
+当成"流结束" → **follower 上的 `SELECT` 会静默返回 0 行**（比报错更糟）。
+现在迭代器打不开时按 `KVEngine::last_error()` 报 `IO_ERROR`（消息里带
+`NotLeader`），`close()` 之后的读取仍然算正常结束（用 `closed_` 区分）。
+
+## 12. 已知未完成项
 
 尚未完成：
 
@@ -623,15 +676,18 @@ raft_election_timeout_ms()/raft_heartbeat_ms()/raft_log_path()`。
    因此安全；后续如果 apply 返回 affected rows，需要把结果持久化与状态机
    apply 做成同一个事务或恢复协议；
 5. **read-index 合并 / lease**：每个 key 一次确认，读放大明显；
-6. **结构化错误**：leader hint（`NotLeader`）和 group id
-   （`CrossGroupTransaction`）还无处携带，客户端重连策略也未定；
-7. **transport 运维语义**：没有保活/半开检测（只能靠写失败发现对端僵死），
+6. **server 代转**：现在是"让客户端换节点重试"，没做服务端把语句转发给 leader
+   执行再回结果（需要服务端内部客户端，等有明确收益再说）；
+7. **schema 读路径的 NotLeader**：`Catalog` 的读接口是 bool/optional，分不清
+   "表不存在"和"读失败"；有 hint 时 server 预检查会先拦下，但**还没学到 leader
+   的 follower**（刚启动/被分区）仍可能把读失败报成"表不存在"或按空表处理；
+8. **transport 运维语义**：没有保活/半开检测（只能靠写失败发现对端僵死），
    没有压测过 N×(N-1) 条连接；要不要多路复用等实测再定；
-8. **幂等结果表的增长**：每个 client_id 一行、只保留最新 request id，长期运行
+9. **幂等结果表的增长**：每个 client_id 一行、只保留最新 request id，长期运行
    需要回收策略；
-9. **成员变更**：设计范围外，未实现。
+10. **成员变更**：设计范围外，未实现。
 
-## 12. 后续 review 检查点
+## 13. 后续 review 检查点
 
 review P0 代码时优先检查：
 

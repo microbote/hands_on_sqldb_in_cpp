@@ -109,11 +109,11 @@ KVStateMachine::apply(const LogEntry &entry) {
 
 std::expected<std::string, Error>
 KVStateMachine::snapshot(kv::KeyRange range) {
-  if (!range.start.has_value() || !range.end.has_value() ||
-      *range.end <= *range.start) {
+  if (!range.start.has_value() ||
+      (range.end.has_value() && *range.end <= *range.start)) {
     return std::unexpected(Error{
         ErrorCode::InvalidArgument,
-        "P0 raft snapshots require a finite, non-empty key range"});
+        "raft snapshots require a start bound and a non-empty key range"});
   }
   if (range.direction != kv::ScanDirection::kForward) {
     return std::unexpected(Error{
@@ -194,11 +194,11 @@ KVStateMachine::restore(kv::KeyRange range, std::string_view snapshot) {
         Error{ErrorCode::InvalidArgument, "invalid raft snapshot count"});
   }
 
-  if (!range.start.has_value() || !range.end.has_value() ||
-      *range.end <= *range.start) {
+  if (!range.start.has_value() ||
+      (range.end.has_value() && *range.end <= *range.start)) {
     return std::unexpected(Error{
         ErrorCode::InvalidArgument,
-        "P0 raft snapshot restore requires a finite, non-empty key range"});
+        "raft snapshot restore requires a start bound and a non-empty range"});
   }
   if (range.direction != kv::ScanDirection::kForward) {
     return std::unexpected(Error{
@@ -208,7 +208,30 @@ KVStateMachine::restore(kv::KeyRange range, std::string_view snapshot) {
 
   kv::WriteBatch batch;
   batch.set_sync(true);
-  batch.remove_range(*range.start, *range.end);
+  if (range.end.has_value()) {
+    batch.remove_range(*range.start, *range.end);
+  } else {
+    // Whole-range restore without an upper bound: remove_range needs a
+    // concrete end, so expand the clear into per-key deletes (the same
+    // strategy the LevelDB engine uses for remove_range itself).
+    kv::KeyRange scan{range.start, range.end, 0, kv::ScanDirection::kForward};
+    auto iterator = local_->new_iterator(scan);
+    if (iterator == nullptr) {
+      return std::unexpected(Error{
+          ErrorCode::InternalError,
+          "failed to create raft snapshot clear iterator"});
+    }
+    for (iterator->seek_to_first(); iterator->valid(); iterator->next()) {
+      batch.remove(iterator->key());
+    }
+    if (iterator->status() != kv::Status::OK &&
+        iterator->status() != kv::Status::NotFound) {
+      return std::unexpected(Error{
+          ErrorCode::InternalError,
+          std::string{"raft snapshot clear scan failed: "} +
+              kv::status_to_string(iterator->status())});
+    }
+  }
   for (uint64_t i = 0; i < *count; ++i) {
     auto key = read_bytes(snapshot, offset);
     if (!key.has_value()) {

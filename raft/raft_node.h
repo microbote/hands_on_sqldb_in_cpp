@@ -58,6 +58,8 @@ public:
   uint64_t applied_index() const { return last_applied_; }
   std::optional<NodeId> leader_hint() const { return leader_id_; }
   uint64_t last_log_index() const { return last_log_index_; }
+  uint64_t last_included_index() const { return last_included_index_; }
+  uint64_t last_included_term() const { return last_included_term_; }
 
   const std::optional<Error> &last_error() const { return last_error_; }
 
@@ -75,18 +77,26 @@ private:
   handle_append_entries(NodeId from, const AppendEntriesRequest &request);
   void handle_append_entries_response(NodeId from,
                                        const AppendEntriesResponse &response);
+  std::expected<void, Error>
+  handle_install_snapshot(NodeId from, const InstallSnapshotRequest &request);
+  void handle_install_snapshot_response(
+      NodeId from, const InstallSnapshotResponse &response);
 
   std::expected<void, Error> send_append_entries(NodeId to);
+  std::expected<void, Error> send_snapshot(NodeId to);
+  std::expected<void, Error> maybe_compact_log();
   void send_heartbeats();
   std::expected<void, Error> advance_commit();
   std::expected<void, Error> apply_committed();
   void complete_applied_proposal(uint64_t index,
                                  const std::string &apply_result);
+  void complete_applied_proposals_upto(uint64_t index);
   void fail_pending_proposals(std::optional<uint64_t> from_index,
                               Error error);
   void evaluate_read_barriers();
   void fail_read_barriers(Error error);
   bool quorum_acknowledged(uint64_t round) const;
+  kv::KeyRange snapshot_range() const;
   std::expected<uint64_t, Error> last_log_term() const;
   void reset_election_deadline();
   void record_error(Error error);
@@ -105,6 +115,10 @@ private:
   Role role_ = Role::Follower;
   std::optional<NodeId> leader_id_;
   uint64_t last_log_index_ = kInvalidIndex;
+  // Compaction point: entries at or below this index live in the state
+  // machine snapshot, not in the log.
+  uint64_t last_included_index_ = kInvalidIndex;
+  uint64_t last_included_term_ = 0;
   uint64_t commit_index_ = kInvalidIndex;
   uint64_t last_applied_ = kInvalidIndex;
 

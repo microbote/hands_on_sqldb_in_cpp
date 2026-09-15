@@ -59,10 +59,16 @@ node_id = 1
 listen = 127.0.0.1:5434
 # 静态成员表：node_id@host:port，逗号分隔，必须包含本节点的 node_id。
 peers =
+# 客户端可达的 SQL 地址（node_id@host:port）：本节点不是 leader 时用它回
+# "NotLeader + 该去哪台"，客户端据此重连。留空 = 只报错、不给重定向目标。
+sql_endpoints =
 election_timeout_ms = 1000
 heartbeat_ms = 100
 # Raft 日志/HardState 的独立 LevelDB 目录（不要和业务数据共用一个目录）。
 log_path =
+# 日志条目数超过该值时，leader 生成快照并压缩日志（0 = 关闭压缩）。
+# 压缩后落后者/新节点靠 InstallSnapshot 追赶。
+snapshot_entries = 0
 )ini";
 
 std::string trim(const std::string &text) {
@@ -288,6 +294,7 @@ std::expected<void, std::string> Config::validate() const {
       {"raft.node_id", 1, INT64_MAX},
       {"raft.election_timeout_ms", 1, INT64_MAX},
       {"raft.heartbeat_ms", 1, INT64_MAX},
+      {"raft.snapshot_entries", 0, INT64_MAX},
   };
   for (const auto &rule : kIntRules) {
     const int64_t v = get_int(rule.key);
@@ -356,6 +363,11 @@ std::expected<void, std::string> Config::validate() const {
         return std::unexpected(parsed.error());
       }
     }
+    const std::string endpoints = get_string("raft.sql_endpoints");
+    if (!endpoints.empty() && !raft::parse_peer_list(endpoints).has_value()) {
+      return std::unexpected("config key 'raft.sql_endpoints': " +
+                             raft::parse_peer_list(endpoints).error());
+    }
     return {};
   }
 
@@ -378,6 +390,32 @@ std::expected<void, std::string> Config::validate() const {
     return std::unexpected("config key 'raft.node_id': must appear in "
                            "raft.peers (peers = " +
                            raft_peers + ")");
+  }
+
+  // 客户端重定向表：写法与 peers 相同（id@host:port），id 必须是已知 peer
+  // —— 拼错的 id 会让重定向静默失效，所以直接拒绝。
+  const std::string sql_endpoints = get_string("raft.sql_endpoints");
+  if (!sql_endpoints.empty()) {
+    const auto endpoints = raft::parse_peer_list(sql_endpoints);
+    if (!endpoints.has_value()) {
+      return std::unexpected("config key 'raft.sql_endpoints': " +
+                             endpoints.error());
+    }
+    for (const auto &endpoint : *endpoints) {
+      bool known = false;
+      for (const auto &peer : *peers) {
+        if (peer.node_id == endpoint.node_id) {
+          known = true;
+          break;
+        }
+      }
+      if (!known) {
+        return std::unexpected(
+            "config key 'raft.sql_endpoints': node id " +
+            std::to_string(endpoint.node_id.value) +
+            " is not in raft.peers");
+      }
+    }
   }
   const std::string raft_listen = get_string("raft.listen");
   const size_t raft_colon = raft_listen.rfind(':');
@@ -527,8 +565,29 @@ uint64_t ServerConfig::raft_heartbeat_ms() const {
   return static_cast<uint64_t>(CFG_INT(generic_, raft.heartbeat_ms));
 }
 
+uint64_t ServerConfig::raft_snapshot_entries() const {
+  return static_cast<uint64_t>(CFG_INT(generic_, raft.snapshot_entries));
+}
+
 std::string ServerConfig::raft_log_path() const {
   return CFG_STR(generic_, raft.log_path);
+}
+
+std::map<uint64_t, std::string> ServerConfig::raft_sql_endpoints() const {
+  const std::string text = CFG_STR(generic_, raft.sql_endpoints);
+  std::map<uint64_t, std::string> endpoints;
+  if (text.empty()) {
+    return endpoints;
+  }
+  auto parsed = raft::parse_peer_list(text);
+  if (!parsed.has_value()) {
+    return endpoints; // validate() 已经拦过；这里不抛，返回空 map
+  }
+  for (const auto &endpoint : *parsed) {
+    endpoints[endpoint.node_id.value] =
+        endpoint.host + ":" + std::to_string(endpoint.port);
+  }
+  return endpoints;
 }
 
 std::expected<ServerConfig, std::string> parse_config(const std::string &text) {

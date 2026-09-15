@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <charconv>
 #include <utility>
 
 #include "common/net/socket.h"
@@ -125,8 +126,13 @@ private:
 // ---- 远程连接：阻塞式协议客户端 ----
 class RemoteConnection : public SqlConnection {
 public:
-  RemoteConnection(common::net::TcpSocket socket, std::string description)
-      : socket_(std::move(socket)), description_(std::move(description)) {}
+  using Dialer = std::function<std::expected<int, std::string>(
+      const std::string &host, const std::string &port)>;
+
+  RemoteConnection(common::net::TcpSocket socket, std::string description,
+                   Dialer dialer = {})
+      : socket_(std::move(socket)), description_(std::move(description)),
+        dialer_(std::move(dialer)) {}
 
   Outcome execute(const std::string &sql) override {
     Outcome outcome;
@@ -186,6 +192,14 @@ public:
         outcome.error_sql = error.sql;
         outcome.error_span = sspan_make(error.begin_line, error.begin_column,
                                         error.end_line, error.end_column);
+        if (error.leader_hint.has_value()) {
+          // 只在服务端通告了能力位时才认这个 hint（版本协商纪律：老客户端
+          // 遇到新服务端也不会误读尾部字段）。
+          if ((capabilities_ & common::proto::kCapabilityLeaderHint) != 0) {
+            outcome.redirect_node_id = error.leader_hint->node_id;
+            outcome.redirect_endpoint = error.leader_hint->endpoint;
+          }
+        }
         outcome.in_transaction = in_transaction_;
         return outcome;
       }
@@ -197,6 +211,85 @@ public:
 
   std::string current_database() const override { return current_db_; }
   bool in_transaction() const override { return in_transaction_; }
+
+  // 换到 leader 节点：建新连接 -> 握手 -> 恢复当前库。
+  //
+  // 只在**不在事务里**时才有意义（事务状态在旧连接上，换过去就没了）；
+  // 调用方（REPL）负责这个判断，这里只做连接层的事。
+  bool redirect(const std::string &endpoint, std::string *error) override {
+    const size_t colon = endpoint.rfind(':');
+    if (colon == std::string::npos || colon == 0 ||
+        colon + 1 >= endpoint.size()) {
+      if (error != nullptr) {
+        *error = "leader endpoint is not host:port: " + endpoint;
+      }
+      return false;
+    }
+    const std::string host = endpoint.substr(0, colon);
+    const std::string port = endpoint.substr(colon + 1);
+    // 地址来自服务端（配置里校验过，但也可能是别人），用 from_chars 解析：
+    // 非数字端口要报错而不是抛异常。
+    uint32_t port_number = 0;
+    const char *begin = port.data();
+    const char *end = begin + port.size();
+    const auto rc = std::from_chars(begin, end, port_number, 10);
+    if (port.empty() || rc.ec != std::errc() || rc.ptr != end ||
+        port_number == 0 || port_number > 65535) {
+      if (error != nullptr) {
+        *error = "leader endpoint has an invalid port: " + endpoint;
+      }
+      return false;
+    }
+
+    std::expected<int, std::string> fd = std::unexpected(
+        std::string{"no dialer"});
+    if (dialer_) {
+      fd = dialer_(host, port);
+    } else {
+      auto socket = common::net::TcpSocket::connect(
+          host, static_cast<uint16_t>(port_number));
+      if (socket.has_value()) {
+        fd = socket->release();
+      } else {
+        fd = std::unexpected(socket.error());
+      }
+    }
+    if (!fd.has_value()) {
+      if (error != nullptr) {
+        *error = "cannot connect to " + endpoint + ": " + fd.error();
+      }
+      return false;
+    }
+
+    common::net::TcpSocket socket = common::net::TcpSocket::adopt(*fd);
+    common::net::socket_suppress_sigpipe(socket.fd());
+    auto replacement = std::make_unique<RemoteConnection>(
+        std::move(socket), endpoint, dialer_);
+    if (!replacement->handshake()) {
+      if (error != nullptr) {
+        *error = "handshake with " + endpoint + " failed";
+      }
+      return false;
+    }
+    // 会话状态：当前库跟着走，事务不跟（调用方保证这里没有事务）。
+    if (!current_db_.empty()) {
+      const Outcome used = replacement->execute("USE " + current_db_);
+      if (!used.ok) {
+        if (error != nullptr) {
+          *error = "cannot restore current database on " + endpoint;
+        }
+        return false;
+      }
+    }
+
+    socket_ = std::move(replacement->socket_);
+    in_.clear();
+    description_ = endpoint;
+    protocol_version_ = replacement->protocol_version_;
+    server_version_ = replacement->server_version_;
+    in_transaction_ = false;
+    return true;
+  }
 
   bool supports_metadata() const override { return true; }
 
@@ -278,6 +371,7 @@ public:
     }
     protocol_version_ = proto;
     server_version_ = server_version;
+    capabilities_ = capabilities;
     return proto == common::proto::kProtocolVersion;
   }
 
@@ -343,17 +437,20 @@ private:
   common::net::TcpSocket socket_;
   std::string in_;
   std::string description_;
+  Dialer dialer_;
   std::string current_db_;
   bool in_transaction_ = false;
   uint16_t protocol_version_ = 0;
   uint16_t server_version_ = 0;
+  uint32_t capabilities_ = 0;
 };
 
 std::unique_ptr<SqlConnection>
 make_remote_from_socket(common::net::TcpSocket socket, std::string *error,
-                        const std::string &label) {
-  auto connection =
-      std::make_unique<RemoteConnection>(std::move(socket), label);
+                        const std::string &label,
+                        RemoteConnection::Dialer dialer = {}) {
+  auto connection = std::make_unique<RemoteConnection>(std::move(socket), label,
+                                                       std::move(dialer));
   if (!connection->handshake()) {
     if (error != nullptr) {
       *error = "protocol handshake failed (server speaks a different version?)";
@@ -372,16 +469,31 @@ make_local(std::shared_ptr<kv::KVEngine> engine) {
 
 std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
                                            std::string *error) {
-  auto socket = common::net::TcpSocket::connect(
-      options.host, static_cast<uint16_t>(std::stoi(options.port)));
-  if (!socket.has_value()) {
-    if (error != nullptr) {
-      *error = socket.error();
+  common::net::TcpSocket socket;
+  if (options.dialer) {
+    auto fd = options.dialer(options.host, options.port);
+    if (!fd.has_value()) {
+      if (error != nullptr) {
+        *error = fd.error();
+      }
+      return nullptr;
     }
-    return nullptr;
+    socket = common::net::TcpSocket::adopt(*fd);
+    common::net::socket_suppress_sigpipe(socket.fd());
+  } else {
+    auto connected = common::net::TcpSocket::connect(
+        options.host, static_cast<uint16_t>(std::stoi(options.port)));
+    if (!connected.has_value()) {
+      if (error != nullptr) {
+        *error = connected.error();
+      }
+      return nullptr;
+    }
+    socket = std::move(*connected);
   }
   const std::string description = options.host + ":" + options.port;
-  return make_remote_from_socket(std::move(*socket), error, description);
+  return make_remote_from_socket(std::move(socket), error, description,
+                                 options.dialer);
 }
 
 std::unique_ptr<SqlConnection> make_remote_from_fd(int fd, std::string *error,

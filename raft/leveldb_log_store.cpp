@@ -14,9 +14,11 @@ namespace {
 
 constexpr std::string_view kHardStateKey = "hard_state";
 constexpr std::string_view kLogPrefix = "log/";
+constexpr std::string_view kSnapshotMetaKey = "snapshot_meta";
 constexpr size_t kEncodedIndexSize = sizeof(uint64_t);
 constexpr size_t kEncodedHardStateSize = kEncodedIndexSize + 1 +
                                          kEncodedIndexSize;
+constexpr size_t kEncodedSnapshotMetaSize = 2 * kEncodedIndexSize;
 
 void append_u64(std::string &out, uint64_t value) {
   for (int shift = 56; shift >= 0; shift -= 8) {
@@ -98,17 +100,56 @@ std::expected<void, Error> LevelDBLogStore::open(const std::string &path) {
   }
   db_.reset(db);
 
-  // P0 has no log compaction, so a non-empty log must start at index 1 and be
-  // contiguous. This catches partial/corrupted writes before Raft starts.
-  uint64_t expected = 1;
+  // Load snapshot metadata first: with compaction the log may start at
+  // last_included_index + 1 instead of 1.
+  std::string meta_value;
+  const leveldb::Status meta_status = db_->Get(
+      leveldb::ReadOptions(), std::string{kSnapshotMetaKey}, &meta_value);
+  if (meta_status.IsNotFound()) {
+    // No snapshot yet.
+  } else if (!meta_status.ok()) {
+    return std::unexpected(leveldb_error(meta_status));
+  } else {
+    if (meta_value.size() != kEncodedSnapshotMetaSize) {
+      return std::unexpected(Error{
+          ErrorCode::InternalError, "invalid raft snapshot metadata size"});
+    }
+    size_t meta_offset = 0;
+    auto included = decode_u64(meta_value, meta_offset);
+    auto included_term = decode_u64(meta_value, meta_offset);
+    if (!included.has_value() || !included_term.has_value()) {
+      return std::unexpected(Error{
+          ErrorCode::InternalError, "invalid raft snapshot metadata"});
+    }
+    if (*included == kInvalidIndex || *included_term == 0) {
+      return std::unexpected(Error{
+          ErrorCode::InternalError, "invalid raft snapshot metadata values"});
+    }
+    snapshot_meta_ = SnapshotMetadata{*included, *included_term};
+  }
+
+  // Log entries must be contiguous from last_included_index + 1. A key at or
+  // below the snapshot boundary is a stale prefix left by a crash between
+  // "state machine restored" and "log compacted"; drop it as recovery.
+  const uint64_t expected_start =
+      snapshot_meta_.has_snapshot() ? snapshot_meta_.last_included_index + 1
+                                    : 1;
+  uint64_t expected = expected_start;
+  uint64_t last_found = kInvalidIndex;
+  leveldb::WriteBatch recovery_batch;
+  bool has_recovery = false;
   std::unique_ptr<leveldb::Iterator> it(
       db_->NewIterator(leveldb::ReadOptions()));
-  for (it->Seek(log_key(expected));
-       it->Valid() && is_log_key(it->key().ToString());
+  for (it->Seek(log_key(1)); it->Valid() && is_log_key(it->key().ToString());
        it->Next()) {
     const auto index = decode_log_index(it->key().ToString());
     if (!index.has_value()) {
       return std::unexpected(index.error());
+    }
+    if (*index < expected_start) {
+      recovery_batch.Delete(it->key());
+      has_recovery = true;
+      continue;
     }
     if (*index != expected) {
       return std::unexpected(Error{
@@ -119,25 +160,23 @@ std::expected<void, Error> LevelDBLogStore::open(const std::string &path) {
       return std::unexpected(
           Error{ErrorCode::InternalError, "truncated raft log entry"});
     }
+    last_found = *index;
     ++expected;
-  }
-  if (it->status().ok() && expected == 1) {
-    // An empty log is valid. A log starting above index 1 is not valid until
-    // snapshot/compaction support exists.
-    std::unique_ptr<leveldb::Iterator> probe(
-        db_->NewIterator(leveldb::ReadOptions()));
-    probe->Seek(log_key(1));
-    if (probe->Valid() && is_log_key(probe->key().ToString())) {
-      return std::unexpected(Error{
-          ErrorCode::InternalError,
-          "raft log store must start at index 1 before compaction"});
-    }
   }
   if (!it->status().ok()) {
     return std::unexpected(leveldb_error(it->status()));
   }
 
-  last_index_ = expected == 1 ? kInvalidIndex : expected - 1;
+  if (has_recovery) {
+    leveldb::WriteOptions options;
+    options.sync = true;
+    const leveldb::Status status = db_->Write(options, &recovery_batch);
+    if (!status.ok()) {
+      return std::unexpected(leveldb_error(status));
+    }
+  }
+
+  last_index_ = std::max(last_found, snapshot_meta_.last_included_index);
   return {};
 }
 
@@ -192,6 +231,16 @@ LevelDBLogStore::at(uint64_t index) const {
     return std::unexpected(
         Error{ErrorCode::InvalidArgument, "log index out of range"});
   }
+  if (index < snapshot_meta_.last_included_index) {
+    return std::unexpected(Error{
+        ErrorCode::InvalidArgument,
+        "log index is inside the compacted snapshot prefix"});
+  }
+  if (index == snapshot_meta_.last_included_index) {
+    // The snapshot boundary: the entry's term is known, its data lives inside
+    // the state machine snapshot and is not stored in the log.
+    return LogEntry{index, snapshot_meta_.last_included_term, {}};
+  }
 
   std::string value;
   const leveldb::Status status =
@@ -227,7 +276,8 @@ LevelDBLogStore::truncate_suffix(uint64_t from) {
   if (auto result = check_db(db_.get()); !result.has_value()) {
     return std::unexpected(result.error());
   }
-  if (from == kInvalidIndex || from > last_index_ + 1) {
+  if (from == kInvalidIndex || from <= snapshot_meta_.last_included_index ||
+      from > last_index_ + 1) {
     return std::unexpected(
         Error{ErrorCode::InvalidArgument, "truncate suffix out of range"});
   }
@@ -324,6 +374,65 @@ std::expected<uint64_t, Error> LevelDBLogStore::last_index() const {
     return std::unexpected(result.error());
   }
   return last_index_;
+}
+
+std::expected<SnapshotMetadata, Error>
+LevelDBLogStore::snapshot_metadata() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (auto result = check_db(db_.get()); !result.has_value()) {
+    return std::unexpected(result.error());
+  }
+  return snapshot_meta_;
+}
+
+std::expected<void, Error>
+LevelDBLogStore::install_snapshot(const SnapshotMetadata &meta) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (auto result = check_db(db_.get()); !result.has_value()) {
+    return std::unexpected(result.error());
+  }
+  if (meta.last_included_index == kInvalidIndex ||
+      meta.last_included_term == 0) {
+    return std::unexpected(
+        Error{ErrorCode::InvalidArgument, "invalid snapshot metadata"});
+  }
+
+  leveldb::WriteBatch batch;
+  std::unique_ptr<leveldb::Iterator> it(
+      db_->NewIterator(leveldb::ReadOptions()));
+  for (it->Seek(log_key(1)); it->Valid() && is_log_key(it->key().ToString());
+       it->Next()) {
+    const auto index = decode_log_index(it->key().ToString());
+    if (!index.has_value()) {
+      return std::unexpected(index.error());
+    }
+    if (*index <= meta.last_included_index) {
+      batch.Delete(it->key());
+    } else {
+      break; // keys are sorted, everything after this is above the boundary
+    }
+  }
+  if (!it->status().ok()) {
+    return std::unexpected(leveldb_error(it->status()));
+  }
+
+  std::string value;
+  append_u64(value, meta.last_included_index);
+  append_u64(value, meta.last_included_term);
+  batch.Put(std::string{kSnapshotMetaKey}, value);
+
+  leveldb::WriteOptions options;
+  options.sync = true;
+  const leveldb::Status status = db_->Write(options, &batch);
+  if (!status.ok()) {
+    return std::unexpected(leveldb_error(status));
+  }
+
+  snapshot_meta_ = meta;
+  if (last_index_ < meta.last_included_index) {
+    last_index_ = meta.last_included_index;
+  }
+  return {};
 }
 
 } // namespace raft

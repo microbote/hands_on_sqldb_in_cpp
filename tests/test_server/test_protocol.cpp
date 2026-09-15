@@ -106,6 +106,64 @@ TEST(Protocol, ColumnsAndOkAndErrorRoundTrip) {
   CHECK_EQ(back.end_column, uint32_t{12});
 }
 
+TEST(Protocol, ErrorFrameCarriesOptionalLeaderHint) {
+  // 带 hint：客户端拿到"该去哪台"。
+  common::proto::ErrorFrame error;
+  error.code = 42;
+  error.message = "not the leader";
+  error.leader_hint = common::proto::LeaderHint{7, "10.0.0.7:5433"};
+
+  common::proto::DecodedFrame frame;
+  size_t consumed = 0;
+  std::string decode_error;
+  CHECK(common::proto::try_decode_frame(common::proto::encode_error(error),
+                                        &frame, &consumed, &decode_error));
+  common::proto::ErrorFrame decoded;
+  CHECK(common::proto::decode_error(frame.payload, &decoded));
+  CHECK_EQ(decoded.code, uint8_t{42});
+  CHECK_EQ(decoded.message, std::string("not the leader"));
+  CHECK_TRUE(decoded.leader_hint.has_value());
+  if (decoded.leader_hint.has_value()) {
+    CHECK_EQ(decoded.leader_hint->node_id, uint64_t{7});
+    CHECK_EQ(decoded.leader_hint->endpoint, std::string("10.0.0.7:5433"));
+  }
+
+  // 不带 hint：编码结果与老格式一致（客户端拿到 nullopt）。
+  common::proto::ErrorFrame plain;
+  plain.message = "syntax error";
+  CHECK(common::proto::try_decode_frame(common::proto::encode_error(plain),
+                                        &frame, &consumed, &decode_error));
+  common::proto::ErrorFrame plain_decoded;
+  CHECK(common::proto::decode_error(frame.payload, &plain_decoded));
+  CHECK_FALSE(plain_decoded.leader_hint.has_value());
+}
+
+TEST(Protocol, ErrorFrameWithoutTrailingHintIsStillReadable) {
+  // 老服务端的格式：固定字段之后没有尾巴 —— 必须能解出来且没有 hint。
+  std::string payload;
+  payload.push_back(static_cast<char>(9)); // code
+  common::proto::encode_error(common::proto::ErrorFrame{}); // 仅确保符号可用
+  const auto append_bytes = [&payload](const std::string &bytes) {
+    const uint32_t length = static_cast<uint32_t>(bytes.size());
+    payload.push_back(static_cast<char>((length >> 0) & 0xff));
+    payload.push_back(static_cast<char>((length >> 8) & 0xff));
+    payload.push_back(static_cast<char>((length >> 16) & 0xff));
+    payload.push_back(static_cast<char>((length >> 24) & 0xff));
+    payload.append(bytes);
+  };
+  append_bytes("legacy error");
+  append_bytes("");
+  for (int i = 0; i < 4; ++i) {
+    payload.append(4, '\0'); // 四个 u32 span 字段
+  }
+
+  common::proto::ErrorFrame decoded;
+  CHECK(common::proto::decode_error(payload, &decoded));
+  CHECK_EQ(decoded.code, uint8_t{9});
+  CHECK_EQ(decoded.message, std::string("legacy error"));
+  CHECK_FALSE(decoded.leader_hint.has_value());
+}
+
 TEST(Protocol, PartialAndPipelinedFrames) {
   const std::string a = common::proto::encode_query("SELECT 1;");
   const std::string b = common::proto::encode_simple(common::proto::FrameType::kPing);

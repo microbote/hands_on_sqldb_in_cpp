@@ -6,8 +6,15 @@ proposal commit/apply 等待、payload 应用到本地 KV、request id 幂等、
 range 快照恢复、ReadIndex 读屏障，以及 `RaftKVStore`/`RaftKVEngine` 这一层
 SQL 侧适配。P1b 已落地：`RaftRuntime`（单服务线程）、RPC 二进制编解码、
 `[raft]` 配置段与校验、TCP transport、以及 `sqldb-server` 的启动/关闭接线
-（`server/raft_bootstrap.{h,cpp}`）。**仍未做**：快照传输/安装、日志
-compaction、`NotLeader` 的 leader hint 回传与重试、read-index 合并、
+（`server/raft_bootstrap.{h,cpp}`）、**NotLeader + leader hint 的客户端重定向**
+（`[raft] sql_endpoints` → ERROR 帧尾部 hint → 客户端自动重连重试一次）。
+**Phase A v1（快照/压缩）已落地**：`SnapshotMetadata` + `LogStore::install_snapshot()`
+（LevelDB 持久化快照点、重启恢复、压缩前缀在 `at()` 以边界项合成）、
+`InstallSnapshot` RPC 编解码与 TCP 直通、leader 侧按 `[raft] snapshot_entries`
+阈值生成快照并压缩日志、落后/新 follower 通过快照追赶并继续复制、
+`KVStateMachine` 支持无上界（整 key space）快照生成/恢复。
+**仍留作后续**：分片式大快照传输（当前单帧、受 64MB 帧上限约束）、
+follower 本地压缩（现在只随快照安装发生）、read-index 合并、跨组只读模式、
 成员变更。
 
 ## 模块结构
@@ -58,6 +65,10 @@ compaction、`NotLeader` 的 leader hint 回传与重试、read-index 合并、
 - 单成员组不监听（没有 peer 连得进来），所以单节点 raft 可以完全离线跑。
 - `client_id` 带**每进程随机盐**：幂等结果会持久化，纯自增计数在重启后会重复，
   会让新写被误判成旧请求的重放而静默跳过。
+- **leader hint / 客户端重定向**：`RaftKVStore::leader_hint()` 在"本节点不是
+  leader"时给出 `{node_id, 客户端 SQL 地址}`（地址来自 `[raft] sql_endpoints`，
+  没配就只给 node id）；server 在执行语句前先问一次，命中直接回 `NOT_LEADER`
+  + hint，不碰本地状态机；客户端只在**不在事务里**时重连并重试一次。
 - 新 leader 会追加当前 term 的 no-op entry，用来安全提交前一 term 的日志。
 - leader 的读要先过 `read_barrier()`（ReadIndex）：记下请求时刻的
   `commit_index`，再发一轮 heartbeat，等**多数派确认了这一轮**且本地 apply

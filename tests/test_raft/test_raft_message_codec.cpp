@@ -78,6 +78,37 @@ TEST(MessageCodec, RoundTripsEveryMessageType) {
     CHECK_EQ(out.match_index, uint64_t{6});
     CHECK_EQ(out.round, uint64_t{8});
   }
+
+  raft::InstallSnapshotRequest snapshot_request;
+  snapshot_request.term = 13;
+  snapshot_request.leader_id = NodeId{1};
+  snapshot_request.last_included_index = 40;
+  snapshot_request.last_included_term = 11;
+  const std::string snapshot_data{"SQSN\x00\x01\xff", 8};
+  snapshot_request.data = snapshot_data;
+  auto decoded_snapshot_request =
+      raft::decode_frame(raft::encode_frame(snapshot_request));
+  CHECK_TRUE(decoded_snapshot_request.has_value());
+  if (decoded_snapshot_request.has_value()) {
+    const auto &out =
+        std::get<raft::InstallSnapshotRequest>(*decoded_snapshot_request);
+    CHECK_EQ(out.term, uint64_t{13});
+    CHECK_EQ(out.leader_id.value, uint64_t{1});
+    CHECK_EQ(out.last_included_index, uint64_t{40});
+    CHECK_EQ(out.last_included_term, uint64_t{11});
+    CHECK_EQ(out.data, snapshot_data);
+  }
+
+  const raft::InstallSnapshotResponse snapshot_response{14, true};
+  auto decoded_snapshot_response =
+      raft::decode_frame(raft::encode_frame(snapshot_response));
+  CHECK_TRUE(decoded_snapshot_response.has_value());
+  if (decoded_snapshot_response.has_value()) {
+    const auto &out =
+        std::get<raft::InstallSnapshotResponse>(*decoded_snapshot_response);
+    CHECK_EQ(out.term, uint64_t{14});
+    CHECK_TRUE(out.success);
+  }
 }
 
 TEST(MessageCodec, RejectsMalformedPayloads) {

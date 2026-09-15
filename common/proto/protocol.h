@@ -20,6 +20,7 @@
 //   6 ERROR   server->client : u8 code, bytes message, bytes sql,
 //                              u32 begin_line, u32 begin_col,
 //                              u32 end_line, u32 end_col
+//                              [+ u8 has_hint, u64 node_id, bytes endpoint]
 //   7 PING / 8 BYE（无 payload）
 //
 // 为什么 NULL 要带标志位：`Value::to_string()` 对 NULL 返回字面量 "NULL"，
@@ -75,6 +76,9 @@ struct MetaTable {
 };
 
 constexpr uint16_t kProtocolVersion = 1;
+// HELLO 里通告的能力位：服务端认识 ERROR 帧尾部的 leader hint。
+// 老客户端读到未知能力位会忽略；新客户端只在服务端通告时才期待 hint。
+constexpr uint32_t kCapabilityLeaderHint = 1u << 0;
 // 单帧上限（防止对端用超大长度头把服务端撑爆）
 constexpr uint32_t kMaxFrameSize = 16u * 1024 * 1024;
 
@@ -82,6 +86,12 @@ constexpr uint32_t kMaxFrameSize = 16u * 1024 * 1024;
 struct ProtocolValue {
   bool is_null = false;
   std::string text;
+};
+
+// 重定向提示：这条语句该去哪个节点执行（多副本存储的 leader）。
+struct LeaderHint {
+  uint64_t node_id = 0;
+  std::string endpoint; // 客户端可连接的 "host:port"；空 = 只知道 node id
 };
 
 struct ErrorFrame {
@@ -92,6 +102,8 @@ struct ErrorFrame {
   uint32_t begin_column = 0;
   uint32_t end_line = 0;
   uint32_t end_column = 0;
+  // 只有 code == NOT_LEADER 时可能有；老服务端不会带（解码后为 nullopt）。
+  std::optional<LeaderHint> leader_hint;
 };
 
 // ---- 编码（返回完整的帧字节，含帧头）----

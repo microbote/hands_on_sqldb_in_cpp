@@ -51,8 +51,11 @@ uint64_t allocate_client_id() {
 
 } // namespace
 
-RaftKVStore::RaftKVStore(std::shared_ptr<kv::KVStore> local, RaftNode &node)
-    : local_(std::move(local)), node_(node) {}
+RaftKVStore::RaftKVStore(std::shared_ptr<kv::KVStore> local,
+                         RaftExecutor &executor,
+                         std::map<uint64_t, std::string> client_endpoints)
+    : local_(std::move(local)), executor_(&executor),
+      client_endpoints_(std::move(client_endpoints)) {}
 
 RaftKVStore::~RaftKVStore() = default;
 
@@ -77,8 +80,9 @@ std::shared_ptr<kv::KVEngine> RaftKVStore::connect() {
   if (local_engine == nullptr) {
     return nullptr;
   }
-  return std::make_shared<RaftKVEngine>(
-      shared_from_this(), std::move(local_engine), allocate_client_id());
+  return std::make_shared<RaftKVEngine>(shared_from_this(),
+                                        std::move(local_engine),
+                                        allocate_client_id(), *executor_);
 }
 
 void RaftKVStore::flush() { local_->flush(); }
@@ -87,6 +91,21 @@ std::string RaftKVStore::stats() const { return local_->stats(); }
 
 bool RaftKVStore::write_slot_held() const {
   return write_slot_held_.load();
+}
+
+std::optional<kv::LeaderHint> RaftKVStore::leader_hint() {
+  const std::optional<NodeId> leader = executor_->leader_hint();
+  if (!leader.has_value() || *leader == executor_->node_id()) {
+    // No hint, or we *are* the leader: nothing to redirect.
+    return std::nullopt;
+  }
+  kv::LeaderHint hint;
+  hint.node_id = leader->value;
+  const auto endpoint = client_endpoints_.find(leader->value);
+  if (endpoint != client_endpoints_.end()) {
+    hint.endpoint = endpoint->second;
+  }
+  return hint;
 }
 
 kv::Status RaftKVStore::write_batch(const kv::WriteBatch &) {
@@ -123,9 +142,9 @@ void RaftKVStore::release_write_slot(const void *owner) {
 
 RaftKVEngine::RaftKVEngine(std::shared_ptr<RaftKVStore> store,
                            std::shared_ptr<kv::KVEngine> local_engine,
-                           uint64_t client_id)
+                           uint64_t client_id, RaftExecutor &executor)
     : store_(std::move(store)), local_engine_(std::move(local_engine)),
-      node_(store_->node_), client_id_(client_id) {}
+      executor_(executor), client_id_(client_id) {}
 
 RaftKVEngine::~RaftKVEngine() {
   tx_.reset();
@@ -139,18 +158,18 @@ std::shared_ptr<kv::KVStore> RaftKVEngine::store() const { return store_; }
 bool RaftKVEngine::is_open() const { return store_->is_open(); }
 
 kv::Status RaftKVEngine::ensure_readable() {
-  auto read_index = node_.read_barrier();
+  auto read_index = executor_.read_barrier();
   if (!read_index.has_value()) {
-    return error_to_status(read_index.error());
+    return last_error_ = error_to_status(read_index.error());
   }
   // A leader that cannot reach a quorum within an election timeout has lost
   // its proof of leadership, so the read must fail instead of waiting forever.
   auto ready = read_index->wait_for(std::chrono::milliseconds{
-      node_.election_timeout_ms()});
+      executor_.election_timeout_ms()});
   if (!ready.has_value()) {
-    return error_to_status(ready.error());
+    return last_error_ = error_to_status(ready.error());
   }
-  return kv::Status::OK;
+  return last_error_ = kv::Status::OK;
 }
 
 kv::Status RaftKVEngine::get(const kv::Key &key, kv::ByteValue *value) {
@@ -178,7 +197,7 @@ kv::Status RaftKVEngine::read_key(const kv::Key &key, kv::ByteValue *value) {
 
   auto iterator = make_iterator(kv::KeyRange::from(key));
   if (iterator == nullptr) {
-    return kv::Status::InternalError;
+    return last_error_ = kv::Status::InternalError;
   }
   if (!iterator->valid() || iterator->key() != key) {
     return kv::Status::NotFound;
@@ -273,12 +292,17 @@ kv::Status RaftKVEngine::write_batch(const kv::WriteBatch &batch) {
 std::unique_ptr<kv::Iterator>
 RaftKVEngine::new_iterator(const kv::KeyRange &range) {
   if (!store_->is_open()) {
+    last_error_ = kv::Status::InternalError;
     return nullptr;
   }
   if (const kv::Status status = ensure_readable(); status != kv::Status::OK) {
     return nullptr;
   }
-  return make_iterator(range);
+  auto iterator = make_iterator(range);
+  if (iterator == nullptr) {
+    last_error_ = kv::Status::InternalError;
+  }
+  return iterator;
 }
 
 kv::Status RaftKVEngine::begin_transaction() {
@@ -384,7 +408,7 @@ std::string RaftKVEngine::name() const { return "RaftKVEngine"; }
 kv::Status RaftKVEngine::propose_batch(const kv::WriteBatch &batch) {
   if (!write_slot_) {
     if (!store_->acquire_write_slot(this)) {
-      return kv::Status::Busy;
+      return last_error_ = kv::Status::Busy;
     }
     write_slot_ = true;
   }
@@ -397,28 +421,28 @@ kv::Status RaftKVEngine::propose_batch(const kv::WriteBatch &batch) {
   payload.request_id = next_request_id_++;
   payload.batch = batch;
 
-  auto proposal = node_.propose(encode_proposal_payload(payload));
+  auto proposal = executor_.propose(encode_proposal_payload(payload));
   if (!proposal.has_value()) {
     if (tx_ == nullptr) {
       release_write_slot();
     }
-    return error_to_status(proposal.error());
+    return last_error_ = error_to_status(proposal.error());
   }
   // Timeout here means "unknown outcome", not "not applied": the entry may
   // still commit later. Callers retry with the same client/request id, which
   // the state machine deduplicates.
   auto committed = proposal->wait_for(std::chrono::milliseconds{
-      node_.election_timeout_ms()});
+      executor_.election_timeout_ms()});
   if (!committed.has_value()) {
     if (tx_ == nullptr) {
       release_write_slot();
     }
-    return error_to_status(committed.error());
+    return last_error_ = error_to_status(committed.error());
   }
   if (tx_ == nullptr) {
     release_write_slot();
   }
-  return kv::Status::OK;
+  return last_error_ = kv::Status::OK;
 }
 
 void RaftKVEngine::release_local_snapshot() {

@@ -43,8 +43,10 @@ Raft 日志/幂等结果放 `log_path/{log,request_results}`，SQL 连接照旧�
 
 - 需要带 LevelDB 的构建（默认就是）；
 - 每个节点用同一份静态 `peers`，`node_id` 必须在其中；单成员组不监听端口；
-- follower 上的读/写会返回 `NotLeader`（ERROR 帧里就是这串文字，暂不带
-  leader hint）；
+- follower 上的读/写返回 `NotLeader` + **leader 的客户端地址**：配了
+  `[raft] sql_endpoints`
+  时，客户端会自动重连到 leader 并把这条语句重试一次（只在不处于事务里时；
+  事务状态挂在旧连接上，重连等于丢掉它，所以事务里直接报错）；
 - 关闭顺序由 `server/raft_bootstrap` 保证：先停 SQL、再停定时器/transport/
   raft 服务线程、最后关两个 LevelDB。
 

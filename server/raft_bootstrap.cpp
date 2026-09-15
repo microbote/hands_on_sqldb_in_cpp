@@ -116,11 +116,16 @@ RaftBootstrap::open(const ServerConfig &config,
         return raw->post_to_runtime(std::move(work));
       });
 
+  raft::NodeConfig node_config{raft::NodeId{node_id}, std::move(peer_ids),
+                               config.raft_election_timeout_ms(),
+                               config.raft_heartbeat_ms()};
+  // P1 单 group 覆盖整个 key space（从 "" 扫到结尾）。P2 多 group 时每个
+  // group 在这里拿到自己的 range。
+  node_config.group_range = kv::KeyRange::from(kv::Key{});
+  node_config.snapshot_entries_threshold = config.raft_snapshot_entries();
   self->node_ = std::make_unique<raft::RaftNode>(
-      raft::NodeConfig{raft::NodeId{node_id}, std::move(peer_ids),
-                       config.raft_election_timeout_ms(),
-                       config.raft_heartbeat_ms()},
-      self->log_store_, *self->transport_, *self->state_machine_, self->clock_);
+      std::move(node_config), self->log_store_, *self->transport_,
+      *self->state_machine_, self->clock_);
   self->runtime_ = std::make_unique<raft::RaftRuntime>(*self->node_, "raft");
   self->runtime_->start();
 
@@ -158,8 +163,11 @@ RaftBootstrap::open(const ServerConfig &config,
     raw->timer_loop_.run();
   });
 
-  self->store_ = std::make_shared<raft::RaftKVStore>(self->local_,
-                                                     *self->node_);
+  // Client-facing endpoints for redirects: node id -> SQL address. Missing
+  // entries mean "we know who the leader is but not where its SQL port is", so
+  // the client gets a plain NotLeader without a reconnect target.
+  self->store_ = std::make_shared<raft::RaftKVStore>(
+      self->local_, *self->runtime_, config.raft_sql_endpoints());
   const kv::Status status = self->store_->open(kv::DatabaseOptions{});
   if (status != kv::Status::OK) {
     return std::unexpected(std::string{"cannot open RaftKVStore: "} +

@@ -72,6 +72,9 @@ enum class SessionErrorCode : uint8_t {
   CONSTRAINT_VIOLATION, // 约束不满足（主键重复等）
   NOT_SUPPORTED,        // 该语句类型这里不处理
   TRANSACTION_ERROR, // 事务控制错误（重复 BEGIN / COMMIT 无事务 / 事务已中止）
+  // 本节点不是（该 key range 所在的）raft group 的 leader：这台机器不该执行
+  // 这条语句。ERROR 帧里会带 leader 的客户端地址，客户端可重连后重试。
+  NOT_LEADER,
 };
 
 inline const char *session_error_message(SessionErrorCode code) {
@@ -100,6 +103,8 @@ inline const char *session_error_message(SessionErrorCode code) {
     return "Statement is not supported";
   case SessionErrorCode::TRANSACTION_ERROR:
     return "Transaction error";
+  case SessionErrorCode::NOT_LEADER:
+    return "Not the leader";
   default:
     return "Unknown error";
   }

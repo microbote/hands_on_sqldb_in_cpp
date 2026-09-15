@@ -13,6 +13,7 @@
 #include <fmt/color.h>
 
 #include "parser/lex_tokens.h"
+#include "session/session.h"
 #include "statement/sql_highlight.h"
 
 #if defined(SQLDB_HAVE_READLINE)
@@ -533,6 +534,39 @@ void history_flush(const std::string &history_path) {
 #endif
 }
 
+// 执行一条语句，必要时**换节点重试一次**。
+//
+// 触发条件（三条同时成立，缺一不可）：
+//   1) 服务端回的不是别的错，而是 NOT_LEADER 且带了可连接的 leader 地址；
+//   2) 当前不在事务里 —— 事务状态挂在旧连接上，重连等于把它丢掉；
+//   3) redirect 成功（新连接握手通过、当前库也恢复了）。
+// 只重试一次：新节点如果也说自己不是 leader，就直接把错误交给用户，
+// 免得在两个节点之间来回弹。
+Outcome execute_with_redirect(SqlConnection &connection,
+                              const std::string &sql,
+                              const ReplOptions &options) {
+  Outcome outcome = connection.execute(sql);
+  const bool can_redirect =
+      !outcome.ok &&
+      outcome.error_code ==
+          static_cast<uint8_t>(session::SessionErrorCode::NOT_LEADER) &&
+      !outcome.redirect_endpoint.empty() && !connection.in_transaction();
+  if (!can_redirect) {
+    return outcome;
+  }
+
+  std::string error;
+  if (!connection.redirect(outcome.redirect_endpoint, &error)) {
+    // 重定向失败：保留原错误（那才是"为什么这条语句没执行"），另外提示一句
+    fmt::print(options.err, "[redirect] {}: {}\n",
+               outcome.redirect_endpoint, error);
+    return outcome;
+  }
+  fmt::print(options.err, "[redirect] leader 在 {}，已重连并重试本条语句\n",
+             outcome.redirect_endpoint);
+  return connection.execute(sql);
+}
+
 int run_text(SqlConnection &connection, const std::string &text,
              const ReplOptions &options) {
   int failures = 0;
@@ -558,7 +592,7 @@ int run_text(SqlConnection &connection, const std::string &text,
         fmt::print(options.out, "{}\n",
                    stmt::highlight_sql(statement.text, options.colors));
       }
-      Outcome outcome = connection.execute(statement.text);
+      Outcome outcome = execute_with_redirect(connection, statement.text, options);
       failures += print_outcome(options.out, options.err,
                                 to_absolute(std::move(outcome), absolute),
                                 options.colors);

@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "storage/kv_engine/kv_engine.h"
+
 namespace raft {
 
 inline constexpr uint64_t kInvalidIndex = 0;
@@ -64,6 +66,12 @@ struct NodeConfig {
   std::vector<NodeId> peers; // voter set; includes node_id itself.
   uint64_t election_timeout_ms = 1000;
   uint64_t heartbeat_interval_ms = 100;
+  // Key range this group owns. Used to generate and install snapshots. P1
+  // single-group covers the whole key space (start = "", end = nullopt).
+  kv::KeyRange group_range;
+  // Compact the log once this many applied entries have accumulated since the
+  // last snapshot. 0 disables compaction (the pre-snapshot behavior).
+  uint64_t snapshot_entries_threshold = 0;
 };
 
 // A static member of the group: identity plus where to reach it.

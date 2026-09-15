@@ -42,6 +42,7 @@ public:
   }
 
   std::expected<void, raft::Error> restore(std::string_view) override {
+    restored = true;
     return {};
   }
 
@@ -49,6 +50,7 @@ public:
     return std::find(applied.begin(), applied.end(), data) != applied.end();
   }
 
+  bool restored = false;
   std::vector<std::string> applied;
 };
 
@@ -227,6 +229,56 @@ TEST(LevelDBLogStore, TruncatesSuffixDurably) {
     CHECK_FALSE(store.at(2).has_value());
     CHECK_TRUE(store.append(raft::LogEntry{2, 3, "replacement"})
                    .has_value());
+  }
+}
+
+TEST(LevelDBLogStore, InstallsSnapshotAndRecoversAfterRestart) {
+  TempDirectory directory;
+  CHECK_TRUE(directory.valid());
+
+  {
+    raft::LevelDBLogStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+    for (uint64_t i = 1; i <= 5; ++i) {
+      CHECK_TRUE(store.append(raft::LogEntry{i, 1, "data" + std::to_string(i)})
+                     .has_value());
+    }
+
+    CHECK_TRUE(store.install_snapshot(raft::SnapshotMetadata{3, 1}).has_value());
+    CHECK_EQ(store.last_index().value_or(99), uint64_t{5});
+
+    auto meta = store.snapshot_metadata();
+    CHECK_TRUE(meta.has_value());
+    CHECK_EQ(meta->last_included_index, uint64_t{3});
+    CHECK_EQ(meta->last_included_term, uint64_t{1});
+
+    // Below the boundary: gone. At the boundary: synthesized with the term.
+    // Above the boundary: the real log entries survive.
+    CHECK_FALSE(store.at(2).has_value());
+    auto boundary = store.at(3);
+    CHECK_TRUE(boundary.has_value());
+    CHECK_EQ(boundary->term, uint64_t{1});
+    CHECK_TRUE(boundary->data.empty());
+    auto after = store.at(4);
+    CHECK_TRUE(after.has_value());
+    CHECK_STREQ(after->data, "data4");
+
+    // Appending continues right after the highest index.
+    CHECK_TRUE(store.append(raft::LogEntry{6, 1, "data6"}).has_value());
+  }
+
+  {
+    raft::LevelDBLogStore store;
+    CHECK_TRUE(store.open(directory.path()).has_value());
+    CHECK_EQ(store.last_index().value_or(99), uint64_t{6});
+    auto meta = store.snapshot_metadata();
+    CHECK_TRUE(meta.has_value());
+    CHECK_EQ(meta->last_included_index, uint64_t{3});
+    CHECK_EQ(meta->last_included_term, uint64_t{1});
+    CHECK_FALSE(store.at(2).has_value());
+    CHECK_TRUE(store.at(3).has_value());
+    CHECK_EQ(store.at(4)->data, "data4");
+    CHECK_EQ(store.at(6)->data, "data6");
   }
 }
 
@@ -713,6 +765,180 @@ TEST(RaftCore, FollowerTruncatesConflictingSuffix) {
   CHECK_TRUE(state_machine.contains("good"));
 }
 
+TEST(MemoryLogStore, CompactionHidesPrefixAndKeepsAppending) {
+  raft::MemoryLogStore log;
+  for (uint64_t i = 1; i <= 4; ++i) {
+    CHECK_TRUE(log.append(raft::LogEntry{i, 1, "d" + std::to_string(i)})
+                   .has_value());
+  }
+  CHECK_TRUE(log.install_snapshot(raft::SnapshotMetadata{3, 1}).has_value());
+
+  CHECK_EQ(log.last_index().value_or(99), uint64_t{4});
+  CHECK_FALSE(log.at(2).has_value()); // inside the compacted prefix
+  auto boundary = log.at(3);
+  CHECK_TRUE(boundary.has_value());
+  CHECK_EQ(boundary->term, uint64_t{1});
+  CHECK_TRUE(boundary->data.empty());
+  CHECK_EQ(log.at(4)->data, "d4");
+
+  // Appending and truncation continue to work after compaction.
+  CHECK_TRUE(log.append(raft::LogEntry{5, 1, "d5"}).has_value());
+  CHECK_TRUE(log.truncate_suffix(5).has_value());
+  CHECK_EQ(log.last_index().value_or(99), uint64_t{4});
+  CHECK_FALSE(log.at(5).has_value());
+}
+
+TEST(RaftCore, SingleNodeCompactsLogAndContinues) {
+  ManualClock clock;
+  TestNetwork network;
+  raft::MemoryLogStore log;
+  RecordingStateMachine state_machine;
+  TestTransport transport(NodeId{1}, network);
+  raft::RaftNode node(
+      raft::NodeConfig{NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100, 10,
+                       kv::KeyRange::from(kv::Key{}), 3},
+      log, transport, state_machine, clock);
+  CHECK_TRUE(node.start().has_value());
+
+  clock.advance(200);
+  node.tick();
+  CHECK_TRUE(node.is_leader());
+
+  for (uint64_t i = 1; i <= 4; ++i) {
+    auto proposal = node.propose("entry-" + std::to_string(i));
+    CHECK_TRUE(proposal.has_value());
+    CHECK_TRUE(proposal->done()); // single member commits immediately
+  }
+  // Leadership added a no-op at index 1; the four entries land at 2..5.
+  CHECK_EQ(node.last_log_index(), 5);
+  CHECK_EQ(node.applied_index(), 5);
+
+  // Compaction triggers on tick once the threshold is reached.
+  node.tick();
+  CHECK_GE(node.last_included_index(), 3);
+  CHECK_EQ(node.last_included_term(), 1);
+  CHECK_FALSE(log.at(1).has_value()); // compacted prefix is gone
+  const uint64_t included = node.last_included_index();
+
+  // A restart over the same log store resumes from the snapshot boundary.
+  RecordingStateMachine restarted_machine;
+  TestNetwork network2;
+  TestTransport transport2(NodeId{1}, network2);
+  raft::RaftNode restarted(
+      raft::NodeConfig{NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100, 10,
+                       kv::KeyRange::from(kv::Key{}), 3},
+      log, transport2, restarted_machine, clock);
+  CHECK_TRUE(restarted.start().has_value());
+  CHECK_EQ(restarted.last_included_index(), included);
+  CHECK_EQ(restarted.applied_index(), included);
+  CHECK_EQ(restarted.commit_index(), included);
+
+  // The new leadership appends a no-op right after the compacted prefix, then
+  // a real proposal continues past it.
+  clock.advance(200);
+  restarted.tick();
+  CHECK_TRUE(restarted.is_leader());
+  CHECK_EQ(restarted.last_log_index(), included + 1);
+
+  auto proposal = restarted.propose("after");
+  CHECK_TRUE(proposal.has_value());
+  CHECK_TRUE(proposal->done());
+  CHECK_EQ(restarted.last_log_index(), included + 2);
+  CHECK_EQ(restarted.applied_index(), included + 2);
+}
+
+TEST(RaftCore, NewFollowerCatchesUpViaSnapshot) {
+  using raft::NodeId;
+  ManualClock clock;
+  TestNetwork network;
+  const std::vector<NodeId> peers{NodeId{1}, NodeId{2}, NodeId{3}};
+  const uint64_t threshold = 3;
+
+  auto make_node = [&](NodeId id) -> std::unique_ptr<TestNode> {
+    auto test_node = std::make_unique<TestNode>();
+    test_node->transport = std::make_unique<TestTransport>(id, network);
+    test_node->node = std::make_unique<raft::RaftNode>(
+        raft::NodeConfig{id, peers, 100, 10, kv::KeyRange::from(kv::Key{}),
+                         threshold},
+        test_node->log, *test_node->transport, test_node->state_machine,
+        clock);
+    network.bind(id, test_node->node.get());
+    return test_node;
+  };
+
+  auto n1 = make_node(NodeId{1});
+  auto n2 = make_node(NodeId{2});
+
+  std::vector<raft::RaftNode *> live{n1->node.get(), n2->node.get()};
+  auto step = [&](uint64_t ms = 10) {
+    clock.advance(ms);
+    for (raft::RaftNode *n : live) {
+      n->tick();
+    }
+    network.deliver_all();
+  };
+
+  CHECK_TRUE(n1->node->start().has_value());
+  CHECK_TRUE(n2->node->start().has_value());
+  for (int i = 0; i < 20; ++i) {
+    step();
+  }
+
+  // With only nodes 1 and 2 up, node 1 campaigns first and wins.
+  raft::RaftNode *leader =
+      n1->node->is_leader() ? n1->node.get() : n2->node.get();
+  CHECK_TRUE(leader->is_leader());
+  CHECK_EQ(leader, n1->node.get());
+
+  auto propose_and_wait = [&](const std::string &data) {
+    auto proposal = leader->propose(data);
+    CHECK_TRUE(proposal.has_value());
+    for (int i = 0; i < 200 && !proposal->done(); ++i) {
+      step();
+    }
+    auto committed = proposal->wait();
+    CHECK_TRUE(committed.has_value());
+    return committed;
+  };
+
+  for (uint64_t i = 1; i <= 4; ++i) {
+    propose_and_wait("pre-" + std::to_string(i));
+  }
+  CHECK_GE(leader->applied_index(), 4);
+
+  // Let the leader compact its log at the applied index.
+  for (int i = 0; i < 5; ++i) {
+    step();
+  }
+  const uint64_t included = leader->last_included_index();
+  CHECK_GE(included, 3);
+  CHECK_FALSE(n1->log.at(1).has_value()); // compacted prefix is gone
+
+  // A brand-new follower joins after the log was compacted: it must catch up
+  // by installing the leader's snapshot.
+  auto n3 = make_node(NodeId{3});
+  CHECK_TRUE(n3->node->start().has_value());
+  live.push_back(n3->node.get());
+  for (int i = 0; i < 40; ++i) {
+    step();
+  }
+
+  CHECK_EQ(n3->node->last_included_index(), included);
+  CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
+  CHECK_EQ(n3->node->applied_index(), leader->applied_index());
+  CHECK_TRUE(n3->state_machine.restored);
+
+  // Post-snapshot proposals still replicate to the new follower.
+  auto p1 = propose_and_wait("post-1");
+  auto p2 = propose_and_wait("post-2");
+  CHECK_STREQ(p1->apply_result, "post-1");
+  CHECK_STREQ(p2->apply_result, "post-2");
+  CHECK_EQ(n3->node->last_log_index(), leader->last_log_index());
+  CHECK_EQ(n3->node->applied_index(), leader->applied_index());
+  CHECK_TRUE(n3->state_machine.contains("post-1"));
+  CHECK_TRUE(n3->state_machine.contains("post-2"));
+}
+
 TEST(ProposalPayload, RoundTripsAllWriteBatchOperations) {
   raft::ProposalPayload payload;
   payload.client_id = 42;
@@ -874,6 +1100,47 @@ TEST(KVStateMachine, SnapshotsAndRestoresFiniteRange) {
     const std::string expected_range_value{"two\0three", 9};
     CHECK_EQ(values.at("range-b"), expected_range_value);
     CHECK_EQ(values.at("outside"), std::string{"stale"});
+  }
+}
+
+TEST(KVStateMachine, SnapshotsAndRestoresWholeRangeWithoutUpperBound) {
+  auto source = open_mock_store();
+  CHECK_TRUE(source != nullptr);
+  raft::MemoryRequestResultStore ignored_results;
+  raft::KVStateMachine source_state_machine{source, ignored_results};
+
+  kv::WriteBatch initial;
+  initial.put("a", "one");
+  initial.put("b", std::string{"two\0three", 9});
+  initial.put("@system/meta", "meta");
+  CHECK_EQ(source->write_batch(initial), kv::Status::OK);
+
+  // P1 single group covers the whole key space: start = "" with no upper
+  // bound. The snapshot must scan everything and restore over any stale keys.
+  const kv::KeyRange whole = kv::KeyRange::from(kv::Key{});
+  auto snapshot = source_state_machine.snapshot(whole);
+  CHECK_TRUE(snapshot.has_value());
+
+  auto target = open_mock_store();
+  CHECK_TRUE(target != nullptr);
+  raft::MemoryRequestResultStore target_results;
+  raft::KVStateMachine target_state_machine{target, target_results};
+
+  kv::WriteBatch stale;
+  stale.put("a", "stale");
+  stale.put("z", "stale");
+  CHECK_EQ(target->write_batch(stale), kv::Status::OK);
+
+  auto restored = target_state_machine.restore(whole, *snapshot);
+  CHECK_TRUE(restored.has_value());
+
+  const auto values = collect_range(target, kv::KeyRange::all());
+  CHECK_EQ(values.size(), size_t{3});
+  if (values.size() == 3) {
+    CHECK_EQ(values.at("a"), std::string{"one"});
+    const std::string expected_b{"two\0three", 9};
+    CHECK_EQ(values.at("b"), expected_b);
+    CHECK_EQ(values.at("@system/meta"), std::string{"meta"});
   }
 }
 

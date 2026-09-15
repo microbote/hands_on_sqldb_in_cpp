@@ -66,6 +66,19 @@ std::expected<void, Error> RaftNode::start() {
   }
   last_log_index_ = *last_index;
 
+  auto meta = log_store_.snapshot_metadata();
+  if (!meta.has_value()) {
+    return std::unexpected(meta.error());
+  }
+  last_included_index_ = meta->last_included_index;
+  last_included_term_ = meta->last_included_term;
+
+  // After a restart the local state machine already contains every applied
+  // entry. With a compacted log the earliest recoverable index is the
+  // snapshot boundary, so resume apply/commit accounting from there.
+  last_applied_ = last_included_index_;
+  commit_index_ = last_included_index_;
+
   role_ = Role::Follower;
   leader_id_.reset();
   votes_received_.clear();
@@ -96,6 +109,12 @@ void RaftNode::tick() {
 
   if (auto result = apply_committed(); !result.has_value()) {
     record_error(result.error());
+  }
+
+  if (role_ == Role::Leader) {
+    if (auto result = maybe_compact_log(); !result.has_value()) {
+      record_error(result.error());
+    }
   }
 }
 
@@ -172,6 +191,13 @@ void RaftNode::handle_message(NodeId from, const Message &message) {
           }
         } else if constexpr (std::is_same_v<T, AppendEntriesResponse>) {
           handle_append_entries_response(from, concrete);
+        } else if constexpr (std::is_same_v<T, InstallSnapshotRequest>) {
+          if (auto result = handle_install_snapshot(from, concrete);
+              !result.has_value()) {
+            record_error(result.error());
+          }
+        } else if constexpr (std::is_same_v<T, InstallSnapshotResponse>) {
+          handle_install_snapshot_response(from, concrete);
         }
       },
       message);
@@ -362,19 +388,35 @@ RaftNode::handle_append_entries(NodeId from,
   }
 
   if (request.prev_log_index > last_log_index_) {
-    transport_.send(
-        from, AppendEntriesResponse{hard_state_.term, false, 0, request.round});
+    transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
+                                                request.round, last_log_index_});
+    return {};
+  }
+
+  // The referenced prefix may have been compacted into a snapshot. Terms are
+  // only known at the snapshot boundary; anything below it cannot be
+  // verified, so reject and let the leader fall back to a snapshot.
+  if (request.prev_log_index < last_included_index_) {
+    transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
+                                                request.round, last_log_index_});
     return {};
   }
 
   if (request.prev_log_index != kInvalidIndex) {
-    auto prev = log_store_.at(request.prev_log_index);
-    if (!prev.has_value()) {
-      return std::unexpected(prev.error());
+    uint64_t prev_term = 0;
+    if (request.prev_log_index == last_included_index_) {
+      prev_term = last_included_term_;
+    } else {
+      auto prev = log_store_.at(request.prev_log_index);
+      if (!prev.has_value()) {
+        return std::unexpected(prev.error());
+      }
+      prev_term = prev->term;
     }
-    if (prev->term != request.prev_log_term) {
+    if (prev_term != request.prev_log_term) {
       transport_.send(from, AppendEntriesResponse{hard_state_.term, false, 0,
-                                                  request.round});
+                                                  request.round,
+                                                  last_log_index_});
       return {};
     }
   }
@@ -472,11 +514,107 @@ void RaftNode::handle_append_entries_response(
   }
 
   if (next_index_[from] > 1) {
+    // The follower reports its last log index on failure. If it is entirely
+    // behind the compacted prefix, it needs a snapshot rather than a full log
+    // replay (backtracking through the whole log would take forever).
+    if (response.hint_last_index < last_included_index_) {
+      if (auto result = send_snapshot(from); !result.has_value()) {
+        record_error(result.error());
+      }
+      return;
+    }
     --next_index_[from];
   }
   if (auto result = send_append_entries(from); !result.has_value()) {
     record_error(result.error());
   }
+}
+
+std::expected<void, Error>
+RaftNode::handle_install_snapshot(NodeId from,
+                                  const InstallSnapshotRequest &request) {
+  if (request.term < hard_state_.term) {
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return {};
+  }
+  if (request.term > hard_state_.term ||
+      (request.term == hard_state_.term && role_ != Role::Follower)) {
+    if (auto result = become_follower(request.term, request.leader_id);
+        !result.has_value()) {
+      return std::unexpected(result.error());
+    }
+  } else {
+    leader_id_ = request.leader_id;
+    reset_election_deadline();
+  }
+
+  if (request.last_included_index == kInvalidIndex ||
+      request.last_included_term == 0) {
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return {};
+  }
+
+  // Restore the state machine data first: if we crash before the log store is
+  // compacted, a restart replays the (idempotent) log over the restored data.
+  if (auto result = state_machine_.restore(snapshot_range(), request.data);
+      !result.has_value()) {
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return std::unexpected(result.error());
+  }
+
+  SnapshotMetadata meta{request.last_included_index,
+                        request.last_included_term};
+  if (auto result = log_store_.install_snapshot(meta); !result.has_value()) {
+    transport_.send(from, InstallSnapshotResponse{hard_state_.term, false});
+    return std::unexpected(result.error());
+  }
+
+  last_included_index_ = meta.last_included_index;
+  last_included_term_ = meta.last_included_term;
+  last_log_index_ = std::max(last_log_index_, meta.last_included_index);
+  if (last_applied_ < meta.last_included_index) {
+    last_applied_ = meta.last_included_index;
+  }
+  if (commit_index_ < meta.last_included_index) {
+    commit_index_ = meta.last_included_index;
+  }
+
+  // Everything at or below the snapshot boundary is applied by construction.
+  // A follower never proposes, so there are normally no pending proposals
+  // here; complete any leftovers so a waiter can never hang.
+  complete_applied_proposals_upto(meta.last_included_index);
+  evaluate_read_barriers();
+
+  transport_.send(from, InstallSnapshotResponse{hard_state_.term, true});
+  return {};
+}
+
+void RaftNode::handle_install_snapshot_response(
+    NodeId from, const InstallSnapshotResponse &response) {
+  if (response.term > hard_state_.term) {
+    if (auto result = become_follower(response.term, std::nullopt);
+        !result.has_value()) {
+      record_error(result.error());
+    }
+    return;
+  }
+  if (role_ != Role::Leader || response.term != hard_state_.term) {
+    return;
+  }
+  if (response.success) {
+    // send_snapshot already advanced next/match optimistically. Keep sending
+    // whatever log remains after the snapshot.
+    if (match_index_[from] < last_log_index_) {
+      if (auto result = send_append_entries(from); !result.has_value()) {
+        record_error(result.error());
+      }
+    }
+    return;
+  }
+  // The follower failed to install (e.g. a restore error). Leave progress as
+  // it is; the next heartbeat retries the snapshot.
+  record_error(Error{ErrorCode::InternalError,
+                     "peer failed to install the raft snapshot"});
 }
 
 std::expected<void, Error> RaftNode::send_append_entries(NodeId to) {
@@ -488,9 +626,17 @@ std::expected<void, Error> RaftNode::send_append_entries(NodeId to) {
   }
 
   const uint64_t next = next_index_[to];
+  // The entry the follower needs has been compacted into a snapshot: hand it
+  // the snapshot instead of a log replay.
+  if (next <= last_included_index_) {
+    return send_snapshot(to);
+  }
+
   const uint64_t prev_index = next - 1;
   uint64_t prev_term = 0;
-  if (prev_index != kInvalidIndex) {
+  if (prev_index == last_included_index_) {
+    prev_term = last_included_term_;
+  } else if (prev_index != kInvalidIndex) {
     auto prev = log_store_.at(prev_index);
     if (!prev.has_value()) {
       return std::unexpected(prev.error());
@@ -518,6 +664,64 @@ std::expected<void, Error> RaftNode::send_append_entries(NodeId to) {
   }
 
   transport_.send(to, request);
+  return {};
+}
+
+std::expected<void, Error> RaftNode::send_snapshot(NodeId to) {
+  if (last_included_index_ == kInvalidIndex) {
+    return {}; // nothing compacted yet; the caller should not reach here
+  }
+  auto data = state_machine_.snapshot(snapshot_range());
+  if (!data.has_value()) {
+    return std::unexpected(data.error());
+  }
+
+  InstallSnapshotRequest request;
+  request.term = hard_state_.term;
+  request.leader_id = config_.node_id;
+  request.last_included_index = last_included_index_;
+  request.last_included_term = last_included_term_;
+  request.data = *data;
+
+  transport_.send(to, request);
+
+  // Optimistically move the follower past the snapshot; the next
+  // AppendEntries verifies and refines the progress.
+  next_index_[to] = last_included_index_ + 1;
+  match_index_[to] = std::max(match_index_[to], last_included_index_);
+  return {};
+}
+
+std::expected<void, Error> RaftNode::maybe_compact_log() {
+  if (role_ != Role::Leader || config_.snapshot_entries_threshold == 0) {
+    return {};
+  }
+  const uint64_t kept = last_log_index_ - last_included_index_;
+  if (kept < config_.snapshot_entries_threshold) {
+    return {};
+  }
+  const uint64_t target = last_applied_;
+  if (target == kInvalidIndex || target <= last_included_index_) {
+    return {};
+  }
+
+  auto entry = log_store_.at(target);
+  if (!entry.has_value()) {
+    return std::unexpected(entry.error());
+  }
+  auto data = state_machine_.snapshot(snapshot_range());
+  if (!data.has_value()) {
+    return std::unexpected(data.error());
+  }
+
+  SnapshotMetadata meta{target, entry->term};
+  if (auto result = log_store_.install_snapshot(meta); !result.has_value()) {
+    return std::unexpected(result.error());
+  }
+  last_included_index_ = target;
+  last_included_term_ = entry->term;
+  // commit_index_ is already >= last_applied_ == target. Followers behind the
+  // compacted prefix receive the snapshot on their next heartbeat.
   return {};
 }
 
@@ -589,6 +793,25 @@ void RaftNode::complete_applied_proposal(
   completion->finish(std::nullopt, apply_result);
 }
 
+void RaftNode::complete_applied_proposals_upto(uint64_t index) {
+  std::vector<std::shared_ptr<ProposalCompletion>> completions;
+  for (auto it = pending_proposals_.begin();
+       it != pending_proposals_.end();) {
+    if (it->first <= index) {
+      completions.push_back(std::move(it->second));
+      it = pending_proposals_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto &completion : completions) {
+    // Defensive fallback: the entry's effect is inside the snapshot, so it
+    // was applied when the snapshot was generated. The current state machine
+    // reports the constant "applied" result for every proposal.
+    completion->finish(std::nullopt, "applied");
+  }
+}
+
 void RaftNode::fail_pending_proposals(std::optional<uint64_t> from_index,
                                       Error error) {
   std::vector<std::shared_ptr<ProposalCompletion>> completions;
@@ -643,6 +866,19 @@ bool RaftNode::quorum_acknowledged(uint64_t round) const {
     }
   }
   return has_quorum(acknowledged);
+}
+
+kv::KeyRange RaftNode::snapshot_range() const {
+  kv::KeyRange range = config_.group_range;
+  if (!range.start.has_value()) {
+    // P1 single group covers the whole key space: scan from the very first
+    // key to the end.
+    range.start = std::string{};
+  }
+  if (range.direction != kv::ScanDirection::kForward) {
+    range.direction = kv::ScanDirection::kForward;
+  }
+  return range;
 }
 
 std::expected<uint64_t, Error> RaftNode::last_log_term() const {

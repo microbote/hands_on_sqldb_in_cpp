@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common/svrkit/service.h"
+#include "raft/raft_executor.h"
 #include "raft/raft_node.h"
 
 namespace raft {
@@ -27,7 +28,10 @@ namespace raft {
 //
 // Calling a blocking submission from the service thread itself returns
 // ErrorCode::Busy instead of deadlocking.
-class RaftRuntime {
+//
+// It is also the production RaftExecutor: the SQL adapter submits proposals and
+// read barriers through this class, never through RaftNode.
+class RaftRuntime : public RaftExecutor {
 public:
   explicit RaftRuntime(RaftNode &node, std::string name = "raft");
   ~RaftRuntime();
@@ -51,8 +55,11 @@ public:
   // Blocking submissions. The returned Proposal/ReadIndex still has to be
   // waited on by the caller (they complete when the entry commits/applies,
   // which happens on the service thread).
-  std::expected<Proposal, Error> propose(std::string data);
-  std::expected<ReadIndex, Error> read_barrier();
+  std::expected<Proposal, Error> propose(std::string data) override;
+  std::expected<ReadIndex, Error> read_barrier() override;
+  NodeId node_id() const override { return node_.node_id(); }
+  uint64_t election_timeout_ms() const override;
+  std::optional<NodeId> leader_hint() override;
 
   // Thread-safe, non-blocking. `false` = dropped because the service is
   // stopping or its queue is full.

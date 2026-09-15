@@ -29,7 +29,8 @@ class KVTestNode {
 public:
   KVTestNode(NodeId id, std::vector<NodeId> peers, ManualClock &clock,
              TestNetwork &network, uint64_t election_timeout = 100,
-             uint64_t heartbeat = 10) {
+             uint64_t heartbeat = 10,
+             std::map<uint64_t, std::string> client_endpoints = {}) {
     local_ = std::make_shared<kv::MockStore>();
     state_machine_ =
         std::make_unique<raft::KVStateMachine>(local_, request_results_);
@@ -37,7 +38,11 @@ public:
     node_ = std::make_unique<raft::RaftNode>(
         raft::NodeConfig{id, std::move(peers), election_timeout, heartbeat},
         log_, *transport_, *state_machine_, clock);
-    store_ = std::make_shared<raft::RaftKVStore>(local_, *node_);
+    // Tests drive the node themselves, so they use the direct executor; the
+    // production path goes through RaftRuntime (see server/raft_bootstrap).
+    executor_ = std::make_unique<raft::RaftNodeExecutor>(*node_);
+    store_ = std::make_shared<raft::RaftKVStore>(local_, *executor_,
+                                                 std::move(client_endpoints));
     CHECK_EQ(store_->open(kv::DatabaseOptions{}), kv::Status::OK);
   }
 
@@ -57,18 +62,21 @@ private:
   std::unique_ptr<raft::KVStateMachine> state_machine_;
   std::unique_ptr<TestTransport> transport_;
   std::unique_ptr<raft::RaftNode> node_;
+  std::unique_ptr<raft::RaftNodeExecutor> executor_;
   std::shared_ptr<raft::RaftKVStore> store_;
 };
 
 class KVTestCluster {
 public:
   explicit KVTestCluster(std::vector<NodeId> ids, uint64_t election_timeout = 100,
-                         uint64_t heartbeat = 10)
+                         uint64_t heartbeat = 10,
+                         std::map<uint64_t, std::string> client_endpoints = {})
       : ids_(std::move(ids)), election_timeout_(election_timeout),
-        heartbeat_(heartbeat) {
+        heartbeat_(heartbeat), client_endpoints_(std::move(client_endpoints)) {
     for (const NodeId id : ids_) {
       auto node = std::make_unique<KVTestNode>(id, ids_, clock_, network_,
-                                              election_timeout_, heartbeat_);
+                                              election_timeout_, heartbeat_,
+                                              client_endpoints_);
       network_.bind(id, node->node());
       nodes_[id] = std::move(node);
     }
@@ -101,6 +109,13 @@ public:
 
   void block(NodeId id) { network_.block(id); }
 
+  void tick_one(NodeId id, uint64_t ms = 10) {
+    clock_.advance(ms);
+    nodes_.at(id)->node()->tick();
+  }
+
+  void deliver_messages() { network_.deliver_all(); }
+
   raft::RaftNode *leader() {
     raft::RaftNode *found = nullptr;
     for (auto &[id, node] : nodes_) {
@@ -127,6 +142,7 @@ private:
   std::vector<NodeId> ids_;
   uint64_t election_timeout_;
   uint64_t heartbeat_;
+  std::map<uint64_t, std::string> client_endpoints_;
   ManualClock clock_;
   TestNetwork network_;
   std::map<NodeId, std::unique_ptr<KVTestNode>> nodes_;
@@ -236,8 +252,56 @@ TEST(RaftKVAdapter, FollowerEngineReturnsNotLeader) {
   CHECK_TRUE(follower != nullptr);
 
   CHECK_EQ(follower->put("k", "v"), kv::Status::NotLeader);
+  CHECK_EQ(follower->last_error(), kv::Status::NotLeader);
   kv::ByteValue value;
   CHECK_EQ(follower->get("k", &value), kv::Status::NotLeader);
+  CHECK_EQ(follower->last_error(), kv::Status::NotLeader);
+}
+
+TEST(RaftKVAdapter, LeaderHintPointsAtTheLeaderClientEndpoint) {
+  std::map<uint64_t, std::string> endpoints{{1, "10.0.0.1:5433"},
+                                            {2, "10.0.0.2:5433"},
+                                            {3, "10.0.0.3:5433"}};
+  KVTestCluster cluster({NodeId{1}, NodeId{2}, NodeId{3}}, 100, 10, endpoints);
+  cluster.start();
+  cluster.elect_leader();
+
+  raft::RaftNode *leader = cluster.leader();
+  CHECK_NOT_NULL(leader);
+  const NodeId leader_id = leader->node_id();
+
+  // The leader itself never redirects.
+  CHECK_FALSE(cluster.node(leader_id).store()->leader_hint().has_value());
+
+  // Followers point at the leader, with the client-facing SQL endpoint.
+  for (const NodeId id : std::vector<NodeId>{NodeId{1}, NodeId{2}, NodeId{3}}) {
+    if (id == leader_id) {
+      continue;
+    }
+    const auto hint = cluster.node(id).store()->leader_hint();
+    CHECK_TRUE(hint.has_value());
+    if (hint.has_value()) {
+      CHECK_EQ(hint->node_id, leader_id.value);
+      CHECK_EQ(hint->endpoint, endpoints[leader_id.value]);
+    }
+  }
+}
+
+TEST(RaftKVAdapter, LeaderWithUnknownClientAddressOmitsTheEndpoint) {
+  // Endpoint table without an entry for node 2, which we make the leader.
+  std::map<uint64_t, std::string> endpoints{{1, "10.0.0.1:5433"}};
+  KVTestCluster cluster({NodeId{1}, NodeId{2}}, 100, 10, endpoints);
+  cluster.start();
+  cluster.tick_one(NodeId{2}, 200); // only node 2 campaigns
+  cluster.deliver_messages();
+  CHECK_TRUE(cluster.node(NodeId{2}).node()->is_leader());
+
+  const auto hint = cluster.node(NodeId{1}).store()->leader_hint();
+  CHECK_TRUE(hint.has_value());
+  if (hint.has_value()) {
+    CHECK_EQ(hint->node_id, uint64_t{2});
+    CHECK_TRUE(hint->endpoint.empty());
+  }
 }
 
 TEST(RaftKVAdapter, MultiNodeReplicationAppliesToEveryLocalStore) {

@@ -81,6 +81,26 @@ bool get_bytes(const std::string &in, size_t *pos, std::string *out) {
   return true;
 }
 
+// ERROR 帧尾部的可选 leader hint。老服务端在这里没有任何字节 → 返回 true 且
+// 不设置 hint（向后兼容）；新服务端写 1 个字节的 has_hint 决定。
+bool get_leader_hint(const std::string &in, size_t *pos, ErrorFrame *error) {
+  error->leader_hint.reset();
+  if (*pos >= in.size()) {
+    return true; // 老格式：到尾了
+  }
+  const uint8_t has_hint = static_cast<uint8_t>(in[(*pos)++]);
+  if (has_hint == 0) {
+    return true;
+  }
+  LeaderHint hint;
+  if (!get_u64(in, pos, &hint.node_id) ||
+      !get_bytes(in, pos, &hint.endpoint)) {
+    return false;
+  }
+  error->leader_hint = std::move(hint);
+  return true;
+}
+
 } // namespace
 
 std::string encode_frame(FrameType type, const std::string &payload) {
@@ -144,6 +164,13 @@ std::string encode_error(const ErrorFrame &error) {
   put_u32(&payload, error.begin_column);
   put_u32(&payload, error.end_line);
   put_u32(&payload, error.end_column);
+  // 尾部可选字段：老客户端解完固定字段就停（多余字节不影响），新客户端按
+  // has_hint 决定要不要继续读。服务端只在能力位被通告时才产生它。
+  if (error.leader_hint.has_value()) {
+    payload.push_back(static_cast<char>(1));
+    put_u64(&payload, error.leader_hint->node_id);
+    put_bytes(&payload, error.leader_hint->endpoint);
+  }
   return encode_frame(FrameType::kError, payload);
 }
 
@@ -386,7 +413,8 @@ bool decode_error(const std::string &payload, ErrorFrame *error) {
          get_u32(payload, &pos, &error->begin_line) &&
          get_u32(payload, &pos, &error->begin_column) &&
          get_u32(payload, &pos, &error->end_line) &&
-         get_u32(payload, &pos, &error->end_column);
+         get_u32(payload, &pos, &error->end_column) &&
+         get_leader_hint(payload, &pos, error);
 }
 
 } // namespace common::proto

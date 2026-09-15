@@ -1,9 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string>
 
-#include "raft/raft_node.h"
+#include "raft/raft_executor.h"
 #include "storage/kv_engine/kv_engine.h"
 #include "storage/kv_engine/tx_buffer.h"
 
@@ -16,7 +19,11 @@ class RaftKVEngine;
 class RaftKVStore final : public kv::KVStore,
                           public std::enable_shared_from_this<RaftKVStore> {
 public:
-  RaftKVStore(std::shared_ptr<kv::KVStore> local, RaftNode &node);
+  // `client_endpoints` maps node id -> client-facing "host:port": when this
+  // node is not the group leader, leader_hint() reports where the client
+  // should reconnect. Empty map = no redirect information.
+  RaftKVStore(std::shared_ptr<kv::KVStore> local, RaftExecutor &executor,
+              std::map<uint64_t, std::string> client_endpoints = {});
   ~RaftKVStore() override;
 
   RaftKVStore(const RaftKVStore &) = delete;
@@ -31,6 +38,7 @@ public:
   void flush() override;
   std::string stats() const override;
   bool write_slot_held() const override;
+  std::optional<kv::LeaderHint> leader_hint() override;
 
   // Raw KVStore operations intentionally do not bypass Raft. Clients use
   // connect(); the replicated state machine uses its separate local store.
@@ -45,7 +53,8 @@ private:
   void release_write_slot(const void *owner);
 
   std::shared_ptr<kv::KVStore> local_;
-  RaftNode &node_;
+  RaftExecutor *executor_ = nullptr;
+  std::map<uint64_t, std::string> client_endpoints_;
   std::atomic<bool> write_slot_held_{false};
   const void *write_slot_owner_ = nullptr;
 };
@@ -56,11 +65,12 @@ class RaftKVEngine final : public kv::KVEngine {
 public:
   RaftKVEngine(std::shared_ptr<RaftKVStore> store,
                std::shared_ptr<kv::KVEngine> local_engine,
-               uint64_t client_id);
+               uint64_t client_id, RaftExecutor &executor);
   ~RaftKVEngine() override;
 
   std::shared_ptr<kv::KVStore> store() const override;
   bool is_open() const override;
+  kv::Status last_error() const override { return last_error_; }
 
   kv::Status get(const kv::Key &key, kv::ByteValue *value) override;
   kv::Status put(const kv::Key &key, const kv::ByteValue &value) override;
@@ -98,7 +108,8 @@ private:
 
   std::shared_ptr<RaftKVStore> store_;
   std::shared_ptr<kv::KVEngine> local_engine_;
-  RaftNode &node_;
+  RaftExecutor &executor_;
+  kv::Status last_error_ = kv::Status::OK;
   uint64_t client_id_;
   uint64_t next_request_id_ = 1;
   std::unique_ptr<kv::TxBuffer> tx_;

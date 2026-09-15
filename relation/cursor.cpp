@@ -33,8 +33,10 @@ CursorError to_cursor_error(const RelError &error) {
 }
 
 TableCursor::TableCursor(const Table *table, KeyRange range,
-                         std::unique_ptr<kv::Iterator> it)
-    : table_(table), range_(std::move(range)), it_(std::move(it)) {}
+                         std::unique_ptr<kv::Iterator> it,
+                         kv::Status open_status)
+    : table_(table), range_(std::move(range)), it_(std::move(it)),
+      open_status_(open_status) {}
 
 TableCursor::~TableCursor() = default;
 
@@ -43,8 +45,23 @@ std::expected<Row, CursorError> TableCursor::next() {
   if (error_.is_error()) {
     return std::unexpected(error_);
   }
-  if (table_ == nullptr || it_ == nullptr) {
+  if (closed_) {
+    error_ = end_of_stream(); // 关闭之后的读取 = 流结束，不是存储错误
+    return std::unexpected(error_);
+  }
+  if (table_ == nullptr) {
     error_ = end_of_stream(); // 空扫描（比如空 KeyRange）也算正常结束
+    return std::unexpected(error_);
+  }
+  if (it_ == nullptr) {
+    // 存储没给出迭代器：这是错误，不是"表是空的"。原因由创建者的
+    // open_status_ 带进来（follower 上是 NotLeader）。
+    error_ = CursorError(
+        CursorErrorCode::IO_ERROR,
+        std::string{"kv scan failed: "} +
+            (open_status_ == kv::Status::OK
+                 ? std::string{"no iterator"}
+                 : std::string{kv::status_to_string(open_status_)}));
     return std::unexpected(error_);
   }
   if (!it_->valid()) {
@@ -69,6 +86,7 @@ std::expected<Row, CursorError> TableCursor::next() {
 
 void TableCursor::close() {
   it_.reset();
+  closed_ = true;
   if (!error_.is_error()) {
     error_ = end_of_stream();
   }
@@ -76,6 +94,7 @@ void TableCursor::close() {
 
 void TableCursor::reset() {
   error_ = CursorError();
+  closed_ = false;
   if (it_ != nullptr) {
     it_->seek_to_first(); // 迭代器自己知道方向（正向/反向）
   }

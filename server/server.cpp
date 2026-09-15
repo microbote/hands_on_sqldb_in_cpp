@@ -19,7 +19,8 @@ namespace {
 
 constexpr uint16_t kServerVersion = 1;
 
-ErrorFrame to_error_frame(const session::SessionError &error) {
+ErrorFrame to_error_frame(const session::SessionError &error,
+                          const std::optional<kv::LeaderHint> &leader_hint) {
   ErrorFrame frame;
   frame.code = static_cast<uint8_t>(error.code);
   frame.message = error.to_string();
@@ -28,7 +29,44 @@ ErrorFrame to_error_frame(const session::SessionError &error) {
   frame.begin_column = error.span.begin_column;
   frame.end_line = error.span.end_line;
   frame.end_column = error.span.end_column;
+  if (leader_hint.has_value()) {
+    common::proto::LeaderHint hint;
+    hint.node_id = leader_hint->node_id;
+    hint.endpoint = leader_hint->endpoint;
+    frame.leader_hint = std::move(hint);
+  }
   return frame;
+}
+
+// 语句执行入口：先问存储"这台是不是该干这事"。
+//
+// P1 只有一个 group，所以"本节点不是这个 group 的 leader"= 整条语句该换个
+// 节点执行：直接回 NotLeader（带 leader 的客户端地址），不碰本地状态机。
+// 多 group 的完整路由属于 P2，届时这里换成按 key 判定。
+//
+// 注意：leader_hint() 对 RaftKVStore 是一次阻塞提交（到 raft 服务线程），
+// 所以这个函数必须跑在服务线程/读池线程上，不能在 event loop 里直接调。
+std::expected<std::unique_ptr<exec::ResultCursor>, session::SessionError>
+execute_on_this_node(session::Session &session,
+                     const session::ParsedStatement &parsed,
+                     kv::KVStore &store,
+                     std::optional<kv::LeaderHint> *leader_hint) {
+  if (auto hint = store.leader_hint(); hint.has_value()) {
+    *leader_hint = hint;
+    return std::unexpected(session::SessionError(
+        session::SessionErrorCode::NOT_LEADER,
+        hint->endpoint.empty()
+            ? "not the leader for this group"
+            : "not the leader for this group; leader is at " + hint->endpoint,
+        parsed.sql));
+  }
+  auto result = session.execute_parsed(parsed);
+  if (!result.has_value() &&
+      result.error().code == session::SessionErrorCode::NOT_LEADER) {
+    // 引擎自己报的 NotLeader（比如刚被降级）：把 hint 一起带给客户端。
+    *leader_hint = store.leader_hint();
+  }
+  return result;
 }
 
 // 没传 logger 就按配置建一个。建不出来（log_file 路径不可写）时退回
@@ -172,7 +210,9 @@ common::svrkit::Task Server::serve_connection(
   // 1) HELLO（协议版本 + 能力位）
   {
     bool ok = false;
-    co_await connection->write_all(encode_hello(kServerVersion, 0), ok);
+    // 能力位：通告"ERROR 帧可能带 leader hint"，客户端据此决定要不要读尾部。
+    co_await connection->write_all(
+        encode_hello(kServerVersion, kCapabilityLeaderHint), ok);
     alive = ok;
   }
 
@@ -340,6 +380,8 @@ common::svrkit::Task Server::serve_connection(
 
     std::expected<std::unique_ptr<exec::ResultCursor>, session::SessionError>
         result = std::unexpected(session::SessionError());
+    // 本节点不是 leader 时由执行任务填写：出错回帧时一起带给客户端。
+    std::optional<kv::LeaderHint> leader_hint;
     if (parsed.has_value()) {
       // 路由：事务里的语句 + 非只读语句 → 写服务线程；只读且不在事务 → 读池
       const bool route_to_write =
@@ -347,8 +389,8 @@ common::svrkit::Task Server::serve_connection(
       if (route_to_write) {
         common::svrkit::SubmitToService submit;
         submit.service = &write_service_;
-        submit.work = [&session, &parsed, &result] {
-          result = session.execute_parsed(*parsed);
+        submit.work = [&session, &parsed, &result, &leader_hint, this] {
+          result = execute_on_this_node(session, *parsed, *store_, &leader_hint);
         };
         co_await submit;
         if (!submit.submitted) {
@@ -367,8 +409,8 @@ common::svrkit::Task Server::serve_connection(
                         read_pool_.size()];
         common::svrkit::SubmitToService submit;
         submit.service = &worker;
-        submit.work = [&session, &parsed, &result] {
-          result = session.execute_parsed(*parsed);
+        submit.work = [&session, &parsed, &result, &leader_hint, this] {
+          result = execute_on_this_node(session, *parsed, *store_, &leader_hint);
         };
         co_await submit;
         if (!submit.submitted) {
@@ -381,7 +423,7 @@ common::svrkit::Task Server::serve_connection(
           continue;
         }
       } else {
-        result = session.execute_parsed(*parsed);
+        result = execute_on_this_node(session, *parsed, *store_, &leader_hint);
       }
     }
 
@@ -392,10 +434,10 @@ common::svrkit::Task Server::serve_connection(
     uint64_t rows_sent = 0;
     if (!parsed.has_value()) {
       error_response = true;
-      out = encode_error(to_error_frame(parse_error));
+      out = encode_error(to_error_frame(parse_error, std::nullopt));
     } else if (!result.has_value()) {
       error_response = true;
-      out = encode_error(to_error_frame(result.error()));
+      out = encode_error(to_error_frame(result.error(), leader_hint));
     } else {
       exec::ResultCursor &cursor = **result;
       if (cursor.root()->produces_rows()) {
@@ -407,8 +449,8 @@ common::svrkit::Task Server::serve_connection(
           if (!row.has_value()) {
             if (row.error().is_error()) {
               error_response = true;
-              out = encode_error(
-                  ErrorFrame{0, row.error().to_string(), "", 0, 0, 0, 0});
+              out = encode_error(ErrorFrame{
+                  0, row.error().to_string(), "", 0, 0, 0, 0, std::nullopt});
               break;
             }
             break;
@@ -441,8 +483,8 @@ common::svrkit::Task Server::serve_connection(
         }
       } else if (cursor.error().is_error()) {
         error_response = true;
-        out = encode_error(
-            ErrorFrame{0, cursor.error().to_string(), "", 0, 0, 0, 0});
+          out = encode_error(ErrorFrame{
+              0, cursor.error().to_string(), "", 0, 0, 0, 0, std::nullopt});
       } else {
         out = encode_ok(static_cast<uint64_t>(cursor.affected_rows()),
                         session.in_transaction(), cursor.root()->is_write(),

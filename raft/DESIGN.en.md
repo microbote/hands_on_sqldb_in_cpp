@@ -7,8 +7,10 @@
 state-machine bridge / `RaftKVStore` + `RaftKVEngine` / ReadIndex barriers /
 per-group write slot / `RaftRuntime` single thread / RPC codec / TCP transport /
 `[raft]` config and the `sqldb-server` wiring). Remaining work is listed in §11
-(snapshot transfer, compaction, leader hints, read-index batching, membership
-changes, P2 multi-group). This is an implementation plan, not a user guide;
+(snapshot transfer, compaction, read-index batching, cross-group read modes,
+membership changes, P2 multi-group). The **NotLeader + leader-hint redirect**
+(`[raft] sql_endpoints` → ERROR-frame hint → one client reconnect+retry) is in.
+This is an implementation plan, not a user guide;
 responsibilities / interfaces / pitfalls live in `raft/README.md`.
 
 ## 0. Goal and scope
@@ -527,6 +529,8 @@ peers   = 1@127.0.0.1:5434,2@127.0.0.1:5435,3@127.0.0.1:5436
 election_timeout_ms = 1000
 heartbeat_ms        = 100
 log_path            = ./sql_db_raft_log     # separate LevelDB for the raft log
+# client-reachable SQL addresses (id@host:port), used to redirect NotLeader
+sql_endpoints       = 1@127.0.0.1:5433,2@127.0.0.1:5434,3@127.0.0.1:5435
 ```
 
 **Landed** (`server/config.{h,cpp}`): all of these keys live in the built-in
@@ -544,6 +548,9 @@ raft_heartbeat_ms()/raft_log_path()`.
 - with `enabled = true` it additionally requires a non-empty `peers`, `node_id`
   present in `peers`, `listen` shaped like `host:port`, and a non-empty
   `log_path`.
+- `sql_endpoints` is optional (same `id@host:port` syntax); every id must exist
+  in `peers` or validation fails (a typo would silently disable redirects).
+  Empty = answer `NotLeader` without a reconnect target.
 
 Static shards (`shard.N = <start>,<end>`) are not implemented yet: P1 has a
 single group, and P2 introduces the static range table with `@system/*` pinned
@@ -571,7 +578,7 @@ internal traffic.
 |-------|---------|--------------|--------|
 | **P0** | raft core: election / log replication / commit / apply / snapshot; **in-proc transport + injectable fake clock** | unit tests: happy path, partitions, dropped messages, reordering, restart, single-node → three-node. **Fully green inside the sandbox** (no sockets) | landed |
 | **P1a** | single-group adapter: `RaftKVStore` / `RaftKVEngine`, **ReadIndex barrier**, per-group write slot, proposal idempotency id, timeout and error mapping | the `RaftKVAdapter` suite in `test_raft` (single-node read/write, transactions, rollback, write slot; three-node replication; follower `NotLeader`; partitioned-leader timeout) | landed |
-| **P1b** | `RaftRuntime` threading model (`ServiceThread` driving tick/messages/apply), RPC codec, `[raft]` config, production transport (svrkit on its own port), server entry wiring, leader hint back to the client | end-to-end: SQL on raft; kill the leader and watch a new one take over | landed (single-node restart persistence and a three-node real-socket election/replication test; leader hints are still open) |
+| **P1b** | `RaftRuntime` threading model (`ServiceThread` driving tick/messages/apply), RPC codec, `[raft]` config, production transport (svrkit on its own port), server entry wiring, leader hint back to the client | end-to-end: SQL on raft; kill the leader and watch a new one take over | landed (single-node restart persistence, a three-node real-socket election/replication test, and NotLeader + redirect tests) |
 | **P2** | many groups: shard per table; `@system/*` in group 0; independent leader per group; **reject cross-group write transactions + `strict`/`loose` modes + the `CLIENT_OPTIONS` frame** (§3.3/§3.4) | two tables write concurrently without blocking each other; a cross-group write transaction fails clearly; under `--cross-group-read=loose` `BEGIN; SELECT a; SELECT b; COMMIT` runs, under `strict` (default) it errors | not started |
 | **P3** | `_meta` group owns placement, **table-level split/merge**, membership changes, follower read / lease | needs its own design (not in this document) | not started |
 
@@ -687,7 +694,17 @@ not be wired into the server before that runtime exists.
   write fails) and no load testing of the connection count (N×(N-1) today).
   Whether to multiplex is a question for real measurements.
 - **`NotLeader` leader hints and retries**: clients currently only see the
-  `NotLeader` text error, with no hint and no server-side forwarding.
+  server now checks the hint once per statement (a cheap blocking submit to the
+  raft service thread), answers `NOT_LEADER` + endpoint on a follower, and the
+  client reconnects and retries once. Not implemented: **server-side
+  forwarding** (the server running the statement on the leader itself), which
+  would need an internal client — deferred until there is a clear payoff.
+- **NotLeader on the schema read path**: the `Catalog` read API returns
+  `bool`/`optional` (it cannot distinguish "no such table" from "read failed").
+  With a known leader the server pre-check catches followers first, so this only
+  bites a follower that has not learned the leader yet (fresh start / partition)
+  — it may report "table not found" or treat the table as empty. Fixing it
+  properly means giving the catalog reads a status/tri-state.
 - **Configurable proposal deadline**: it borrows `election_timeout_ms` today;
   eventually there should be a dedicated `raft.proposal_timeout_ms`, with read
   and write timeouts distinguished.

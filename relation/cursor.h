@@ -12,6 +12,8 @@
 
 #include <memory>
 
+#include "storage/kv_engine/kv_engine.h" // kv::Status（构造时的打开结果）
+
 #include "relation_defs.h"
 #include "sql_types/cursor.h"
 #include "sql_types/key_range.h"
@@ -28,7 +30,8 @@ class Table;
 class TableCursor : public Cursor {
 public:
   TableCursor(const Table *table, KeyRange range,
-              std::unique_ptr<kv::Iterator> it);
+              std::unique_ptr<kv::Iterator> it,
+              kv::Status open_status = kv::Status::OK);
   // 析构放在 .cpp：unique_ptr<kv::Iterator> 的删除需要完整类型
   ~TableCursor() override;
 
@@ -50,6 +53,10 @@ private:
   const Table *table_; // 借 Table 的解码能力；不持有所有权
   KeyRange range_;
   std::unique_ptr<kv::Iterator> it_;
+  // new_iterator() 返回 nullptr 时的原因（NotLeader / Timeout / ...）：
+  // nullptr 迭代器绝不能当成"空表"，否则 follower 上的 SELECT 会静默回空集。
+  kv::Status open_status_ = kv::Status::OK;
+  bool closed_ = false; // close() 之后 = 正常结束（不是"打不开存储"）
   CursorError error_; // 出错后粘住，供后续 next() 重复返回
 };
 

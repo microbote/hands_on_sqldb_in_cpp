@@ -245,6 +245,42 @@ log_path = ./sql_db_raft_log
 }
 
 TEST(Config, RaftRejectsBadTimingAndMalformedPeers) {
+  // 客户端重定向表：id 必须是已知 peer，拼错就拒绝（否则重定向会静默失效）。
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+enabled = true
+node_id = 1
+listen = 127.0.0.1:5434
+peers = 1@127.0.0.1:5434,2@127.0.0.1:5435
+sql_endpoints = 9@127.0.0.1:5433
+log_path = ./raft_log
+)"));
+
+  // 形状不对的 sql_endpoints：即使 raft 关着也拦。
+  CHECK_FALSE(parses_and_validates(R"(
+[raft]
+sql_endpoints = 1-127.0.0.1:5433
+)"));
+
+  // 合法：能解析成 node id -> host:port。
+  auto endpoints_config = server::parse_config(R"(
+[raft]
+enabled = true
+node_id = 2
+listen = 127.0.0.1:5435
+peers = 1@127.0.0.1:5434, 2@127.0.0.1:5435
+sql_endpoints = 1@10.0.0.1:5433, 2@10.0.0.2:5433
+log_path = ./raft_log
+)");
+  CHECK(endpoints_config.has_value());
+  if (endpoints_config.has_value()) {
+    CHECK_TRUE(endpoints_config->validate().has_value());
+    const auto endpoints = endpoints_config->raft_sql_endpoints();
+    CHECK_EQ(endpoints.size(), size_t{2});
+    CHECK_EQ(endpoints.at(1), std::string("10.0.0.1:5433"));
+    CHECK_EQ(endpoints.at(2), std::string("10.0.0.2:5433"));
+  }
+
   // heartbeat 必须小于 election timeout（开着关着都拦）。
   CHECK_FALSE(parses_and_validates(R"(
 [raft]

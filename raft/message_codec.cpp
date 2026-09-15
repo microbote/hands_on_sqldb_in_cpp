@@ -138,13 +138,30 @@ std::string encode_message(const Message &message) {
           for (const auto &entry : concrete.entries) {
             put_entry(out, entry.entry);
           }
-        } else {
+        } else if constexpr (std::is_same_v<T, AppendEntriesResponse>) {
           put_u8(out,
                  static_cast<uint8_t>(MessageType::kAppendEntriesResponse));
           put_u64(out, concrete.term);
           put_u8(out, concrete.success ? 1 : 0);
           put_u64(out, concrete.match_index);
           put_u64(out, concrete.round);
+          put_u64(out, concrete.hint_last_index);
+        } else if constexpr (std::is_same_v<T, InstallSnapshotRequest>) {
+          put_u8(out,
+                 static_cast<uint8_t>(MessageType::kInstallSnapshotRequest));
+          put_u64(out, concrete.term);
+          put_u64(out, concrete.leader_id.value);
+          put_u64(out, concrete.last_included_index);
+          put_u64(out, concrete.last_included_term);
+          put_bytes(out, concrete.data);
+        } else if constexpr (std::is_same_v<T, InstallSnapshotResponse>) {
+          put_u8(out,
+                 static_cast<uint8_t>(MessageType::kInstallSnapshotResponse));
+          put_u64(out, concrete.term);
+          put_u8(out, concrete.success ? 1 : 0);
+        } else {
+          static_assert(sizeof(T) == 0,
+                        "unhandled raft message type in encode_message");
         }
       },
       message);
@@ -244,12 +261,41 @@ std::expected<Message, Error> decode_message(std::string_view payload) {
     auto success = read_bool(payload, offset);
     auto match_index = read_u64(payload, offset);
     auto round = read_u64(payload, offset);
+    auto hint_last_index = read_u64(payload, offset);
     if (!term.has_value() || !success.has_value() ||
-        !match_index.has_value() || !round.has_value()) {
+        !match_index.has_value() || !round.has_value() ||
+        !hint_last_index.has_value()) {
       return std::unexpected(truncated("AppendEntriesResponse"));
     }
-    return finish(AppendEntriesResponse{*term, *success, *match_index,
-                                        *round});
+    return finish(AppendEntriesResponse{*term, *success, *match_index, *round,
+                                        *hint_last_index});
+  }
+  case MessageType::kInstallSnapshotRequest: {
+    InstallSnapshotRequest request;
+    auto term = read_u64(payload, offset);
+    auto leader = read_u64(payload, offset);
+    auto last_included_index = read_u64(payload, offset);
+    auto last_included_term = read_u64(payload, offset);
+    auto data = read_bytes(payload, offset);
+    if (!term.has_value() || !leader.has_value() ||
+        !last_included_index.has_value() || !last_included_term.has_value() ||
+        !data.has_value()) {
+      return std::unexpected(truncated("InstallSnapshotRequest"));
+    }
+    request.term = *term;
+    request.leader_id = NodeId{*leader};
+    request.last_included_index = *last_included_index;
+    request.last_included_term = *last_included_term;
+    request.data = std::move(*data);
+    return finish(std::move(request));
+  }
+  case MessageType::kInstallSnapshotResponse: {
+    auto term = read_u64(payload, offset);
+    auto success = read_bool(payload, offset);
+    if (!term.has_value() || !success.has_value()) {
+      return std::unexpected(truncated("InstallSnapshotResponse"));
+    }
+    return finish(InstallSnapshotResponse{*term, *success});
   }
   }
   return std::unexpected(

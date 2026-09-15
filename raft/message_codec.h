@@ -24,7 +24,7 @@ namespace raft {
 // AppendEntries entries are encoded as
 //   u64 count, then per entry: u64 index, u64 term, u64 data_len + bytes
 // so entry data (a serialized WriteBatch) is binary safe.
-inline constexpr uint8_t kMessageVersion = 1;
+inline constexpr uint8_t kMessageVersion = 2;
 inline constexpr uint32_t kMaxFrameBytes = 64u * 1024u * 1024u;
 
 enum class MessageType : uint8_t {
@@ -32,6 +32,8 @@ enum class MessageType : uint8_t {
   kRequestVoteResponse = 2,
   kAppendEntriesRequest = 3,
   kAppendEntriesResponse = 4,
+  kInstallSnapshotRequest = 5,
+  kInstallSnapshotResponse = 6,
 };
 
 // Encodes a message payload without the length prefix.

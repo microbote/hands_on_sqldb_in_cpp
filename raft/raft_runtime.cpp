@@ -134,6 +134,20 @@ std::expected<ReadIndex, Error> RaftRuntime::read_barrier() {
   return std::move(*result);
 }
 
+uint64_t RaftRuntime::election_timeout_ms() const {
+  // Configuration, not mutable Raft state: reading it off the node directly is
+  // safe from any thread.
+  return node_.election_timeout_ms();
+}
+
+std::optional<NodeId> RaftRuntime::leader_hint() {
+  std::optional<NodeId> hint;
+  if (!run([&] { hint = node_.leader_hint(); }).has_value()) {
+    return std::nullopt;
+  }
+  return hint;
+}
+
 bool RaftRuntime::post_message(NodeId from, const Message &message) {
   const bool queued = service_.submit(
       [this, from, message] { node_.handle_message(from, message); }, nullptr,

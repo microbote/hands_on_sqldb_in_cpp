@@ -41,10 +41,31 @@ struct AppendEntriesResponse {
   bool success = false;
   uint64_t match_index = kInvalidIndex;
   uint64_t round = 0;
+  // On failure, the follower's last log index. The leader uses it to detect a
+  // follower that is entirely behind the compacted snapshot prefix and should
+  // receive a snapshot instead of a full log replay.
+  uint64_t hint_last_index = kInvalidIndex;
+};
+
+struct InstallSnapshotRequest {
+  uint64_t term = 0;
+  NodeId leader_id;
+  uint64_t last_included_index = kInvalidIndex;
+  uint64_t last_included_term = 0;
+  // Serialized state machine snapshot covering [start, last_included_index].
+  // P1 sends the whole snapshot in one frame; chunking is a follow-up for
+  // very large snapshots.
+  std::string data;
+};
+
+struct InstallSnapshotResponse {
+  uint64_t term = 0;
+  bool success = false;
 };
 
 using Message = std::variant<RequestVoteRequest, RequestVoteResponse,
-                             AppendEntriesRequest, AppendEntriesResponse>;
+                             AppendEntriesRequest, AppendEntriesResponse,
+                             InstallSnapshotRequest, InstallSnapshotResponse>;
 
 // Transport is asynchronous from RaftNode's perspective. Implementations must
 // queue send() calls rather than synchronously re-entering RaftNode.

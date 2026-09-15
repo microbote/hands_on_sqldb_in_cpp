@@ -43,11 +43,15 @@ public:
   save_hard_state(const HardState &hard_state) override;
   std::expected<HardState, Error> load_hard_state() const override;
   std::expected<uint64_t, Error> last_index() const override;
+  std::expected<SnapshotMetadata, Error> snapshot_metadata() const override;
+  std::expected<void, Error>
+  install_snapshot(const SnapshotMetadata &meta) override;
 
 private:
   mutable std::mutex mutex_;
   std::unique_ptr<leveldb::DB> db_;
   uint64_t last_index_ = kInvalidIndex;
+  SnapshotMetadata snapshot_meta_{};
 };
 
 } // namespace raft

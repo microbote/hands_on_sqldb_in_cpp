@@ -236,6 +236,16 @@ struct ScanResult {
   size_t size() const { return pairs.size(); }
 };
 
+// 存储层告诉调用方"这条语句该去别处执行"。
+//
+// 只对多副本存储（Raft）有意义：本节点不是 leader 时给出 leader 的
+// node id 和**客户端可连接的地址**（SQL 监听地址，不是内部复制端口）。
+// endpoint 为空表示"知道该去哪儿但不知道地址"，调用方只能报错。
+struct LeaderHint {
+  uint64_t node_id = 0;
+  std::string endpoint;
+};
+
 // ============================================================
 // 迭代器
 // ============================================================
@@ -343,6 +353,9 @@ public:
   // 这条连接挂在哪个存储上（开新连接用 store()->connect()）
   virtual std::shared_ptr<KVStore> store() const = 0;
   virtual bool is_open() const = 0;
+  // 最近一次失败的非 OK Status：new_iterator() 只能返回 nullptr，用它解释
+  // 原因（NotLeader / Timeout / IOError）。默认 OK，老实现不用管。
+  virtual Status last_error() const { return Status::OK; }
 
   // ----- 单条操作 -----
   virtual Status get(const Key &key, ByteValue *value) = 0;
@@ -484,6 +497,11 @@ public:
 
   // 写槽是否被某条连接持有（测试/诊断用）
   virtual bool write_slot_held() const = 0;
+
+  // 多副本存储（Raft）用：本节点不是 leader 时给出"该去哪个节点"。
+  // 默认 nullopt = 单机存储没有这个概念；endpoint 为空表示只知道 node id。
+  // server 据此回 NotLeader + 重定向信息，客户端可换节点重试。
+  virtual std::optional<LeaderHint> leader_hint() { return std::nullopt; }
 };
 
 } // namespace kv

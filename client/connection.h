@@ -10,6 +10,8 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,6 +44,10 @@ struct Outcome {
   std::string error_message; // 已经带位置（"table not found ... (line 1:15)"）
   std::string error_sql;     // 原文（高亮用）
   SSpan error_span = sspan_unknown();
+  // 服务端说"这条语句该去别的节点"（NotLeader + leader hint）：
+  // endpoint 非空才能自动重连；只知道 node id 时只能报错。
+  uint64_t redirect_node_id = 0;
+  std::string redirect_endpoint;
 };
 
 // 元命令用的元信息（\l / \dt / \d）
@@ -91,6 +97,17 @@ public:
 
   // 切库：本地与远程都是同一条 SQL（USE 是会话状态）
   bool use_database(const std::string &db) { return execute("USE " + db).ok; }
+
+  // 换到另一个节点执行（服务端回了 NotLeader + leader 地址时）。
+  // 成功 = 之后可以在新连接上重发这条语句；默认实现不支持（本地连接、
+  // 或服务端没给地址）。
+  virtual bool redirect(const std::string &endpoint, std::string *error) {
+    (void)endpoint;
+    if (error != nullptr) {
+      *error = "this connection cannot be redirected";
+    }
+    return false;
+  }
 };
 
 // 本地：进程内直接跑（就是现在的 `sqldb`）
@@ -100,6 +117,11 @@ std::unique_ptr<SqlConnection> make_local(std::shared_ptr<kv::KVEngine> engine);
 struct RemoteOptions {
   std::string host = "127.0.0.1";
   std::string port = "5433";
+  // 重定向时怎么拿到新连接：默认真 TCP connect。测试用它注入 socketpair，
+  // 这样"换节点重试"能在禁 bind 的环境里验证。
+  std::function<std::expected<int, std::string>(const std::string &host,
+                                               const std::string &port)>
+      dialer;
 };
 std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
                                            std::string *error);

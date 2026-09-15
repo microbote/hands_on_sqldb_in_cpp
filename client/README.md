@@ -373,6 +373,11 @@ SELECT * FROM [红]userz[/红];
   `ResultCursor::columns()` 提供）；
 - 写语句：`OK, N rows affected`；DDL/USE：`OK`；
 - 错误：红色信息 + `stmt::highlight_span` 出来的高亮片段。
+- **换节点重试**：连到 raft 集群时，服务端可能回
+  `Not the leader` + leader 的客户端地址。REPL 会**自动重连过去并把这条语句
+  重试一次**（stderr 打一行 `[redirect] ...`）。两条限制：① 只在**不在事务里**
+  时重试 —— 事务状态挂在旧连接上；② 只重试一次，新节点也说自己不是 leader
+  就直接把错误报出来。
 
 ## 一个客户端层的小活：脚本行号
 

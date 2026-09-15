@@ -14,6 +14,7 @@ add_executable(test_server
     test_client.cpp
     test_lifecycle.cpp
     test_raft_cluster.cpp
+    test_raft_redirect.cpp
     test_remote_client_fake_server.cpp
 )
 
