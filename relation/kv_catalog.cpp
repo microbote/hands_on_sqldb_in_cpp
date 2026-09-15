@@ -126,7 +126,14 @@ std::string KVCatalog::read_meta(const std::string &key) const {
     return {};
   }
   std::string value;
-  if (engine_->get(key, &value) != kv::Status::OK) {
+  const kv::Status status = engine_->get(key, &value);
+  last_read_status_ = status;
+  if (status == kv::Status::NotFound) {
+    // 键不存在是正常结果，不是读失败（follower 上会返回 NotLeader 等）。
+    last_read_status_ = kv::Status::OK;
+    return {};
+  }
+  if (status != kv::Status::OK) {
     return {};
   }
   return value;
@@ -405,6 +412,14 @@ KVCatalog::open_table(const Identifier &db_name,
   }
   auto schema = get_table_schema(db_name, table_name);
   if (!schema.has_value()) {
+    if (last_read_status_ != kv::Status::OK) {
+      // 存储读失败（还没学到 leader 的 follower 的 NotLeader / 分区 Timeout），
+      // 不是"表不存在"：明确报存储错误，别误导成 table not found。
+      return std::unexpected(RelError(
+          RelErrorCode::KV_ERROR,
+          std::string("read table schema failed: ") +
+              kv::status_to_string(last_read_status_)));
+    }
     return std::unexpected(
         RelError(RelErrorCode::TABLE_NOT_FOUND,
                  "table not found: " + db_name.str() + "." + table_name.str()));

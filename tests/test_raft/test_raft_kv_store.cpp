@@ -15,6 +15,8 @@
 #include "raft/raft_kv_store.h"
 #include "raft/request_result_store.h"
 #include "raft_test_net.h"
+#include "relation/kv_catalog.h"
+#include "sql_types/identifier.h"
 #include "storage/mock_engine/mock_engine.h"
 #include "test_framework.h"
 
@@ -451,6 +453,35 @@ TEST(RaftKVAdapter, RawStoreWritePathIsNotSupported) {
   batch.put("k", "v");
   CHECK_EQ(cluster.node(NodeId{1}).store()->write_batch(batch),
            kv::Status::NotSupported);
+}
+
+TEST(RaftKVAdapter, CatalogDistinguishesReadFailureFromMissingTable) {
+  KVTestCluster cluster({NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  cluster.elect_leader();
+
+  auto follower_engine = cluster.node(cluster.follower_id()).connect();
+  CHECK_TRUE(follower_engine != nullptr);
+  if (follower_engine == nullptr) {
+    return;
+  }
+  sql::KVCatalog catalog(follower_engine);
+
+  // follower 上 schema 读失败（NotLeader），不是"表不存在"：Catalog 只暴露
+  // optional，调用方必须查 last_read_status() 才知道是读失败。
+  const auto schema = catalog.get_table_schema(sql::Identifier("shop"),
+                                               sql::Identifier("t"));
+  CHECK_FALSE(schema.has_value());
+  CHECK_EQ(catalog.last_read_status(), kv::Status::NotLeader);
+
+  // open_table 据此报 KV_ERROR（存储读失败）而不是 TABLE_NOT_FOUND。
+  auto table = catalog.open_table(sql::Identifier("shop"),
+                                  sql::Identifier("t"));
+  CHECK_FALSE(table.has_value());
+  if (!table.has_value()) {
+    CHECK_EQ(table.error().code, sql::RelErrorCode::KV_ERROR);
+    CHECK(table.error().to_string().find("NotLeader") != std::string::npos);
+  }
 }
 
 } // namespace

@@ -217,6 +217,11 @@ public:
   //   - 在事务里时，语句的自动提交让位给事务本身（由 COMMIT/ROLLBACK 收尾）。
   bool in_transaction() const { return in_transaction_; }
 
+  // 连接级：跨组只读模式（multi-raft）。默认 strict；loose 允许事务内跨组
+  // 读（事务冻结为只读）。转发给底层引擎（非 raft 引擎忽略）。
+  void set_loose_cross_group_reads(bool loose);
+  bool loose_cross_group_reads() const { return cross_group_read_loose_; }
+
   // ---- 元信息查询（元命令用；db 为空表示当前数据库）----
   std::vector<DatabaseInfo> databases() const;
   std::vector<TableInfo> tables(const sql::Identifier &db = {}) const;
@@ -270,6 +275,7 @@ private:
   execute_catalog_statement(const sql::Query &query, const std::string &sql);
 
   std::shared_ptr<kv::KVEngine> engine_;
+  bool cross_group_read_loose_ = false;
   sql::KVCatalog catalog_;
   bool in_transaction_ = false; // 显式事务是否打开
   bool tx_failed_ = false;      // 事务里出过错：只能 ROLLBACK（Postgres 风格）

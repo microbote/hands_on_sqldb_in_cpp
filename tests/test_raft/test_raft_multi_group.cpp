@@ -215,6 +215,12 @@ TEST(MultiGroup, CrossGroupWriteTransactionRejected) {
   CHECK_EQ(engine->begin_transaction(), kv::Status::OK);
   CHECK_EQ(engine->put("a", "1"), kv::Status::OK);
   CHECK_EQ(engine->put("m", "2"), kv::Status::CrossGroupTransaction);
+  const auto info = engine->last_cross_group_info();
+  CHECK_TRUE(info.has_value());
+  if (info.has_value()) {
+    CHECK_EQ(info->from_group, uint64_t{1});
+    CHECK_EQ(info->to_group, uint64_t{2});
+  }
   CHECK_EQ(engine->rollback_transaction(), kv::Status::OK);
 
   kv::ByteValue value;
@@ -230,6 +236,12 @@ TEST(MultiGroup, CrossGroupReadStrictRejectedLooseAllowed) {
   kv::ByteValue value;
   CHECK_EQ(strict_engine->get("a", &value), kv::Status::NotFound);
   CHECK_EQ(strict_engine->get("m", &value), kv::Status::CrossGroupTransaction);
+  const auto info = strict_engine->last_cross_group_info();
+  CHECK_TRUE(info.has_value());
+  if (info.has_value()) {
+    CHECK_EQ(info->from_group, uint64_t{1});
+    CHECK_EQ(info->to_group, uint64_t{2});
+  }
   CHECK_EQ(strict_engine->rollback_transaction(), kv::Status::OK);
 
   // loose: the read is allowed, but the transaction freezes as read-only.
@@ -262,6 +274,12 @@ TEST(MultiGroup, AutoCommitCrossesGroupsRejected) {
   cross.put("a", "1");
   cross.put("m", "2");
   CHECK_EQ(engine->write_batch(cross), kv::Status::CrossGroupTransaction);
+  const auto info = engine->last_cross_group_info();
+  CHECK_TRUE(info.has_value());
+  if (info.has_value()) {
+    CHECK_EQ(info->from_group, uint64_t{1});
+    CHECK_EQ(info->to_group, uint64_t{2});
+  }
 
   kv::WriteBatch within;
   within.put("a", "1");

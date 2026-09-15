@@ -40,6 +40,13 @@ enum class Status {
   CrossGroupTransaction,
 };
 
+// CrossGroupTransaction 的两个组：from = 事务已绑定的组，to = 违规触碰的组。
+// 自动提交的单条语句跨组时 from/to 是语句里前两个不同组的 id。
+struct CrossGroupInfo {
+  uint64_t from_group = 0;
+  uint64_t to_group = 0;
+};
+
 inline const char *status_to_string(Status s) {
   switch (s) {
   case Status::OK:
@@ -453,6 +460,14 @@ public:
 
   // 当前是否有活跃快照（一致读视图）。测试/诊断用。
   virtual bool has_snapshot() const { return false; }
+
+  // 多组（multi-raft）只读模式：loose 允许事务内跨组读（冻结为只读）。
+  // 非 raft 引擎忽略；raft 引擎默认 strict。
+  virtual void set_loose_cross_group_reads(bool /*loose*/) {}
+  // 最近一次 CrossGroupTransaction 涉及的两个组（仅 raft 多组引擎填）。
+  virtual std::optional<CrossGroupInfo> last_cross_group_info() const {
+    return std::nullopt;
+  }
 
   // ----- 管理 -----
   virtual void flush() = 0;

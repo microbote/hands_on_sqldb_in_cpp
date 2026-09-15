@@ -14,7 +14,11 @@ KV 状态机桥接 / `RaftKVStore` + `RaftKVEngine` / ReadIndex 读屏障 / 组�
 proposal/read 超时独立配置、`get_batch` 迭代器复用、apply 耗时监控。
 **Phase C 切片 1 已落地**：`GroupRouter` 静态路由（`@system/*` → 0 号组）、
 适配层多 group 路由、per-group 写槽、跨组事务 strict/loose 规则。
-剩余工作见 §11（语句级读合并需 lease、成员变更、P2 server 路由/每 group 快照）。
+**切片 2 已落地**：`CLIENT_OPTIONS` 帧 + 能力位协商 + CLI 开关，loose 从
+客户端可配置。**错误语义收尾已落地**：`CrossGroupTransaction` 结构化
+（from/to 组）与 schema 读三态（`last_read_status`，不再把读失败报成
+表不存在）。剩余工作见 §11（语句级读合并需 lease、成员变更、P2 server
+路由/每 group 快照）。
 本文件是实施方案，不是使用说明；职责/接口/踩坑见 `raft/README.md`。
 
 ## 0. 目标与范围

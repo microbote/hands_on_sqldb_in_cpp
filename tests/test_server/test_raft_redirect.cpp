@@ -183,6 +183,109 @@ TEST(RaftRedirect, ServerWithoutHintExecutesNormally) {
   }
 }
 
+TEST(RaftRedirect, ServerAcceptsClientOptionsAndKeepsServing) {
+  int fds[2] = {-1, -1};
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+  auto logger = server::Logger::create("error", "");
+  CHECK_TRUE(logger.has_value());
+  if (!logger.has_value()) {
+    return;
+  }
+  auto store = std::make_shared<kv::MockStore>();
+  CHECK_EQ(store->open(kv::DatabaseOptions{}), kv::Status::OK);
+
+  server::ServerConfig config;
+  config.set("storage.engine", "mock");
+  config.set("storage.path", "mock://client-options");
+  config.set("server.listen", "127.0.0.1:0");
+  server::Server server(config, store, *logger);
+  server.attach_connection(fds[1]);
+  std::thread server_thread([&] { server.run(); });
+
+  // loose=true：客户端握手后发 CLIENT_OPTIONS；服务端必须消费掉这帧，连接
+  // 不能断开，后续语句照常执行。
+  std::string error;
+  auto connection =
+      client::make_remote_from_fd(fds[0], &error, "t", /*loose=*/true);
+  CHECK_TRUE(connection != nullptr);
+  if (connection != nullptr) {
+    const client::Outcome create_db =
+        connection->execute("CREATE DATABASE shop");
+    CHECK_TRUE(create_db.ok);
+    CHECK_TRUE(connection->use_database("shop"));
+    const client::Outcome create =
+        connection->execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    CHECK_TRUE(create.ok);
+    const client::Outcome insert =
+        connection->execute("INSERT INTO t (id, v) VALUES (1, 10)");
+    CHECK_TRUE(insert.ok);
+    const client::Outcome select = connection->execute("SELECT * FROM t");
+    CHECK_TRUE(select.ok);
+  }
+
+  connection.reset();
+  server.stop();
+  if (server_thread.joinable()) {
+    server_thread.join();
+  }
+}
+
+TEST(RaftRedirect, ClientSendsClientOptionsOnlyWhenAdvertised) {
+  // 能力被通告：握手后的第一帧必须是 CLIENT_OPTIONS。
+  int fds[2] = {-1, -1};
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  std::thread fake_server([&] {
+    CHECK(write_all(fds[1],
+                    common::proto::encode_hello(
+                        1, common::proto::kCapabilityLeaderHint |
+                               common::proto::kCapabilityCrossGroupReadLoose)));
+    std::string buffer;
+    auto first = read_frame(fds[1], &buffer);
+    CHECK_TRUE(first.has_value());
+    if (first.has_value()) {
+      CHECK(first->type == common::proto::FrameType::kClientOptions);
+    }
+    ::close(fds[1]);
+  });
+
+  std::string error;
+  auto connection =
+      client::make_remote_from_fd(fds[0], &error, "t", /*loose=*/true);
+  CHECK_TRUE(connection != nullptr);
+  if (connection != nullptr) {
+    // 假服务端读完 CLIENT_OPTIONS 就关连接：execute 失败没关系，帧类型已验。
+    (void)connection->execute("SELECT 1");
+  }
+  fake_server.join();
+  ::close(fds[0]);
+
+  // 能力没通告：即使客户端要 loose 也不发 CLIENT_OPTIONS，第一帧是 QUERY。
+  int fds2[2] = {-1, -1};
+  CHECK_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds2), 0);
+  std::thread fake_server2([&] {
+    CHECK(write_all(fds2[1],
+                    common::proto::encode_hello(1,
+                                                common::proto::kCapabilityLeaderHint)));
+    std::string buffer;
+    auto first = read_frame(fds2[1], &buffer);
+    CHECK_TRUE(first.has_value());
+    if (first.has_value()) {
+      CHECK(first->type == common::proto::FrameType::kQuery);
+    }
+    ::close(fds2[1]);
+  });
+
+  auto connection2 =
+      client::make_remote_from_fd(fds2[0], &error, "t", /*loose=*/true);
+  CHECK_TRUE(connection2 != nullptr);
+  if (connection2 != nullptr) {
+    (void)connection2->execute("SELECT 1");
+  }
+  fake_server2.join();
+  ::close(fds2[0]);
+}
+
 // ---- 客户端半边 ----
 
 // 假服务端 1：握手后对第一条语句回 NotLeader + hint，然后等连接关闭。

@@ -27,6 +27,7 @@ struct Options {
   bool echo_sql = false;
   bool force_interactive = false;
   std::string command; // -e
+  bool loose_cross_group_reads = false;
 };
 
 void print_usage(const char *program) {
@@ -36,6 +37,8 @@ void print_usage(const char *program) {
   fmt::print("      --host HOST     服务器地址（默认 127.0.0.1）\n");
   fmt::print("      --port PORT     服务器端口（默认 5433）\n");
   fmt::print("      --echo-sql      执行前回显\n");
+  fmt::print("      --cross-group-read=MODE 事务跨组只读模式：strict（默认）|\n");
+  fmt::print("                             loose（允许读多个组，事务冻结为只读）\n");
   fmt::print("      --no-color      关闭颜色\n");
   fmt::print("  -h, --help          显示帮助\n");
 }
@@ -91,6 +94,21 @@ bool parse_options(int argc, char **argv, Options *options) {
       if (!take_value("--port", &options->port)) {
         return false;
       }
+    } else if (arg == "--cross-group-read" ||
+               arg.starts_with("--cross-group-read=")) {
+      std::string mode;
+      if (!take_value("--cross-group-read", &mode)) {
+        return false;
+      }
+      if (mode == "loose") {
+        options->loose_cross_group_reads = true;
+      } else if (mode == "strict") {
+        options->loose_cross_group_reads = false;
+      } else {
+        fmt::print(stderr, "--cross-group-read 只接受 loose 或 strict，得到：{}\n",
+                   mode);
+        return false;
+      }
     } else {
       fmt::print(stderr, "未知选项：{}\n", arg);
       return false;
@@ -137,6 +155,7 @@ int main(int argc, char **argv) {
   client::RemoteOptions remote;
   remote.host = options.host;
   remote.port = options.port;
+  remote.loose_cross_group_reads = options.loose_cross_group_reads;
   std::string error;
   auto connection = client::make_remote(remote, &error);
   if (connection == nullptr) {

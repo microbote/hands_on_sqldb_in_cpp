@@ -27,8 +27,13 @@ barrier 覆盖整个持快照读阶段）、`raft.proposal_timeout_ms` / `raft.r
 （`@system/*` 固定 0 号组 + 数据 range 表）、`RaftKVStore` 泛化为多 group
 （单 group 路径行为不变）、**per-group 写槽**、跨组事务规则
 （写跨组拒绝；未写时跨组读 strict/loose，跨组后冻结只读；自动提交跨组
-batch/range 拒绝）。server 侧按语句路由、`CLIENT_OPTIONS` 帧、每 group
-独立快照留待切片 2。
+batch/range 拒绝）。**切片 2 已落地**：`CLIENT_OPTIONS` 帧 + 能力位协商，
+`--cross-group-read=loose|strict`（远程/本地客户端），loose 真正从客户端
+可配置。**切片 2b 已落地**：`CrossGroupTransaction` 结构化错误
+（`kv::CrossGroupInfo` 带 from/to 组，table/session 错误消息带 "group X ->
+group Y"）；schema 读三态化（`KVCatalog::last_read_status()`，`open_table` 和
+`\d` 区分"读失败"与"表不存在"，follower 不再误报 table not found）。
+server 侧按语句路由、每 group 独立快照留待切片 3。
 
 ## 模块结构
 

@@ -117,6 +117,9 @@ std::unique_ptr<SqlConnection> make_local(std::shared_ptr<kv::KVEngine> engine);
 struct RemoteOptions {
   std::string host = "127.0.0.1";
   std::string port = "5433";
+  // 连接级跨组只读模式：loose 允许事务内跨组读。服务端通告能力才发
+  // CLIENT_OPTIONS，否则静默保持 strict（默认）。
+  bool loose_cross_group_reads = false;
   // 重定向时怎么拿到新连接：默认真 TCP connect。测试用它注入 socketpair，
   // 这样"换节点重试"能在禁 bind 的环境里验证。
   std::function<std::expected<int, std::string>(const std::string &host,
@@ -130,6 +133,7 @@ std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
 // 会先做协议握手（读 HELLO），失败返回 nullptr。
 std::unique_ptr<SqlConnection>
 make_remote_from_fd(int fd, std::string *error,
-                    const std::string &label = "remote");
+                    const std::string &label = "remote",
+                    bool loose_cross_group_reads = false);
 
 } // namespace client

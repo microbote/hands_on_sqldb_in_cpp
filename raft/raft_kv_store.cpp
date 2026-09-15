@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <iterator>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -220,6 +221,8 @@ kv::Status RaftKVEngine::check_group(uint64_t group, bool is_write) {
     return kv::Status::OK;
   }
   if (*bound_group_ != group) {
+    cross_group_from_ = *bound_group_;
+    cross_group_to_ = group;
     if (is_write) {
       return last_error_ = kv::Status::CrossGroupTransaction;
     }
@@ -235,6 +238,8 @@ kv::Status RaftKVEngine::check_group(uint64_t group, bool is_write) {
   }
   if (crossed_groups_ && is_write) {
     // "已经跨过组，再想写": a crossed transaction is frozen read-only.
+    // The offending group is the bound group itself; keep the generic message
+    // (no from/to pair) since this is not a two-group write conflict.
     return last_error_ = kv::Status::CrossGroupTransaction;
   }
   return kv::Status::OK;
@@ -326,6 +331,9 @@ kv::Status RaftKVEngine::get_batch(
     groups.insert(store_->router().group_for(key));
   }
   if (groups.size() > 1 && tx_ == nullptr) {
+    const auto first = groups.begin();
+    cross_group_from_ = *first;
+    cross_group_to_ = *std::next(first);
     return last_error_ = kv::Status::CrossGroupTransaction;
   }
   for (const uint64_t group : groups) {
@@ -396,9 +404,27 @@ kv::Status RaftKVEngine::write_batch(const kv::WriteBatch &batch) {
     return kv::Status::OK;
   }
 
-  const auto group = store_->router().batch_group(batch);
-  if (!group.has_value()) {
-    return last_error_ = kv::Status::CrossGroupTransaction;
+  // Route: every op must land in one group. put/remove mismatches record the
+  // two groups; a remove_range spanning groups keeps the generic message (its
+  // boundary is not a single "second group").
+  std::optional<uint64_t> group;
+  for (const auto &op : batch.ops()) {
+    std::optional<uint64_t> op_group;
+    if (op.type == kv::WriteBatch::OpType::kRemoveRange) {
+      op_group = store_->router().range_group(op.data.key, op.range_end);
+      if (!op_group.has_value()) {
+        return last_error_ = kv::Status::CrossGroupTransaction;
+      }
+    } else {
+      op_group = store_->router().group_for(op.data.key);
+    }
+    if (!group.has_value()) {
+      group = op_group;
+    } else if (*group != *op_group) {
+      cross_group_from_ = *group;
+      cross_group_to_ = *op_group;
+      return last_error_ = kv::Status::CrossGroupTransaction;
+    }
   }
 
   if (tx_ == nullptr) {

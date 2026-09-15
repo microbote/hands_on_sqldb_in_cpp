@@ -22,6 +22,9 @@
 //                              u32 end_line, u32 end_col
 //                              [+ u8 has_hint, u64 node_id, bytes endpoint]
 //   7 PING / 8 BYE（无 payload）
+//   11 CLIENT_OPTIONS client->server : u32 capabilities, u16 option_count,
+//       { u16 key_len, bytes key, u16 value_len, bytes value } *
+//       （HELLO 之后发一次，能力位协商见 kCapability*）
 //
 // 为什么 NULL 要带标志位：`Value::to_string()` 对 NULL 返回字面量 "NULL"，
 // 与字符串 'NULL' 无法区分 —— 不给标志位就是数据说谎。
@@ -49,7 +52,8 @@ enum class FrameType : uint8_t {
   kPing = 7,
   kBye = 8,
   kMeta = 9,      // client->server：要元信息（\l / \dt / \d）
-  kMetaReply = 10 // server->client：元信息载荷（按 kind 解码）
+  kMetaReply = 10, // server->client：元信息载荷（按 kind 解码）
+  kClientOptions = 11 // client->server：连接级选项（跨组只读模式等）
 };
 
 // 元信息请求的种类（kMeta 的 payload：u8 kind, bytes arg1, bytes arg2）
@@ -79,6 +83,8 @@ constexpr uint16_t kProtocolVersion = 1;
 // HELLO 里通告的能力位：服务端认识 ERROR 帧尾部的 leader hint。
 // 老客户端读到未知能力位会忽略；新客户端只在服务端通告时才期待 hint。
 constexpr uint32_t kCapabilityLeaderHint = 1u << 0;
+// 服务端支持 CLIENT_OPTIONS 里的跨组只读 loose 模式；客户端看到才发。
+constexpr uint32_t kCapabilityCrossGroupReadLoose = 1u << 1;
 // 单帧上限（防止对端用超大长度头把服务端撑爆）
 constexpr uint32_t kMaxFrameSize = 16u * 1024 * 1024;
 
@@ -108,6 +114,11 @@ struct ErrorFrame {
 
 // ---- 编码（返回完整的帧字节，含帧头）----
 std::string encode_hello(uint16_t server_version, uint32_t capabilities);
+// CLIENT_OPTIONS 帧：capabilities + 可扩展 key/value 选项（当前用能力位，
+// 选项表留给后续加参数；结构保留在设计形态上）。
+std::string encode_client_options(
+    uint32_t capabilities,
+    const std::vector<std::pair<std::string, std::string>> &options = {});
 std::string encode_columns(const std::vector<std::string> &columns);
 std::string encode_row(const std::vector<ProtocolValue> &values);
 std::string encode_ok(uint64_t affected_rows, bool in_transaction,
@@ -148,6 +159,9 @@ bool try_decode_frame(const std::string &buffer, DecodedFrame *frame,
 bool decode_query(const std::string &payload, std::string *sql);
 bool decode_hello(const std::string &payload, uint16_t *proto_version,
                   uint16_t *server_version, uint32_t *capabilities);
+bool decode_client_options(
+    const std::string &payload, uint32_t *capabilities,
+    std::vector<std::pair<std::string, std::string>> *options);
 bool decode_columns(const std::string &payload,
                     std::vector<std::string> *columns);
 bool decode_row(const std::string &payload, std::vector<ProtocolValue> *values);

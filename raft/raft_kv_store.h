@@ -123,8 +123,14 @@ public:
   // P2 slice: strict (default) rejects a transaction that reads a second
   // group; loose allows it and freezes the transaction as read-only. The
   // CLIENT_OPTIONS frame that carries this from the client is the next slice.
-  void set_loose_cross_group_reads(bool loose) {
+  void set_loose_cross_group_reads(bool loose) override {
     loose_cross_group_reads_ = loose;
+  }
+  std::optional<kv::CrossGroupInfo> last_cross_group_info() const override {
+    if (!cross_group_from_.has_value() || !cross_group_to_.has_value()) {
+      return std::nullopt;
+    }
+    return kv::CrossGroupInfo{*cross_group_from_, *cross_group_to_};
   }
 
 private:
@@ -153,6 +159,9 @@ private:
   bool crossed_groups_ = false;
   bool wrote_ = false;
   bool loose_cross_group_reads_ = false;
+  // 最近一次 CrossGroupTransaction 的 from/to 组（未发生则为 nullopt）。
+  std::optional<uint64_t> cross_group_from_;
+  std::optional<uint64_t> cross_group_to_;
 };
 
 } // namespace raft

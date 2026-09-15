@@ -26,6 +26,46 @@ TEST(Protocol, HelloRoundTrip) {
   CHECK_EQ(caps, uint32_t{3});
 }
 
+TEST(Protocol, ClientOptionsRoundTrip) {
+  // capabilities + 空选项表。
+  const std::string frame = common::proto::encode_client_options(
+      common::proto::kCapabilityCrossGroupReadLoose);
+  common::proto::DecodedFrame decoded;
+  size_t consumed = 0;
+  std::string error;
+  CHECK(common::proto::try_decode_frame(frame, &decoded, &consumed, &error));
+  CHECK_EQ(consumed, frame.size());
+  CHECK(decoded.type == common::proto::FrameType::kClientOptions);
+
+  uint32_t capabilities = 0;
+  std::vector<std::pair<std::string, std::string>> options;
+  CHECK(common::proto::decode_client_options(decoded.payload, &capabilities,
+                                             &options));
+  CHECK_EQ(capabilities, common::proto::kCapabilityCrossGroupReadLoose);
+  CHECK_EQ(options.size(), size_t{0});
+
+  // 可扩展 key/value 选项：往返保留。
+  const std::string with_options = common::proto::encode_client_options(
+      common::proto::kCapabilityCrossGroupReadLoose,
+      {{"cross_group_read", "loose"}, {"future", "option"}});
+  CHECK(common::proto::try_decode_frame(with_options, &decoded, &consumed,
+                                        &error));
+  CHECK(common::proto::decode_client_options(decoded.payload, &capabilities,
+                                             &options));
+  CHECK_EQ(options.size(), size_t{2});
+  if (options.size() == 2) {
+    CHECK_EQ(options[0].first, std::string("cross_group_read"));
+    CHECK_EQ(options[0].second, std::string("loose"));
+    CHECK_EQ(options[1].first, std::string("future"));
+    CHECK_EQ(options[1].second, std::string("option"));
+  }
+
+  // 截断/越界必须失败。
+  CHECK_FALSE(common::proto::decode_client_options(
+                  with_options.substr(0, with_options.size() - 3), &capabilities,
+                  &options));
+}
+
 TEST(Protocol, QueryRoundTrip) {
   const std::string sql = "SELECT * FROM t WHERE name = 'a;b';";
   common::proto::DecodedFrame decoded;

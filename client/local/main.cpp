@@ -31,6 +31,7 @@ namespace {
 // ============================================================
 struct Options {
   std::string engine = "default"; // default/mock/leveldb
+  bool loose_cross_group_reads = false;
   std::string path = "./sql_db";
   bool force_interactive = false;
   bool echo_sql = false;
@@ -48,6 +49,8 @@ void print_usage(const char *program) {
              "mock）\n");
   fmt::print("      --path DIR      leveldb 数据目录（默认 ./sql_db）\n");
   fmt::print("      --echo-sql      执行前回显（带语法高亮）\n");
+  fmt::print("      --cross-group-read=MODE 事务跨组只读模式：strict（默认）|\n");
+  fmt::print("                             loose（允许读多个组，事务冻结为只读）\n");
   fmt::print("      --no-color      关闭颜色\n");
   fmt::print("  -h, --help          显示帮助\n");
   fmt::print("\n交互模式内置命令：exit / quit / \\q 退出\n");
@@ -107,6 +110,21 @@ bool parse_options(int argc, char **argv, Options *options) {
       }
     } else if (arg == "--path" || arg.starts_with("--path=")) {
       if (!take_value("--path", &options->path)) {
+        return false;
+      }
+    } else if (arg == "--cross-group-read" ||
+               arg.starts_with("--cross-group-read=")) {
+      std::string mode;
+      if (!take_value("--cross-group-read", &mode)) {
+        return false;
+      }
+      if (mode == "loose") {
+        options->loose_cross_group_reads = true;
+      } else if (mode == "strict") {
+        options->loose_cross_group_reads = false;
+      } else {
+        fmt::print(stderr, "--cross-group-read 只接受 loose 或 strict，得到：{}\n",
+                   mode);
         return false;
       }
     } else if (!arg.empty() && arg[0] == '-') {
@@ -183,6 +201,7 @@ int main(int argc, char **argv) {
     fmt::print(stderr, "存储引擎没有打开\n");
     return 1;
   }
+  engine->set_loose_cross_group_reads(options.loose_cross_group_reads);
 
   client::ReplOptions repl_options;
   repl_options.colors = options.colors;

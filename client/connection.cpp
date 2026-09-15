@@ -355,6 +355,18 @@ public:
 
   std::string description() const override { return description_; }
 
+  // 连上后按需发 CLIENT_OPTIONS（跨组只读 loose）。只在该能力被服务端通告时
+  // 才发；否则保持 strict（默认），两边语义一致。
+  bool send_client_options_if_requested(bool loose) {
+    if (!loose ||
+        (capabilities_ & common::proto::kCapabilityCrossGroupReadLoose) == 0) {
+      return true;
+    }
+    return send_all(
+        common::proto::encode_client_options(
+            common::proto::kCapabilityCrossGroupReadLoose));
+  }
+
   // 连上之后先读 HELLO（协议版本/能力位）：**必须在任何 QUERY 之前消费掉**，
   // 否则第一条语句会把 HELLO 当成"不该出现的帧"而报连接断开。
   bool handshake() {
@@ -448,12 +460,19 @@ private:
 std::unique_ptr<SqlConnection>
 make_remote_from_socket(common::net::TcpSocket socket, std::string *error,
                         const std::string &label,
-                        RemoteConnection::Dialer dialer = {}) {
+                        RemoteConnection::Dialer dialer,
+                        bool loose_cross_group_reads) {
   auto connection = std::make_unique<RemoteConnection>(std::move(socket), label,
                                                        std::move(dialer));
   if (!connection->handshake()) {
     if (error != nullptr) {
       *error = "protocol handshake failed (server speaks a different version?)";
+    }
+    return nullptr;
+  }
+  if (!connection->send_client_options_if_requested(loose_cross_group_reads)) {
+    if (error != nullptr) {
+      *error = "failed to send client options";
     }
     return nullptr;
   }
@@ -493,14 +512,17 @@ std::unique_ptr<SqlConnection> make_remote(const RemoteOptions &options,
   }
   const std::string description = options.host + ":" + options.port;
   return make_remote_from_socket(std::move(socket), error, description,
-                                 options.dialer);
+                                 options.dialer,
+                                 options.loose_cross_group_reads);
 }
 
 std::unique_ptr<SqlConnection> make_remote_from_fd(int fd, std::string *error,
-                                                   const std::string &label) {
+                                                   const std::string &label,
+                                                   bool loose_cross_group_reads) {
   common::net::TcpSocket socket = common::net::TcpSocket::adopt(fd);
   common::net::socket_suppress_sigpipe(socket.fd());
-  return make_remote_from_socket(std::move(socket), error, label);
+  return make_remote_from_socket(std::move(socket), error, label, {},
+                                 loose_cross_group_reads);
 }
 
 } // namespace client

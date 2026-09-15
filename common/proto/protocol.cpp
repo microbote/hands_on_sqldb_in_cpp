@@ -120,6 +120,21 @@ std::string encode_hello(uint16_t server_version, uint32_t capabilities) {
   return encode_frame(FrameType::kHello, payload);
 }
 
+std::string encode_client_options(
+    uint32_t capabilities,
+    const std::vector<std::pair<std::string, std::string>> &options) {
+  std::string payload;
+  put_u32(&payload, capabilities);
+  put_u16(&payload, static_cast<uint16_t>(options.size()));
+  for (const auto &[key, value] : options) {
+    put_u16(&payload, static_cast<uint16_t>(key.size()));
+    payload.append(key);
+    put_u16(&payload, static_cast<uint16_t>(value.size()));
+    payload.append(value);
+  }
+  return encode_frame(FrameType::kClientOptions, payload);
+}
+
 std::string encode_columns(const std::vector<std::string> &columns) {
   std::string payload;
   put_u16(&payload, static_cast<uint16_t>(columns.size()));
@@ -323,7 +338,7 @@ bool try_decode_frame(const std::string &buffer, DecodedFrame *frame,
     return false; // 体还没收全
   }
   if (type < static_cast<uint8_t>(FrameType::kHello) ||
-      type > static_cast<uint8_t>(FrameType::kMetaReply)) {
+      type > static_cast<uint8_t>(FrameType::kClientOptions)) {
     *error = "unknown frame type: " + std::to_string(type);
     return false;
   }
@@ -344,6 +359,41 @@ bool decode_hello(const std::string &payload, uint16_t *proto_version,
   return get_u16(payload, &pos, proto_version) &&
          get_u16(payload, &pos, server_version) &&
          get_u32(payload, &pos, capabilities);
+}
+
+bool decode_client_options(
+    const std::string &payload, uint32_t *capabilities,
+    std::vector<std::pair<std::string, std::string>> *options) {
+  if (capabilities == nullptr || options == nullptr) {
+    return false;
+  }
+  size_t pos = 0;
+  if (!get_u32(payload, &pos, capabilities)) {
+    return false;
+  }
+  uint16_t option_count = 0;
+  if (!get_u16(payload, &pos, &option_count)) {
+    return false;
+  }
+  options->clear();
+  for (uint16_t i = 0; i < option_count; ++i) {
+    uint16_t key_len = 0;
+    uint16_t value_len = 0;
+    if (!get_u16(payload, &pos, &key_len) ||
+        pos + key_len > payload.size()) {
+      return false;
+    }
+    std::string key = payload.substr(pos, key_len);
+    pos += key_len;
+    if (!get_u16(payload, &pos, &value_len) ||
+        pos + value_len > payload.size()) {
+      return false;
+    }
+    std::string value = payload.substr(pos, value_len);
+    pos += value_len;
+    options->emplace_back(std::move(key), std::move(value));
+  }
+  return pos == payload.size();
 }
 
 bool decode_columns(const std::string &payload,

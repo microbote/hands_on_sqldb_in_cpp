@@ -12,9 +12,17 @@
 namespace sql {
 namespace {
 
-RelError kv_error(const char *what, const kv::Status &status) {
-  return RelError(RelErrorCode::KV_ERROR, std::string(what) + " failed: " +
-                                              kv::status_to_string(status));
+RelError kv_error(const char *what, const kv::Status &status,
+                  const kv::KVEngine &engine) {
+  std::string message = std::string(what) + " failed: " +
+                        kv::status_to_string(status);
+  if (status == kv::Status::CrossGroupTransaction) {
+    if (const auto info = engine.last_cross_group_info(); info.has_value()) {
+      message += " (group " + std::to_string(info->from_group) + " -> group " +
+                 std::to_string(info->to_group) + ")";
+    }
+  }
+  return RelError(RelErrorCode::KV_ERROR, std::move(message));
 }
 
 RelError schema_error(SchemaError err, const std::string &what) {
@@ -84,7 +92,7 @@ std::expected<Row, RelError> Table::find(const Value &primary_key) const {
                  "row not found in " + schema_.table_name().str()));
   }
   if (status != kv::Status::OK) {
-    return std::unexpected(kv_error("get", status));
+    return std::unexpected(kv_error("get", status, *engine_));
   }
   auto decoded = decode_row(data);
   if (!decoded.has_value()) {
@@ -181,7 +189,7 @@ std::expected<void, RelError> Table::insert(const Row &row) {
   // 整行一个 blob（值 = Row::serialize(schema)）
   const kv::Status status = engine_->put(key, encode_row(row));
   if (status != kv::Status::OK) {
-    return std::unexpected(kv_error("put", status));
+    return std::unexpected(kv_error("put", status, *engine_));
   }
   return {};
 }
@@ -208,7 +216,7 @@ std::expected<void, RelError> Table::update(const Value &primary_key,
   const kv::Status status =
       engine_->put(encode_key(primary_key), encode_row(row));
   if (status != kv::Status::OK) {
-    return std::unexpected(kv_error("put", status));
+    return std::unexpected(kv_error("put", status, *engine_));
   }
   return {};
 }
@@ -239,7 +247,7 @@ std::expected<void, RelError> Table::remove(const Value &primary_key) {
   }
   const kv::Status status = engine_->remove(encode_key(primary_key));
   if (status != kv::Status::OK && status != kv::Status::NotFound) {
-    return std::unexpected(kv_error("remove", status));
+    return std::unexpected(kv_error("remove", status, *engine_));
   }
   return {};
 }
@@ -251,7 +259,7 @@ std::expected<void, RelError> Table::truncate() {
   batch.remove_range(key_prefix_, keys::prefix_end(key_prefix_));
   const kv::Status status = engine_->write_batch(batch);
   if (status != kv::Status::OK) {
-    return std::unexpected(kv_error("remove_range", status));
+    return std::unexpected(kv_error("remove_range", status, *engine_));
   }
   return {};
 }

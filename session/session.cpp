@@ -18,6 +18,14 @@
 #include "storage/kv_engine/kv_engine.h"
 
 namespace session {
+
+void Session::set_loose_cross_group_reads(bool loose) {
+  cross_group_read_loose_ = loose;
+  if (engine_ != nullptr) {
+    engine_->set_loose_cross_group_reads(loose);
+  }
+}
+
 namespace {
 
 // 去掉尾部空白；没有结尾分号就补一个（parser 要求语句以 ';' 结束）
@@ -48,6 +56,19 @@ SessionError from_stmt_error(SessionErrorCode code,
           ? SessionErrorCode::CONSTRAINT_VIOLATION
           : code;
   return SessionError(effective, message, sql, error.span);
+}
+
+// kv::Status 的可读消息；CrossGroupTransaction 时把两个组带进去。
+std::string kv_status_message(const kv::Status &status,
+                              const kv::KVEngine &engine) {
+  std::string message = kv::status_to_string(status);
+  if (status == kv::Status::CrossGroupTransaction) {
+    if (const auto info = engine.last_cross_group_info(); info.has_value()) {
+      message += " (group " + std::to_string(info->from_group) + " -> group " +
+                 std::to_string(info->to_group) + ")";
+    }
+  }
+  return message;
 }
 
 SessionError from_plan_error(SessionErrorCode code,
@@ -448,7 +469,8 @@ Session::execute_parsed(const ParsedStatement &parsed_stmt) {
           return std::expected<std::unique_ptr<exec::ResultCursor>,
                                SessionError>(std::unexpected(SessionError(
               SessionErrorCode::EXECUTE_ERROR,
-              std::string("commit failed: ") + kv::status_to_string(committed),
+              std::string("commit failed: ") +
+                  kv_status_message(committed, *engine_),
               statement)));
         }
         return result;
@@ -520,7 +542,7 @@ Session::begin_transaction(const std::string &statement) {
     return std::unexpected(
         SessionError(SessionErrorCode::TRANSACTION_ERROR,
                      std::string("cannot begin transaction: ") +
-                         kv::status_to_string(status),
+                         kv_status_message(status, *engine_),
                      statement));
   }
   in_transaction_ = true;
@@ -549,7 +571,7 @@ Session::commit_transaction(const std::string &statement) {
     // 缓冲还留在引擎里：可以重试 COMMIT，也可以 ROLLBACK
     return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
                                         std::string("commit failed: ") +
-                                            kv::status_to_string(status),
+                                            kv_status_message(status, *engine_),
                                         statement));
   }
   in_transaction_ = false;
@@ -569,7 +591,7 @@ Session::rollback_transaction(const std::string &statement) {
   if (status != kv::Status::OK) {
     return std::unexpected(SessionError(SessionErrorCode::TRANSACTION_ERROR,
                                         std::string("rollback failed: ") +
-                                            kv::status_to_string(status),
+                                            kv_status_message(status, *engine_),
                                         statement));
   }
   return exec::empty_result();

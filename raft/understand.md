@@ -407,7 +407,7 @@ follower 端有 1 GiB 待组装缓冲上限，超大快照仍需要后续做流�
 follower `BEGIN` 立即 NotLeader；`get_batch` 覆盖 store/覆盖层/缺失/重复 key
 且两种缺失策略语义不变；超时预算在运行时与配置层都可见。
 
-### Phase C：多 group（P2）—— 切片 1（适配层路由）✅，切片 2 待做
+### Phase C：多 group（P2）—— 切片 1（适配层路由）✅ + 切片 2（CLIENT_OPTIONS）✅
 
 切片 1 已落地（2026-09-15）：
 
@@ -425,24 +425,53 @@ follower `BEGIN` 立即 NotLeader；`get_batch` 覆盖 store/覆盖层/缺失/�
    - 未写过时读别的组：`strict`（默认）拒绝 / `loose` 放行，一旦跨组事务冻结
      为只读，任何再写都报错；
    - 自动提交的单条 batch / range 跨组也直接拒绝。
-   `loose` 目前是引擎上的 setter（`set_loose_cross_group_reads`），客户端
-   `CLIENT_OPTIONS` 帧接线是切片 2。
+   `loose` 的客户端接线在切片 2 完成。
 
-**切片 1 的已知简化（切片 2 处理）**：
+切片 2 已落地（2026-09-15）：**CLIENT_OPTIONS 帧 + loose 真正可配置**。
+
+5. ✅ 协议（`common/proto/protocol.{h,cpp}`）：新增 `kClientOptions` 帧
+   （u32 capabilities + u16 option_count + key/value 选项表）与
+   `kCapabilityCrossGroupReadLoose` 能力位；`try_decode_frame` 类型上界放宽。
+6. ✅ 协商：server 在 HELLO 通告能力位；客户端只在看到能力位时才发
+   CLIENT_OPTIONS（老 server 不收这帧、老 client 不发，默认 strict 两边语义
+   一致）。服务端处理 CLIENT_OPTIONS → `Session::set_loose_cross_group_reads`
+   → 转发到连接级 `RaftKVEngine`（`kv::KVEngine` 加默认 no-op 虚方法）。
+7. ✅ CLI：`sqldb-client --cross-group-read=loose|strict` 与本地 `sqldb`
+   同款开关；连接级、不改 SQL 语法（与 DESIGN §3.4 一致）。
+
+切片 2b（错误语义收尾）已落地（2026-09-15）：
+
+8. ✅ **`CrossGroupTransaction` 结构化**：`kv::CrossGroupInfo{from_group,
+   to_group}` + `KVEngine::last_cross_group_info()`（默认 nullopt，
+   `RaftKVEngine` 记录）。`check_group` 的跨组拒绝、自动提交 batch/get_batch
+   跨组都会记录前两个不同组的 id；table 层 `kv_error` 与 session 的
+   begin/commit/rollback 错误消息都带上 "（group X -> group Y）"。跨组 range
+   扫描与"冻结只读后写"保留通用消息（边界不是一个明确"第二组"）。
+9. ✅ **schema 读三态化（务实版）**：Catalog 接口本身是 bool/optional（
+   sql_types 定死），所以给 `KVCatalog` 加 `last_read_status()`：`read_meta`
+   记录最近一次元数据读的存储状态（NotFound 视为正常清空）。`open_table`
+   在 schema 读失败时返回 `KV_ERROR("read table schema failed: NotLeader")`
+   而不是误导性的 `TABLE_NOT_FOUND`；server 的 `\d` 元命令同样区分
+   "schema read failed" 与 "table not found"。还没学到 leader 的 follower
+   不再把"读不到"说成"表不存在"（有 hint 时 server 预检查仍会先重定向）。
+
+**已知简化（切片 3：server 多 group 路由）**：
 - 事务快照仍是**全局一张** LevelDB 快照（BEGIN 时对每个 group 各取一次
   barrier 再取快照）；DESIGN 的“每 group 独立快照 / loose 事务 = N 份
   快照”需要存储层支持，未做。
 - server 侧仍是单 group 启动（bootstrap 只建一组），`leader_hint()` 报 0 号组；
-  “按语句判定 group 再抢写槽 / 回 NotLeader”的 server 路由是切片 2（代码注释
-  “多 group 的完整路由属于 P2”未变）。
-- 结构化错误仍只有状态码：`CrossGroupTransaction` 不带两个 group id；
-  schema 读三态化未做。
+  “按语句判定 group 再抢写槽 / 回 NotLeader”的 server 路由是切片 3（代码注释
+  “多 group 的完整路由属于 P2”未变）；这需要传输层支持按 group 复用连接或
+  每 group 独立监听。
 - `begin_transaction` 每个 group 各一次 barrier：组数越多 BEGIN 越贵（与
   DESIGN 的“N 份”成本方向一致），读只事务持快照阶段不追加 barrier。
 
 验收（已通过）：路由（含 `@system/*`）、按组状态机写入与 barrier 计数、
 per-group 写槽并发、跨组写拒绝可回滚、strict/loose 读规则、自动提交跨组
-batch/range 拒绝、跨组扫描拒绝。
+batch/range 拒绝、跨组扫描拒绝；CLIENT_OPTIONS 编解码往返（含选项表与截断
+拒绝）、真 server 接受该帧后继续服务、客户端只在能力通告时发送、session
+连接级模式状态；`CrossGroupInfo` 在事务/自动提交跨组时给出 {1,2}；follower
+上 Catalog `open_table` 报 KV_ERROR(NotLeader) 而非 TABLE_NOT_FOUND。
 
 ### Phase D：成员变更与长期项（P3+）
 

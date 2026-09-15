@@ -17,6 +17,17 @@ int64_t fake_clock() { return g_now; }
 
 } // namespace
 
+TEST(Session, CrossGroupReadModeIsConnectionLevelState) {
+  auto engine = sess_test::open_engine();
+  session::Session session(engine);
+  // 默认 strict（安全）；loose 是连接级开关，可随时切回。
+  CHECK_FALSE(session.loose_cross_group_reads());
+  session.set_loose_cross_group_reads(true);
+  CHECK_TRUE(session.loose_cross_group_reads());
+  session.set_loose_cross_group_reads(false);
+  CHECK_FALSE(session.loose_cross_group_reads());
+}
+
 TEST(Metadata, DatabasesCarryTableCountAndCreationTime) {
   auto engine = sess_test::open_engine();
   session::Session session(engine, fake_clock);

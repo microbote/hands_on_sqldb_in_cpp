@@ -28,11 +28,8 @@
 #include "sql_types/catalog.h"
 #include "sql_types/identifier.h"
 #include "sql_types/schema.h"
+#include "storage/kv_engine/kv_engine.h"
 #include "table.h"
-
-namespace kv {
-class KVEngine;
-}
 
 namespace sql {
 
@@ -95,6 +92,11 @@ public:
   std::expected<Table, RelError> open_table(const Identifier &db_name,
                                             const Identifier &table_name) const;
 
+  // 最近一次元数据**读**的存储状态。Catalog 接口本身只有 bool/optional，
+  // 分不清"表不存在"和"读失败"（follower 上 NotLeader / 分区 Timeout）；
+  // 调用方在拿到"没找到"后查这里，决定是报"表不存在"还是报存储错误。
+  kv::Status last_read_status() const { return last_read_status_; }
+
   // 用当前数据库打开表
   std::expected<Table, RelError>
   open_current_table(const Identifier &table_name) const;
@@ -129,6 +131,7 @@ private:
   bool remove_prefix(const std::string &prefix);
 
   std::shared_ptr<kv::KVEngine> engine_;
+  mutable kv::Status last_read_status_ = kv::Status::OK;
   Identifier current_db_; // 会话状态：当前数据库（USE）
   Clock now_;             // 时间源（默认系统时间）
 };

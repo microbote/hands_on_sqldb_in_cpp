@@ -20,6 +20,7 @@ target_include_directories(test_raft PRIVATE
 
 target_link_libraries(test_raft PRIVATE
     sql_raft
+    sql_relation
     test_fwk
 )
 

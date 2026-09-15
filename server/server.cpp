@@ -210,9 +210,11 @@ common::svrkit::Task Server::serve_connection(
   // 1) HELLO（协议版本 + 能力位）
   {
     bool ok = false;
-    // 能力位：通告"ERROR 帧可能带 leader hint"，客户端据此决定要不要读尾部。
+    // 能力位：leader hint 尾帧 + CLIENT_OPTIONS（跨组只读 loose）协商。
     co_await connection->write_all(
-        encode_hello(kServerVersion, kCapabilityLeaderHint), ok);
+        encode_hello(kServerVersion,
+                     kCapabilityLeaderHint | kCapabilityCrossGroupReadLoose),
+        ok);
     alive = ok;
   }
 
@@ -268,6 +270,18 @@ common::svrkit::Task Server::serve_connection(
       alive = ok;
       continue;
     }
+    if (frame.type == FrameType::kClientOptions) {
+      uint32_t capabilities = 0;
+      std::vector<std::pair<std::string, std::string>> options;
+      if (!decode_client_options(frame.payload, &capabilities, &options)) {
+        alive = false;
+        break;
+      }
+      // 连接级：跨组只读模式。老客户端不发这帧 -> 保持 strict（默认）。
+      session.set_loose_cross_group_reads(
+          (capabilities & kCapabilityCrossGroupReadLoose) != 0);
+      continue;
+    }
     if (frame.type == FrameType::kMeta) {
       // 元信息（\l / \dt / \d）：读 Catalog，就地执行（不占写槽）
       uint8_t kind = 0;
@@ -314,7 +328,16 @@ common::svrkit::Task Server::serve_connection(
             session.table_schema(sql::Identifier(arg2), sql::Identifier(arg1));
         if (!schema.has_value()) {
           ErrorFrame missing;
-          missing.message = "table not found: " + arg2;
+          const kv::Status read_status = session.catalog().last_read_status();
+          if (read_status != kv::Status::OK) {
+            // 存储读失败（follower 的 NotLeader / 分区 Timeout）：报真实原因，
+            // 别把"读不到"说成"表不存在"。
+            missing.message =
+                std::string("schema read failed: ") +
+                kv::status_to_string(read_status);
+          } else {
+            missing.message = "table not found: " + arg2;
+          }
           co_await connection->write_all(encode_error(missing), ok);
           alive = ok;
           replied = true;
