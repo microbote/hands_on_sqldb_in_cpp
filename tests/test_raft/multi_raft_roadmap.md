@@ -110,7 +110,7 @@
 | S2 | shard 配置解析 + 路由校验（D2） | `[raft] shards` 解析与校验 + `GroupRouter::validate()` + 配置/路由测试 —— **✅ 已落地 2026-09-15**（格式 `start,end,group;...`，校验：不相交/非空/组>=1 且唯一/不覆盖 @system/*） |
 | S3 | bootstrap 多组启动（D3） | K 组 = K×(LogStore+KVStateMachine+RaftNode+RaftRuntime)，共享一个 transport + 一个 RaftKVStore；K=1 走现有路径 —— **✅ 已落地 2026-09-15**（`<log_path>/group<N>/` 每组独立日志/幂等库；多组 + snapshot_entries>0 暂时拒绝，per-group 快照属 M3；`RaftBootstrap::open` 单组布局不变） |
 | S4 | server 按语句路由（D4） | `group_for/leader_hint_for`、session 写槽按组、预检查按组 —— **✅ 已落地 2026-09-15**（DML→数据组、DDL/USE→组 0、事务语句不占组；`@system/*` 读不绑定事务组，避免 DML 的 schema 读把事务绑错组；DROP TABLE 的多组数据段删除为 M1 已知不支持） |
-| S5 | 端到端验收 | K=2~3、N=3 真实 TCP：每组独立 leader；组 A 写不影响组 B；跨组写事务报错带组号；follower 组回 NotLeader 指向该组 leader；loose 跨组读可跑 |
+| S5 | 端到端验收 | K=3、N=3 真实 TCP —— **✅ 已落地 2026-09-16**（`MultiGroupThreeNodesThreeGroupsOverTcp`）：每组独立选主；组 1/2 各自 INSERT 复制到全部 3 节点对应组；跨组写事务报错带 (group 1 -> group 2) 且可回滚；组 1 follower 的写返回 NotLeader、`leader_hint_for` 指向组 1 leader 且带地址。loose 跨组读已在适配层测试覆盖（真实 TCP 上需要某节点同时是两组的 leader，不做确定性断言） |
 
 测试矩阵（M1）：
 

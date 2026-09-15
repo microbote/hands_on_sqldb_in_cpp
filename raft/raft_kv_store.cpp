@@ -194,12 +194,12 @@ std::shared_ptr<kv::KVStore> RaftKVEngine::store() const { return store_; }
 bool RaftKVEngine::is_open() const { return store_->is_open(); }
 
 kv::Status RaftKVEngine::ensure_readable(uint64_t group) {
-  // A transaction that still holds its fixed snapshot was proven readable at
-  // begin_transaction() (one barrier per group, taken before the snapshot);
-  // every read inside it reads the same snapshot, so they all reuse those
-  // barriers instead of paying one heartbeat round each. Once the first write
-  // releases the snapshot, reads go back to fresh barriers.
-  if (tx_ != nullptr && local_engine_->has_snapshot()) {
+  // A transaction that still holds its fixed snapshot only needs one barrier
+  // per group: the first touch of a group proves leadership, later reads of
+  // the same group reuse it. Once the first write releases the snapshot, reads
+  // go back to fresh barriers.
+  if (tx_ != nullptr && local_engine_->has_snapshot() &&
+      proven_read_groups_.contains(group)) {
     return last_error_ = kv::Status::OK;
   }
   RaftExecutor &executor = store_->executor_for(group);
@@ -213,6 +213,9 @@ kv::Status RaftKVEngine::ensure_readable(uint64_t group) {
       std::chrono::milliseconds{executor.read_timeout_ms()});
   if (!ready.has_value()) {
     return last_error_ = error_to_status(ready.error());
+  }
+  if (tx_ != nullptr && local_engine_->has_snapshot()) {
+    proven_read_groups_.insert(group);
   }
   return last_error_ = kv::Status::OK;
 }
@@ -506,14 +509,12 @@ kv::Status RaftKVEngine::begin_transaction() {
   if (tx_ != nullptr) {
     return kv::Status::Busy;
   }
-  // Prove leadership and applied-index for every group first: the snapshot
-  // taken afterwards must include everything committed before the transaction
-  // began. This is also the set of barriers the whole (read-only) transaction
-  // reuses.
-  for (const auto &[group, executor] : store_->executors()) {
-    (void)executor;
-    if (const kv::Status status = ensure_readable(group);
-        status != kv::Status::OK) {
+  // 单 group：BEGIN 时先证明领导权再取快照（快照包含 BEGIN 前所有已提交）。
+  // 多 group：不对所有组取 barrier（否则"本节点必须是所有组的 leader 才能
+  // BEGIN"，3 组 × 3 节点几乎必然没有这样的节点）；改为首次触碰某组时
+  // 惰性证明（ensure_readable 里的 proven_read_groups_）。
+  if (store_->executors().size() == 1) {
+    if (const kv::Status status = ensure_readable(0); status != kv::Status::OK) {
       return status;
     }
   }
@@ -525,6 +526,11 @@ kv::Status RaftKVEngine::begin_transaction() {
   bound_group_.reset();
   crossed_groups_ = false;
   wrote_ = false;
+  proven_read_groups_.clear();
+  if (store_->executors().size() == 1) {
+    // 单 group：BEGIN 时的 barrier 已经证明过组 0，事务内读直接跳过。
+    proven_read_groups_.insert(0);
+  }
   return kv::Status::OK;
 }
 

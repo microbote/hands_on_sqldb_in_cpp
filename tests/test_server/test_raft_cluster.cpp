@@ -510,6 +510,211 @@ TEST(RaftCluster, ThreeNodesReplicateOverTcp) {
   }
 }
 
+// S5 端到端：3 节点 × 3 组（0=@system、1/2=数据组）真实 TCP。每组独立选主、
+// 独立复制；跨组写事务被拒并带组号；follower 组写返回 NotLeader 且 hint 指向
+// 该组的 leader。
+TEST(RaftCluster, MultiGroupThreeNodesThreeGroupsOverTcp) {
+  TempDir dir;
+  CHECK_TRUE(!dir.path().empty());
+  auto logger = server::Logger::create("error", "");
+  CHECK_TRUE(logger.has_value());
+  if (!logger.has_value()) {
+    return;
+  }
+
+  const int base_port = 44000 + static_cast<int>(::getpid() % 8000);
+  std::string peers;
+  for (int i = 1; i <= 3; ++i) {
+    if (i > 1) {
+      peers += ",";
+    }
+    peers += std::to_string(i) + "@127.0.0.1:" +
+             std::to_string(base_port + i - 1);
+  }
+
+  struct Node {
+    std::shared_ptr<kv::KVStore> local;
+    std::unique_ptr<server::RaftBootstrap> bootstrap;
+  };
+  std::vector<std::unique_ptr<Node>> nodes;
+  for (int i = 1; i <= 3; ++i) {
+    const std::string node_dir = dir.path() + "/node" + std::to_string(i);
+    const std::string config_text =
+        "[raft]\nenabled = true\nnode_id = " + std::to_string(i) +
+        "\nlisten = 127.0.0.1:" + std::to_string(base_port + i - 1) +
+        "\npeers = " + peers + "\n"
+        // 客户端可达的 SQL 地址（hint 用；测试里不真起 SQL server，只要非空）。
+        "sql_endpoints = 1@127.0.0.1:55001,2@127.0.0.1:55002,3@127.0.0.1:55003\n"
+        // shop(4) -> 组 1；shop2(5) -> 组 2（按库名长度切 @data）。
+        "shards = @data/,@data/5:,1; @data/5:,@data/9:,2\n"
+        "election_timeout_ms = 300\nheartbeat_ms = 60\n"
+        "log_path = " +
+        node_dir + "/raft\n";
+    auto config = server::parse_config(config_text);
+    CHECK_TRUE(config.has_value());
+    if (!config.has_value()) {
+      return;
+    }
+    CHECK_TRUE(config->validate().has_value());
+    auto local = open_local(node_dir + "/kv");
+    CHECK_TRUE(local != nullptr);
+    if (local == nullptr) {
+      return;
+    }
+    auto bootstrap = server::RaftBootstrap::open(*config, local, **logger);
+    if (!bootstrap.has_value() &&
+        bootstrap.error().find("bind") != std::string::npos) {
+      fmt::print(stderr,
+                 "[skip] MultiGroupThreeNodesThreeGroupsOverTcp: {}\n",
+                 bootstrap.error());
+      return;
+    }
+    CHECK_EQ(describe(bootstrap), std::string{"ok"});
+    if (!bootstrap.has_value()) {
+      return;
+    }
+    auto node = std::make_unique<Node>();
+    node->local = local;
+    node->bootstrap = std::move(*bootstrap);
+    nodes.push_back(std::move(node));
+  }
+
+  // 每个组选出唯一 leader（跨 3 节点）。
+  const int64_t elect_deadline = now_ms() + 15000;
+  auto group_leader = [&](size_t group) -> server::RaftBootstrap * {
+    server::RaftBootstrap *found = nullptr;
+    for (auto &node : nodes) {
+      if (node->bootstrap->node(group)->is_leader()) {
+        if (found != nullptr) {
+          return nullptr; // 暂时多个 leader（切换中），再等等
+        }
+        found = node->bootstrap.get();
+      }
+    }
+    return found;
+  };
+  while (now_ms() < elect_deadline) {
+    bool all_ready = true;
+    for (size_t g = 0; g < 3; ++g) {
+      if (group_leader(g) == nullptr) {
+        all_ready = false;
+        break;
+      }
+    }
+    if (all_ready) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+  }
+  for (size_t g = 0; g < 3; ++g) {
+    CHECK_NOT_NULL(group_leader(g));
+  }
+
+  // DDL（@system）都跑在组 0 的 leader 上。
+  server::RaftBootstrap *meta_leader = group_leader(0);
+  {
+    session::Session meta(meta_leader->store()->connect());
+    CHECK(meta.execute("CREATE DATABASE shop").has_value());
+    CHECK(meta.execute("CREATE DATABASE shop2").has_value());
+    CHECK(meta.execute("USE shop").has_value());
+    CHECK(meta.execute("CREATE TABLE a (id INT PRIMARY KEY, v INT)")
+              .has_value());
+    CHECK(meta.execute("USE shop2").has_value());
+    CHECK(meta.execute("CREATE TABLE b (id INT PRIMARY KEY, v INT)")
+              .has_value());
+  }
+
+  // 组 1：INSERT 到 shop.a（数据前缀 @data/4:shop/1:a/）。
+  server::RaftBootstrap *leader1 = group_leader(1);
+  {
+    session::Session s1(leader1->store()->connect());
+    CHECK(s1.execute("USE shop").has_value());
+    CHECK(s1.execute("INSERT INTO a (id, v) VALUES (1, 10)").has_value());
+  }
+  // 组 2：INSERT 到 shop2.b（数据前缀 @data/5:shop2/1:b/）。
+  server::RaftBootstrap *leader2 = group_leader(2);
+  {
+    session::Session s2(leader2->store()->connect());
+    CHECK(s2.execute("USE shop2").has_value());
+    CHECK(s2.execute("INSERT INTO b (id, v) VALUES (1, 20)").has_value());
+  }
+
+  // 两组各自的写复制到全部 3 个节点的对应组（applied = no-op + INSERT）。
+  const int64_t apply_deadline = now_ms() + 10000;
+  while (now_ms() < apply_deadline) {
+    bool all = true;
+    for (auto &node : nodes) {
+      if (node->bootstrap->node(1)->applied_index() < 2 ||
+          node->bootstrap->node(2)->applied_index() < 2) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+  }
+  for (auto &node : nodes) {
+    CHECK_EQ(node->bootstrap->node(1)->applied_index(), uint64_t{2});
+    CHECK_EQ(node->bootstrap->node(2)->applied_index(), uint64_t{2});
+  }
+
+  // 跨组写事务：BEGIN -> 写组 1 表 -> 写组 2 表 -> 报错带组号，可回滚。
+  {
+    session::Session s(leader1->store()->connect());
+    CHECK(s.execute("USE shop").has_value());
+    CHECK(s.execute("BEGIN").has_value());
+    CHECK(s.execute("INSERT INTO a (id, v) VALUES (2, 20)").has_value());
+    auto cross = s.execute("USE shop2");
+    CHECK(cross.has_value());
+    cross = s.execute("INSERT INTO b (id, v) VALUES (2, 20)");
+    CHECK_FALSE(cross.has_value());
+    if (!cross.has_value()) {
+      CHECK(cross.error().to_string().find("group 1 -> group 2") !=
+            std::string::npos);
+    }
+    CHECK(s.execute("ROLLBACK").has_value());
+  }
+
+  // follower 组的写返回 NotLeader，hint 指向该组 leader。需要找一个
+  // "组 0 的 leader 但不是组 1 的 leader"的节点：USE 读 schema（组 0）必须
+  // 能过，数据写（组 1）才真正暴露 NotLeader。
+  server::RaftBootstrap *follower = nullptr;
+  for (auto &node : nodes) {
+    if (node->bootstrap.get() == leader1 ||
+        node->bootstrap->node(0)->is_leader() == false) {
+      continue;
+    }
+    follower = node->bootstrap.get();
+    break;
+  }
+  if (follower != nullptr) {
+    session::Session s(follower->store()->connect());
+    CHECK(s.execute("USE shop").has_value());
+    auto write = s.execute("INSERT INTO a (id, v) VALUES (3, 30)");
+    CHECK_FALSE(write.has_value());
+    if (!write.has_value()) {
+      CHECK(write.error().to_string().find("NotLeader") != std::string::npos);
+    }
+    // hint 必须指向组 1 的 leader（node id + 客户端地址）。
+    const auto hint = follower->store()->leader_hint_for(
+        "@data/4:shop/1:a/");
+    CHECK_TRUE(hint.has_value());
+    if (hint.has_value()) {
+      CHECK_EQ(hint->node_id, leader1->node(1)->node_id().value);
+      CHECK_FALSE(hint->endpoint.empty());
+    }
+  }
+
+  for (auto &node : nodes) {
+    node->bootstrap->stop();
+  }
+  for (auto &node : nodes) {
+    CHECK_EQ(node->local->close(), kv::Status::OK);
+  }
+}
+
 } // namespace
 
 #endif // SQLDB_HAVE_LEVELDB

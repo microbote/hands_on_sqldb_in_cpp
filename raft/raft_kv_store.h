@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 
 #include "raft/group_router.h"
@@ -169,6 +170,9 @@ private:
   bool crossed_groups_ = false;
   bool wrote_ = false;
   bool loose_cross_group_reads_ = false;
+  // 事务内已做过 read barrier 的组（惰性证明：多组下 BEGIN 不对所有组取
+  // barrier，首次触碰某组时才取，之后该组读跳过）。
+  std::set<uint64_t> proven_read_groups_;
   // 最近一次 CrossGroupTransaction 的 from/to 组（未发生则为 nullopt）。
   std::optional<uint64_t> cross_group_from_;
   std::optional<uint64_t> cross_group_to_;

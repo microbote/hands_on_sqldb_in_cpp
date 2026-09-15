@@ -240,11 +240,19 @@ TEST(MultiGroup, ReadsRouteToTheOwningGroupBarrier) {
   CHECK_EQ(fixture.group(0).node->read_barrier_count(), before0);
   CHECK_EQ(fixture.group(2).node->read_barrier_count(), before2);
 
-  // BEGIN takes one barrier per group before the snapshot.
+  // 多组 BEGIN 不取 barrier（否则要求本节点是所有组的 leader）：首次触碰
+  // 某组才惰性取一次，之后该组读跳过。
   CHECK_EQ(engine->begin_transaction(), kv::Status::OK);
-  CHECK_EQ(fixture.group(0).node->read_barrier_count(), before0 + 1);
+  CHECK_EQ(fixture.group(0).node->read_barrier_count(), before0);
+  CHECK_EQ(fixture.group(1).node->read_barrier_count(), before1 + 1);
+  CHECK_EQ(fixture.group(2).node->read_barrier_count(), before2);
+
+  // 事务内首次读组 1：+1 并标记 proven；再读同组不再加。
+  CHECK_EQ(engine->get("a", &value), kv::Status::NotFound);
   CHECK_EQ(fixture.group(1).node->read_barrier_count(), before1 + 2);
-  CHECK_EQ(fixture.group(2).node->read_barrier_count(), before2 + 1);
+  CHECK_EQ(engine->get("b", &value), kv::Status::NotFound);
+  CHECK_EQ(fixture.group(1).node->read_barrier_count(), before1 + 2);
+
   CHECK_EQ(engine->rollback_transaction(), kv::Status::OK);
 }
 
