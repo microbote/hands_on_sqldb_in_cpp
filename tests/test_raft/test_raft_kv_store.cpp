@@ -353,6 +353,95 @@ TEST(RaftKVAdapter, IsolatedLeaderFailsReadsAndWritesWithTimeout) {
   CHECK_EQ(engine->put("k", "v"), kv::Status::Timeout);
 }
 
+TEST(RaftKVAdapter, ReadOnlyTransactionReusesTheBeginBarrier) {
+  KVTestCluster cluster({NodeId{1}});
+  cluster.start();
+  cluster.elect_leader();
+
+  auto engine = cluster.node(NodeId{1}).connect();
+  CHECK_EQ(engine->put("k", "v"), kv::Status::OK);
+
+  const uint64_t before = cluster.leader()->read_barrier_count();
+  CHECK_EQ(engine->begin_transaction(), kv::Status::OK);
+  kv::ByteValue value;
+  CHECK_EQ(engine->get("k", &value), kv::Status::OK);
+  CHECK_EQ(engine->get("k", &value), kv::Status::OK);
+  CHECK_EQ(engine->get("k", &value), kv::Status::OK);
+  CHECK_EQ(engine->rollback_transaction(), kv::Status::OK);
+  // One barrier total: the one taken at BEGIN, reused by every snapshot read.
+  CHECK_EQ(cluster.leader()->read_barrier_count(), before + 1);
+
+  // Outside a transaction, every read takes its own barrier.
+  auto other = cluster.node(NodeId{1}).connect();
+  const uint64_t mid = cluster.leader()->read_barrier_count();
+  CHECK_EQ(other->get("k", &value), kv::Status::OK);
+  CHECK_EQ(other->get("k", &value), kv::Status::OK);
+  CHECK_EQ(cluster.leader()->read_barrier_count(), mid + 2);
+}
+
+TEST(RaftKVAdapter, FollowerBeginTransactionReturnsNotLeader) {
+  KVTestCluster cluster({NodeId{1}, NodeId{2}, NodeId{3}});
+  cluster.start();
+  cluster.elect_leader();
+
+  auto follower = cluster.node(cluster.follower_id()).connect();
+  CHECK_EQ(follower->begin_transaction(), kv::Status::NotLeader);
+  CHECK_FALSE(follower->in_transaction());
+}
+
+TEST(RaftKVAdapter, GetBatchResolvesOverlayAndStoreKeys) {
+  KVTestCluster cluster({NodeId{1}});
+  cluster.start();
+  cluster.elect_leader();
+
+  auto engine = cluster.node(NodeId{1}).connect();
+  CHECK_EQ(engine->put("a", "1"), kv::Status::OK);
+  CHECK_EQ(engine->put("b", "2"), kv::Status::OK);
+
+  // kReturnEmpty: missing keys become nullopt, order and duplicates preserved.
+  std::vector<std::optional<kv::ByteValue>> values;
+  const std::vector<kv::Key> mixed{"b", "zz", "a", "b"};
+  CHECK_EQ(engine->get_batch(mixed, kv::MissingKeyPolicy::kReturnEmpty,
+                             &values),
+           kv::Status::OK);
+  CHECK_EQ(values.size(), size_t{4});
+  if (values.size() == 4) {
+    CHECK(values[0].has_value());
+    CHECK_EQ(*values[0], std::string("2"));
+    CHECK_FALSE(values[1].has_value());
+    CHECK(values[2].has_value());
+    CHECK_EQ(*values[2], std::string("1"));
+    CHECK(values[3].has_value());
+    CHECK_EQ(*values[3], std::string("2"));
+  }
+
+  // kReturnError: a missing key fails the whole batch.
+  const std::vector<kv::Key> with_missing{"a", "nope"};
+  CHECK_EQ(engine->get_batch(with_missing, kv::MissingKeyPolicy::kReturnError,
+                             &values),
+           kv::Status::NotFound);
+
+  // Inside a transaction: buffered puts, tombstones and store keys resolve
+  // through the same call.
+  CHECK_EQ(engine->begin_transaction(), kv::Status::OK);
+  CHECK_EQ(engine->put("c", "3"), kv::Status::OK); // buffered write
+  CHECK_EQ(engine->remove("a"), kv::Status::OK);   // buffered tombstone
+  const std::vector<kv::Key> overlay_keys{"a", "b", "c", "x"};
+  CHECK_EQ(engine->get_batch(overlay_keys, kv::MissingKeyPolicy::kReturnEmpty,
+                             &values),
+           kv::Status::OK);
+  CHECK_EQ(values.size(), size_t{4});
+  if (values.size() == 4) {
+    CHECK_FALSE(values[0].has_value()); // tombstoned
+    CHECK(values[1].has_value());
+    CHECK_EQ(*values[1], std::string("2"));
+    CHECK(values[2].has_value());
+    CHECK_EQ(*values[2], std::string("3"));
+    CHECK_FALSE(values[3].has_value()); // missing
+  }
+  CHECK_EQ(engine->rollback_transaction(), kv::Status::OK);
+}
+
 TEST(RaftKVAdapter, RawStoreWritePathIsNotSupported) {
   KVTestCluster cluster({NodeId{1}});
   cluster.start();

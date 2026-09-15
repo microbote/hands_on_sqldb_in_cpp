@@ -26,6 +26,13 @@ public:
   virtual std::expected<ReadIndex, Error> read_barrier() = 0;
   virtual NodeId node_id() const = 0;
   virtual uint64_t election_timeout_ms() const = 0;
+  // Wait budgets the adapter uses when blocking on a proposal or a read
+  // barrier. 0 (the default) falls back to election_timeout_ms, keeping the
+  // pre-configuration behavior.
+  virtual uint64_t proposal_timeout_ms() const {
+    return election_timeout_ms();
+  }
+  virtual uint64_t read_timeout_ms() const { return election_timeout_ms(); }
   // Leader id this node knows about (nullopt when unknown). Used to build the
   // redirect hint; the executor does not know client-facing addresses.
   virtual std::optional<NodeId> leader_hint() = 0;

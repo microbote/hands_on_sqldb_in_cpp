@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <map>
@@ -60,6 +61,17 @@ public:
   uint64_t last_log_index() const { return last_log_index_; }
   uint64_t last_included_index() const { return last_included_index_; }
   uint64_t last_included_term() const { return last_included_term_; }
+  // Apply-path observability: how many entries were applied and how long the
+  // state machine calls took (wall clock). A slow apply (e.g. a large
+  // remove_range) blocks heartbeats on the raft service thread; these counters
+  // let an operator spot it.
+  uint64_t apply_count() const { return apply_count_; }
+  uint64_t total_apply_ns() const { return total_apply_ns_; }
+  uint64_t max_apply_ns() const { return max_apply_ns_; }
+  // How many read barriers were requested. A fresh barrier costs a heartbeat
+  // round, so this is the read-amplification counter the adapter's
+  // transaction-level merge tries to keep close to the transaction count.
+  uint64_t read_barrier_count() const { return read_barrier_count_; }
 
   const std::optional<Error> &last_error() const { return last_error_; }
 
@@ -121,6 +133,10 @@ private:
   uint64_t last_included_term_ = 0;
   uint64_t commit_index_ = kInvalidIndex;
   uint64_t last_applied_ = kInvalidIndex;
+  uint64_t apply_count_ = 0;
+  uint64_t total_apply_ns_ = 0;
+  uint64_t max_apply_ns_ = 0;
+  uint64_t read_barrier_count_ = 0;
 
   std::map<NodeId, uint64_t> next_index_;
   std::map<NodeId, uint64_t> match_index_;

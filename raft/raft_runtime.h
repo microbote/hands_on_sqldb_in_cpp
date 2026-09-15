@@ -33,7 +33,11 @@ namespace raft {
 // read barriers through this class, never through RaftNode.
 class RaftRuntime : public RaftExecutor {
 public:
-  explicit RaftRuntime(RaftNode &node, std::string name = "raft");
+  // `proposal_timeout_ms` / `read_timeout_ms`: wait budgets for proposal and
+  // read-barrier waits. 0 = fall back to the election timeout.
+  explicit RaftRuntime(RaftNode &node, std::string name = "raft",
+                       uint64_t proposal_timeout_ms = 0,
+                       uint64_t read_timeout_ms = 0);
   ~RaftRuntime();
 
   RaftRuntime(const RaftRuntime &) = delete;
@@ -59,6 +63,8 @@ public:
   std::expected<ReadIndex, Error> read_barrier() override;
   NodeId node_id() const override { return node_.node_id(); }
   uint64_t election_timeout_ms() const override;
+  uint64_t proposal_timeout_ms() const override;
+  uint64_t read_timeout_ms() const override;
   std::optional<NodeId> leader_hint() override;
 
   // Thread-safe, non-blocking. `false` = dropped because the service is
@@ -80,6 +86,8 @@ private:
 
   RaftNode &node_;
   common::svrkit::ServiceThread service_;
+  uint64_t proposal_timeout_ms_ = 0;
+  uint64_t read_timeout_ms_ = 0;
   std::atomic<std::thread::id> worker_id_{};
   std::atomic<bool> running_{false};
   std::atomic<uint64_t> rejected_{0};

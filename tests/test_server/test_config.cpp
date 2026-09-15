@@ -281,6 +281,25 @@ log_path = ./raft_log
     CHECK_EQ(endpoints.at(2), std::string("10.0.0.2:5433"));
   }
 
+  // proposal / read 等待预算可分别配置，默认 0 = 回退 election timeout。
+  const auto timeout_config = server::parse_config(R"(
+[raft]
+proposal_timeout_ms = 250
+read_timeout_ms = 300
+)");
+  CHECK(timeout_config.has_value());
+  if (timeout_config.has_value()) {
+    CHECK_TRUE(timeout_config->validate().has_value());
+    CHECK_EQ(timeout_config->raft_proposal_timeout_ms(), uint64_t{250});
+    CHECK_EQ(timeout_config->raft_read_timeout_ms(), uint64_t{300});
+  }
+  const auto default_config = server::parse_config("");
+  CHECK(default_config.has_value());
+  if (default_config.has_value()) {
+    CHECK_EQ(default_config->raft_proposal_timeout_ms(), uint64_t{0});
+    CHECK_EQ(default_config->raft_read_timeout_ms(), uint64_t{0});
+  }
+
   // heartbeat 必须小于 election timeout（开着关着都拦）。
   CHECK_FALSE(parses_and_validates(R"(
 [raft]

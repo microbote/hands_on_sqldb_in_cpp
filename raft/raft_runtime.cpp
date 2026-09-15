@@ -20,8 +20,12 @@ struct SubmitState {
 
 } // namespace
 
-RaftRuntime::RaftRuntime(RaftNode &node, std::string name)
-    : node_(node), service_(std::move(name)) {}
+RaftRuntime::RaftRuntime(RaftNode &node, std::string name,
+                         uint64_t proposal_timeout_ms,
+                         uint64_t read_timeout_ms)
+    : node_(node), service_(std::move(name)),
+      proposal_timeout_ms_(proposal_timeout_ms),
+      read_timeout_ms_(read_timeout_ms) {}
 
 RaftRuntime::~RaftRuntime() { stop(); }
 
@@ -138,6 +142,15 @@ uint64_t RaftRuntime::election_timeout_ms() const {
   // Configuration, not mutable Raft state: reading it off the node directly is
   // safe from any thread.
   return node_.election_timeout_ms();
+}
+
+uint64_t RaftRuntime::proposal_timeout_ms() const {
+  return proposal_timeout_ms_ == 0 ? election_timeout_ms()
+                                   : proposal_timeout_ms_;
+}
+
+uint64_t RaftRuntime::read_timeout_ms() const {
+  return read_timeout_ms_ == 0 ? election_timeout_ms() : read_timeout_ms_;
 }
 
 std::optional<NodeId> RaftRuntime::leader_hint() {

@@ -46,12 +46,13 @@ public:
 
 class RuntimeFixture {
 public:
-  RuntimeFixture()
+  RuntimeFixture(uint64_t proposal_timeout_ms = 0,
+                 uint64_t read_timeout_ms = 0)
       : transport_(NodeId{1}, network_),
         node_(raft::NodeConfig{NodeId{1}, std::vector<NodeId>{NodeId{1}}, 100,
                                10},
               log_, transport_, state_machine_, clock_),
-        runtime_(node_, "raft-test") {
+        runtime_(node_, "raft-test", proposal_timeout_ms, read_timeout_ms) {
     network_.bind(NodeId{1}, &node_);
     CHECK_TRUE(node_.start().has_value());
   }
@@ -91,6 +92,17 @@ private:
   raft::RaftNode node_;
   raft::RaftRuntime runtime_;
 };
+
+TEST(RaftRuntime, ExposesConfigurableWaitBudgets) {
+  RuntimeFixture defaults;
+  CHECK_EQ(defaults.runtime().election_timeout_ms(), uint64_t{100});
+  CHECK_EQ(defaults.runtime().proposal_timeout_ms(), uint64_t{100});
+  CHECK_EQ(defaults.runtime().read_timeout_ms(), uint64_t{100});
+
+  RuntimeFixture configured(/*proposal_timeout_ms=*/55, /*read_timeout_ms=*/66);
+  CHECK_EQ(configured.runtime().proposal_timeout_ms(), uint64_t{55});
+  CHECK_EQ(configured.runtime().read_timeout_ms(), uint64_t{66});
+}
 
 TEST(RaftRuntime, ProposesOnTheServiceThreadAndCommits) {
   RuntimeFixture fixture;

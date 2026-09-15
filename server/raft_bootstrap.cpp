@@ -126,7 +126,9 @@ RaftBootstrap::open(const ServerConfig &config,
   self->node_ = std::make_unique<raft::RaftNode>(
       std::move(node_config), self->log_store_, *self->transport_,
       *self->state_machine_, self->clock_);
-  self->runtime_ = std::make_unique<raft::RaftRuntime>(*self->node_, "raft");
+  self->runtime_ = std::make_unique<raft::RaftRuntime>(
+      *self->node_, "raft", config.raft_proposal_timeout_ms(),
+      config.raft_read_timeout_ms());
   self->runtime_->start();
 
   // start() installs the transport callback; it must run on the raft service

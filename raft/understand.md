@@ -380,16 +380,32 @@ follower 端有 1 GiB 待组装缓冲上限，超大快照仍需要后续做流�
 快照元数据与日志前缀恢复正确；**up-to-date follower 各自本地压缩日志且继续
 复制**；`KVStateMachine` 全 key space（无上界）快照生成/恢复。
 
-### Phase B：读路径与等待收敛
+### Phase B：读路径与等待收敛（✅ 已落地，2026-09-15）
 
-1. **read-index 合并**：同一语句 / 同一事务内的多次读合并为一轮确认（需要
-   时间上界：lease 或注入时钟），把“每次 KV 读一次往返”降下来；
-2. `raft.proposal_timeout_ms` 独立配置，区分读/写超时预算；
-3. `get_batch` 复用单个 iterator 遍历多个 key；
-4. 评估 apply 慢路径：监控 remove_range 耗时，必要时 apply 移到独立线程
-   （此时要重新审视 apply 与 propose 顺序的可见性）。
+1. ✅ **read-index 合并（安全版本）**：把 barrier 移到 `begin_transaction`——
+   BEGIN 时先过一次 ReadIndex 再取本地快照，事务持快照阶段的每次读都复用这
+   一次证明（快照是固定的，重复 barrier 既不刷新数据也不增加正确性，纯浪费）。
+   第一次写释放快照后恢复“每次读一个 barrier”（与旧行为一致）。
+   **为什么不做“每条语句一次”的更大合并**：那需要 lease（时钟假设），会破坏
+   “分区旧 leader 不能放行读”的保证（`IsolatedLeaderCannotServeReads`）；
+   事务级合并是当前语义下唯一无损的合并点。自动提交语句 / 多表扫描的读放大
+   留给 lease 方案（§11）。
+2. ✅ `raft.proposal_timeout_ms` / `raft.read_timeout_ms` 独立配置
+   （0 = 回退 election timeout）：`RaftExecutor` 提供默认回退，`RaftRuntime`
+   可配置并接线，读/写等待预算分离，分区场景下超时仍受控。
+3. ✅ `get_batch` 复用单个 iterator：先解析事务覆盖层（值/墓碑），再用一个
+   iterator 逐个 seek 落空 key，避免每个 key 新建+注册迭代器（含
+   MergingIterator）；稀疏 key 集仍是点查复杂度，不会退化成区间扫。
+4. ✅ **apply 慢路径评估**：给 `RaftNode` 加了 apply 计数与耗时统计
+   （`apply_count / total_apply_ns / max_apply_ns`）作监控钩子。结论：
+   **暂不把 apply 移出服务线程**——那需要把 last_applied / pending 变成线程
+   安全（破坏 RaftNode 无锁不变量），接近重写。真正的先手是让 `remove_range`
+   变便宜（LevelDB 当前展开成逐键删：升级用 DeleteRange，或限制单条语句
+   删除量）；只有单条语句 apply 依然慢，再考虑独立 apply 线程。
 
-验收：读吞吐提升有量化对比；分区场景下读/写超时仍受控。
+验收（已通过）：事务内多次读只产生一次 barrier（读 barrier 计数验证）；
+follower `BEGIN` 立即 NotLeader；`get_batch` 覆盖 store/覆盖层/缺失/重复 key
+且两种缺失策略语义不变；超时预算在运行时与配置层都可见。
 
 ### Phase C：多 group（P2）
 

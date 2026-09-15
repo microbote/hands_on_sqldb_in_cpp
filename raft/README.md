@@ -17,6 +17,12 @@ SQL 侧适配。P1b 已落地：`RaftRuntime`（单服务线程）、RPC 二进�
 `KVStateMachine` 支持无上界（整 key space）快照生成/恢复。
 **仍留作后续**：read-index 合并、跨组只读模式、成员变更。
 
+**Phase B（读路径与等待收敛）已落地**：事务级 read-index 合并（BEGIN 一次
+barrier 覆盖整个持快照读阶段）、`raft.proposal_timeout_ms` / `raft.read_timeout_ms`
+独立等待预算、`get_batch` 单迭代器复用、apply 耗时监控钩子
+（`apply_count / total_apply_ns / max_apply_ns`）。
+**仍留作后续**：lease 方案的语句级读合并、跨组只读模式、成员变更。
+
 ## 模块结构
 
 | 文件 | 职责 |

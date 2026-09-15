@@ -153,6 +153,7 @@ std::expected<Proposal, Error> RaftNode::propose(std::string data) {
 }
 
 std::expected<ReadIndex, Error> RaftNode::read_barrier() {
+  ++read_barrier_count_;
   if (role_ != Role::Leader) {
     return std::unexpected(
         Error{ErrorCode::NotLeader, "read barrier requires the leader role"});
@@ -866,7 +867,17 @@ std::expected<void, Error> RaftNode::apply_committed() {
     if (!entry.has_value()) {
       return std::unexpected(entry.error());
     }
+    const auto apply_start = std::chrono::steady_clock::now();
     auto result = state_machine_.apply(*entry);
+    const auto apply_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - apply_start)
+            .count());
+    ++apply_count_;
+    total_apply_ns_ += apply_ns;
+    if (apply_ns > max_apply_ns_) {
+      max_apply_ns_ = apply_ns;
+    }
     if (!result.has_value()) {
       fail_pending_proposals(last_applied_ + 1, result.error());
       fail_read_barriers(result.error());

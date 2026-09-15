@@ -158,14 +158,22 @@ std::shared_ptr<kv::KVStore> RaftKVEngine::store() const { return store_; }
 bool RaftKVEngine::is_open() const { return store_->is_open(); }
 
 kv::Status RaftKVEngine::ensure_readable() {
+  // A transaction that still holds its fixed snapshot was proven readable at
+  // begin_transaction(); every read inside it reads the same snapshot, so they
+  // all reuse that single barrier instead of paying one heartbeat round each.
+  // Once the first write releases the snapshot, reads go back to fresh
+  // barriers (exactly like the pre-merge behavior).
+  if (tx_ != nullptr && local_engine_->has_snapshot()) {
+    return last_error_ = kv::Status::OK;
+  }
   auto read_index = executor_.read_barrier();
   if (!read_index.has_value()) {
     return last_error_ = error_to_status(read_index.error());
   }
   // A leader that cannot reach a quorum within an election timeout has lost
   // its proof of leadership, so the read must fail instead of waiting forever.
-  auto ready = read_index->wait_for(std::chrono::milliseconds{
-      executor_.election_timeout_ms()});
+  auto ready = read_index->wait_for(
+      std::chrono::milliseconds{executor_.read_timeout_ms()});
   if (!ready.has_value()) {
     return last_error_ = error_to_status(ready.error());
   }
@@ -240,16 +248,46 @@ kv::Status RaftKVEngine::get_batch(
   }
   values->clear();
   values->reserve(keys.size());
-  for (const auto &key : keys) {
-    kv::ByteValue value;
-    const kv::Status status = read_key(key, &value);
-    if (status == kv::Status::OK) {
-      values->push_back(std::move(value));
-    } else if (status == kv::Status::NotFound &&
-               policy == kv::MissingKeyPolicy::kReturnEmpty) {
-      values->push_back(std::nullopt);
-    } else {
-      return status;
+
+  // Phase 1: keys served from the transaction overlay are resolved directly;
+  // the rest need the store.
+  std::vector<size_t> misses;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    bool handled = false;
+    if (tx_ != nullptr) {
+      const kv::OverlayOp op = tx_->lookup(keys[i]);
+      if (op.is_tombstone()) {
+        if (policy == kv::MissingKeyPolicy::kReturnError) {
+          return last_error_ = kv::Status::NotFound;
+        }
+        values->push_back(std::nullopt);
+        handled = true;
+      } else if (op.has_value()) {
+        values->push_back(op.value);
+        handled = true;
+      }
+    }
+    if (!handled) {
+      misses.push_back(i);
+      values->push_back(std::nullopt); // placeholder, filled below
+    }
+  }
+  if (misses.empty()) {
+    return last_error_ = kv::Status::OK;
+  }
+
+  // Phase 2: one iterator, seek per key. Avoids allocating and registering a
+  // fresh iterator (plus its MergingIterator) for every key.
+  auto iterator = make_iterator(kv::KeyRange::all());
+  if (iterator == nullptr) {
+    return last_error_ = kv::Status::InternalError;
+  }
+  for (const size_t i : misses) {
+    iterator->seek(keys[i]);
+    if (iterator->valid() && iterator->key() == keys[i]) {
+      (*values)[i] = iterator->value();
+    } else if (policy == kv::MissingKeyPolicy::kReturnError) {
+      return last_error_ = kv::Status::NotFound;
     }
   }
   return kv::Status::OK;
@@ -311,6 +349,12 @@ kv::Status RaftKVEngine::begin_transaction() {
   }
   if (tx_ != nullptr) {
     return kv::Status::Busy;
+  }
+  // Prove leadership and applied-index first: the snapshot taken afterwards
+  // must include everything committed before the transaction began. This is
+  // also the single read barrier the whole (read-only) transaction reuses.
+  if (const kv::Status status = ensure_readable(); status != kv::Status::OK) {
+    return status;
   }
   const kv::Status status = local_engine_->begin_transaction();
   if (status != kv::Status::OK) {
@@ -432,7 +476,7 @@ kv::Status RaftKVEngine::propose_batch(const kv::WriteBatch &batch) {
   // still commit later. Callers retry with the same client/request id, which
   // the state machine deduplicates.
   auto committed = proposal->wait_for(std::chrono::milliseconds{
-      executor_.election_timeout_ms()});
+      executor_.proposal_timeout_ms()});
   if (!committed.has_value()) {
     if (tx_ == nullptr) {
       release_write_slot();

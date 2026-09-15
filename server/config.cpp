@@ -69,6 +69,10 @@ log_path =
 # 日志条目数超过该值时，leader 生成快照并压缩日志（0 = 关闭压缩）。
 # 压缩后落后者/新节点靠 InstallSnapshot 追赶。
 snapshot_entries = 0
+# proposal / read 等待预算（毫秒）。0 = 回退到 election_timeout_ms。
+# 分区里的旧 leader 不会自己降级，等待必须有上限；读写可分别配置。
+proposal_timeout_ms = 0
+read_timeout_ms = 0
 )ini";
 
 std::string trim(const std::string &text) {
@@ -295,6 +299,8 @@ std::expected<void, std::string> Config::validate() const {
       {"raft.election_timeout_ms", 1, INT64_MAX},
       {"raft.heartbeat_ms", 1, INT64_MAX},
       {"raft.snapshot_entries", 0, INT64_MAX},
+      {"raft.proposal_timeout_ms", 0, INT64_MAX},
+      {"raft.read_timeout_ms", 0, INT64_MAX},
   };
   for (const auto &rule : kIntRules) {
     const int64_t v = get_int(rule.key);
@@ -567,6 +573,14 @@ uint64_t ServerConfig::raft_heartbeat_ms() const {
 
 uint64_t ServerConfig::raft_snapshot_entries() const {
   return static_cast<uint64_t>(CFG_INT(generic_, raft.snapshot_entries));
+}
+
+uint64_t ServerConfig::raft_proposal_timeout_ms() const {
+  return static_cast<uint64_t>(CFG_INT(generic_, raft.proposal_timeout_ms));
+}
+
+uint64_t ServerConfig::raft_read_timeout_ms() const {
+  return static_cast<uint64_t>(CFG_INT(generic_, raft.read_timeout_ms));
 }
 
 std::string ServerConfig::raft_log_path() const {

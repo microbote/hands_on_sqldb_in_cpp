@@ -124,6 +124,9 @@ public:
   uint64_t raft_heartbeat_ms() const;
   // 日志条目数快照/压缩阈值（0 = 关闭）。
   uint64_t raft_snapshot_entries() const;
+  // proposal / read 等待预算（0 = 回退到 election_timeout_ms）。
+  uint64_t raft_proposal_timeout_ms() const;
+  uint64_t raft_read_timeout_ms() const;
   std::string raft_log_path() const;
   // node id -> 客户端可达的 SQL "host:port"（空 map = 不给重定向目标）
   std::map<uint64_t, std::string> raft_sql_endpoints() const;
